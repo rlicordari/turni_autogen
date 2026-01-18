@@ -146,7 +146,7 @@ st.title("UOC Cardiologia con UTIC - Turni Autogenerator")
 
 st.markdown(
     """
-**Default:** selezioni **mese** + **anno** e il programma **genera automaticamente il template Excel** (date + intestazioni colonne dalla YAML).
+**Default:** selezioni **mese** + **anno** e il programma **genera automaticamente il template Excel** (date + intestazioni colonne).
 
 **Avanzato:** puoi caricare un tuo *Template Excel*.
 """
