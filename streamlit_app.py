@@ -142,12 +142,10 @@ def _month_label_it(month: int) -> str:
 
 st.set_page_config(page_title="Turni Autogenerator", layout="wide")
 
-st.title("Turni Autogenerator – versione web (Streamlit)")
+st.title("UOC Cardiologia con UTIC - Turni Autogenerator")
 
 st.markdown(
     """
-Questa versione gira **senza Tkinter** (Streamlit Cloud non supporta GUI desktop).
-
 **Default:** selezioni **mese** + **anno** e il programma **genera automaticamente il template Excel** (date + intestazioni colonne dalla YAML).
 
 **Avanzato:** puoi caricare un tuo *Template Excel*.
