@@ -9,12 +9,10 @@ from turni_generator import generate_schedule
 
 st.set_page_config(page_title="Turni Autogenerator", layout="wide")
 
-st.title("Turni Autogenerator – versione web (Streamlit)")
+st.title("UOC Cardiologia con UTIC - Turni Autogenerator")
 
 st.markdown(
     """
-Questa versione gira **senza Tkinter** (Streamlit Cloud non supporta GUI desktop).
-
 **Workflow:** carichi *Template Excel*, *Regole YAML* (o usi quelle del repo) e, opzionalmente, *Indisponibilità* → generi un **.xlsx** scaricabile.
 """
 )
