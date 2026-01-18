@@ -8,9 +8,7 @@ from turni_generator import generate_schedule
 
 st.set_page_config(page_title="Turni Autogenerator", layout="wide")
 
-st.title("UOC Cardiologia con UTIC
-
-         Turni Autogenerator")
+st.title("UOC Cardiologia con UTIC - Turni Autogenerator")
 
 st.markdown(
     """
