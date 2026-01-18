@@ -12,8 +12,6 @@ st.title("Turni Autogenerator – versione web (Streamlit)")
 
 st.markdown(
     """
-Questa versione gira **senza Tkinter** (Streamlit Cloud non supporta GUI desktop).
-
 **Workflow:** carichi *Template Excel*, *Regole YAML* (o usi quelle del repo) e, opzionalmente, *Indisponibilità* → generi un **.xlsx** scaricabile.
 """
 )
