@@ -129,9 +129,9 @@ def save_store_to_github(rows: list[dict], sha: str | None, message: str):
     )
 
 # -------- UI --------
-st.title("Turni UTIC – Autogeneratore")
+st.title("UOC Cardiologia con UTIC - Turni Generator")
 
-mode = st.sidebar.radio("Sezione", ["Genera turni (Admin)", "Indisponibilità (Medico)"], index=0)
+mode = st.sidebar.radio("Sezione", ["Admin", "Carica Indisponibilità (Medico)"], index=0)
 
 # Load default rules (used for doctor module and as Admin default)
 cfg_default = tg.load_rules(DEFAULT_RULES_PATH)
@@ -259,7 +259,7 @@ else:
     sheet_name = st.text_input("Nome foglio (opzionale)", value="")
 
     # Carryover
-    st.markdown("### Carryover mese precedente (NOTTE ultimo giorno → blocco giorno 1)")
+    st.markdown("### Carryover: Medico di turno di NOTTE ultimo giorno del mese precedente → blocco giorno 1)")
     prev_out = st.file_uploader("Carica output mese precedente (opzionale)", type=["xlsx"], key="prev")
     manual_block = st.multiselect("Oppure seleziona manualmente medico/i da bloccare il giorno 1", doctors, default=[])
 
