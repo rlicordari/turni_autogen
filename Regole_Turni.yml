@@ -232,13 +232,15 @@ rules:
       - Pugliatti
       - Trio
       - Manganaro
+      - De Gregorio
     no_consecutive_days_same_doctor: true
+    balance: true
 
   # ==========================================================
-  # L (PADIGLIONI) – Mon/Tue/Wed, Recupero <= 3
+  # L (PADIGLIONI) – Mon/Wed/Thu, Recupero <= 3
   # ==========================================================
   L:
-    days: [Mon, Tue, Wed]
+    days: [Mon, Wed, Thu]
     quota_recupero_per_month: 3
     pool_other:
       - Allegra
@@ -284,6 +286,7 @@ rules:
     pool:
       - Zito
       - Cusmà
+    balance: true
 
   T:
     days: Mon-Sat
