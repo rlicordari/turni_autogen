@@ -273,7 +273,6 @@ rules:
   R:
     days: Mon-Fri
     pool:
-      - Recupero
       - Colarusso
       - Zito
       - Manganaro
