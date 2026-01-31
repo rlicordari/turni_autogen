@@ -1,4 +1,4 @@
-version: '2026-01-22'
+version: '2026-01-31'
 
 # ------------------------------------------------------------
 # CONFIG GENERALE
@@ -180,7 +180,7 @@ rules:
       - Dattilo
       - Crea
       - Pugliatti
-      - Manganaro
+      - De Gregorio
 
   # ==========================================================
   # H (UTIC pomeriggio)
@@ -195,6 +195,7 @@ rules:
       - Migliorato
       - Trio
       - Cusmà
+      - Manganaro
     cap_mon_fri_per_doctor: 5
     saturday_must_be_covered: true
 
@@ -237,7 +238,7 @@ rules:
     balance: true
 
   # ==========================================================
-  # L (PADIGLIONI) – Mon/Wed/Thu, Recupero <= 3
+  # L (PADIGLIONI) – Mon/Wed/Thu
   # ==========================================================
   L:
     days: [Mon, Wed, Thu]
@@ -310,7 +311,7 @@ rules:
     pool: [Crea, "D'Angelo", Allegra, Dattilo, Cimino]
 
   V:
-    days: [Wed, Fri]
+    days: [Mon, Wed, Fri]
     pool: [Dattilo, Crea, Allegra]
 
   W:
@@ -326,8 +327,7 @@ rules:
   AB:
     weekly: true
     fixed_day: Thu
-    prefer: Crea
-    fallback_pool: [Dattilo, Cimino, Allegra, "D'Angelo"]
+    fallback_pool: [Dattilo, Crea, Cimino, Allegra, "D'Angelo"]
 
   AC:
     days: [Tue, Wed]
