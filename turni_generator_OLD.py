@@ -1639,42 +1639,18 @@ def solve_with_ortools(cfg: dict, days: List[DayRow], slots: List[Slot]) -> Tupl
     if "rules" in cfg and "L" in cfg["rules"]:
         qrec = cfg["rules"]["L"].get("quota_recupero_per_month")
         if qrec is not None and "Recupero" in doctors:
-            vars_ = []
+            vars_=[]
             for s in slots:
                 if s.columns == ["L"] and (s.slot_id, "Recupero") in x:
                     vars_.append(x[(s.slot_id, "Recupero")])
             if vars_:
-                # Support either:
-                # - int: interpret as MAX with soft preference to reach the value
-                # - [min, max]: enforce hard range (no soft preference)
-                if isinstance(qrec, (list, tuple)) and len(qrec) == 2:
-                    qmin, qmax = int(qrec[0]), int(qrec[1])
-                    if qmin > qmax:
-                        qmin, qmax = qmax, qmin
-                    model.Add(sum(vars_) >= qmin)
-                    model.Add(sum(vars_) <= qmax)
-                else:
-                    # Backward compatible behavior
-                    qrec_int = int(qrec)
-                    model.Add(sum(vars_) <= qrec_int)
-                    short = model.NewIntVar(0, qrec_int, f"L_rec_short")
-                    model.Add(sum(vars_) + short == qrec_int)
-                    extra_obj.append(5 * short)
-
-    # T: minimum number of "Recupero" assignments (optional), excluding Saturdays by default
-    if "rules" in cfg and "T" in cfg["rules"]:
-        rT = cfg["rules"]["T"] or {}
-        min_rec_T = rT.get("min_recupero_per_month")
-        if min_rec_T is not None and "Recupero" in doctors:
-            vars_ = []
-            for s in slots:
-                if s.columns == ["T"] and (s.slot_id, "Recupero") in x:
-                    # exclude Saturdays (T is typically Mon-Fri; this is a safety net)
-                    if getattr(s.day, "dow", "") == "Sat":
-                        continue
-                    vars_.append(x[(s.slot_id, "Recupero")])
-            if vars_:
-                model.Add(sum(vars_) >= int(min_rec_T))
+                # Hard cap (<=) and soft preference to reach the target.
+                qrec_int = int(qrec)
+                model.Add(sum(vars_) <= qrec_int)
+                # soft: minimize shortfall (qrec_int - sum(vars_))
+                short = model.NewIntVar(0, qrec_int, f"L_rec_short")
+                model.Add(sum(vars_) + short == qrec_int)
+                extra_obj.append(5 * short)
     # Y two Mondays as Recupero (if enabled) – counts ONLY the optional Y_REC slots
     if "rules" in cfg and "Y" in cfg["rules"]:
         rY = cfg["rules"]["Y"]
@@ -1691,7 +1667,8 @@ def solve_with_ortools(cfg: dict, days: List[DayRow], slots: List[Slot]) -> Tupl
     # (the solver will minimize the number of missing weekends-off).
     min_weekends = int(gc.get("min_full_weekends_off_per_month", 0) or 0)
     weekend_exempt = set(norm_name(x) for x in (gc.get("weekend_off_exempt") or []))
-    # Do not auto-exempt "Recupero": treat like other doctors unless explicitly listed in weekend_off_exempt
+    # Always exempt the placeholder 'Recupero' from weekend-off accounting
+    weekend_exempt.add("Recupero")
     weekend_soft = bool(gc.get("weekend_off_soft", False))
     weekend_penalty = int(gc.get("weekend_off_penalty", 50) or 50)  # penalty per missing full weekend off
     weekend_shortfalls: List = []
@@ -1753,7 +1730,7 @@ def solve_with_ortools(cfg: dict, days: List[DayRow], slots: List[Slot]) -> Tupl
     if weekend_shortfalls:
         objective_terms.append(weekend_penalty * sum(weekend_shortfalls))
     # fairness: minimize max assignments per doctor (excluding 'Recupero')
-    real_doctors = list(doctors)  # include Recupero in fairness
+    real_doctors = [d for d in doctors if d != "Recupero"]
     max_load = model.NewIntVar(0, 999, "max_load")
     for doc in real_doctors:
         vars_ = []
@@ -1787,7 +1764,7 @@ def solve_with_ortools(cfg: dict, days: List[DayRow], slots: List[Slot]) -> Tupl
             if isinstance(pool_raw, list):
                 for p in pool_raw:
                     pn = norm_name(p)
-                    if pn and pn in doc_to_idx:
+                    if pn and pn in doc_to_idx and pn != 'Recupero':
                         pool.append(pn)
             if not pool:
                 # fallback: any doctor that actually appears in some var for these slots
@@ -1824,7 +1801,17 @@ def solve_with_ortools(cfg: dict, days: List[DayRow], slots: List[Slot]) -> Tupl
     except Exception:
         # never fail scheduling due to a balance/cap config issue
         pass
-    # No special penalty for 'Recupero' – treat like any other doctor.
+    # Penalize using placeholder 'Recupero' (otherwise the solver overuses it to improve fairness)
+    gc_obj = cfg.get("global_constraints", {}) or {}
+    rec_pen_default = int(gc_obj.get("recupero_penalty_default", 50))
+    rec_pen_echo = int(gc_obj.get("recupero_penalty_echo", 200))
+    for s in slots:
+        v_rec = x.get((s.slot_id, "Recupero"))
+        if v_rec is None:
+            continue
+        cols = set(s.columns)
+        pen = rec_pen_echo if cols.intersection({"Q","R","T"}) else rec_pen_default
+        objective_terms.append(pen * v_rec)
     # Maximize number of Wednesdays with dedicated S assignment (if optional)
     s_slots = [s for s in slots if s.columns == ["S"]]
     s_dedicated = []
@@ -1932,26 +1919,12 @@ def solve_greedy(cfg: dict, days: List[DayRow], slots: List[Slot]) -> Tuple[Dict
     night_off_next = bool((gc.get("night_off") or {}).get("next_day", True))
     # --- Hard quotas / caps from rules
     rules = cfg.get("rules", {}) or {}
-    # L: Recupero quota (supports either MAX int, or [min,max])
+    # L: Recupero cap (interpret as MAX, not exact)
     L_cap_rec = None
-    L_min_rec = None
     if isinstance(rules.get("L"), dict):
-        _q = rules["L"].get("quota_recupero_per_month")
-        if isinstance(_q, (list, tuple)) and len(_q) == 2:
-            L_min_rec, L_cap_rec = int(_q[0]), int(_q[1])
-            if L_min_rec > L_cap_rec:
-                L_min_rec, L_cap_rec = L_cap_rec, L_min_rec
-        else:
-            L_cap_rec = int(_q) if _q is not None else None
+        L_cap_rec = rules["L"].get("quota_recupero_per_month")
+        L_cap_rec = int(L_cap_rec) if L_cap_rec is not None else None
     L_rec_used = 0
-
-    # T: minimum Recupero assignments (optional)
-    T_need_rec = None
-    if isinstance(rules.get("T"), dict):
-        _t = rules["T"].get("min_recupero_per_month")
-        T_need_rec = int(_t) if _t is not None else None
-    T_rec_used = 0
-
     # Y: Monday specialist clinics
     # - Y_MAIN: always 1 doctor among the main pool (rotation)
     # - Y_REC: optional second line (Recupero) on exactly 2 Mondays/month
@@ -1961,64 +1934,6 @@ def solve_greedy(cfg: dict, days: List[DayRow], slots: List[Slot]) -> Tuple[Dict
     Y_rec_used = 0
     Y_rec_slots_total = sum(1 for s in slots if getattr(s, "rule_tag", "") == "Y_REC")
     Y_rec_slots_done = 0
-    # Totals for enforcing min quotas with look-ahead
-    T_slots_total = sum(1 for s in slots_sorted if s.columns == ["T"] and getattr(s.day, "dow", "") != "Sat")
-    T_slots_done = 0
-    L_slots_total = sum(1 for s in slots_sorted if s.columns == ["L"])
-    L_slots_done = 0
-    # --- Pre-assign "Recupero" to satisfy min quotas while enforcing per-day uniqueness
-    reserved_dates: Set[dt.date] = set()
-
-    def reserve_slot(slot: Slot) -> bool:
-        # Reserve the whole day for Recupero (so it can't be used in other slots that day).
-        if slot.day.date in reserved_dates:
-            return False
-        if "Recupero" not in (slot.allowed or []):
-            return False
-        assignment[slot.slot_id] = "Recupero"
-        used_per_day[slot.day.date].add("Recupero")
-        reserved_dates.add(slot.day.date)
-        load_total["Recupero"] += 1
-        load_by_tag[slot.rule_tag or ""]["Recupero"] += 1
-        nonlocal_vars = None  # placeholder for readability
-        nonlocal L_rec_used, T_rec_used, Y_rec_used
-        if slot.columns == ["L"]:
-            L_rec_used += 1
-        if slot.columns == ["T"] and getattr(slot.day, "dow", "") != "Sat":
-            T_rec_used += 1
-        if (slot.rule_tag or "") == "Y_REC":
-            Y_rec_used += 1
-        return True
-
-    # Y: choose 2 Mondays for Y_REC (prefer 1st and 3rd Monday if available)
-    if Y_need_rec:
-        y_slots = sorted([s for s in slots_sorted if (s.rule_tag or "") == "Y_REC"], key=lambda s: s.day.date)
-        picks = []
-        if len(y_slots) >= 3:
-            picks = [y_slots[0], y_slots[2]]
-        else:
-            picks = y_slots[:2]
-        for s in picks:
-            if Y_rec_used >= Y_need_rec:
-                break
-            reserve_slot(s)
-
-    # T: reserve min required T slots for Recupero (spread from the start of the month)
-    if T_need_rec:
-        t_slots = sorted([s for s in slots_sorted if s.columns == ["T"] and getattr(s.day, "dow", "") != "Sat"], key=lambda s: s.day.date)
-        for s in t_slots:
-            if T_rec_used >= T_need_rec:
-                break
-            reserve_slot(s)
-
-    # L: reserve the minimum required L slots for Recupero
-    if L_min_rec:
-        l_slots = sorted([s for s in slots_sorted if s.columns == ["L"]], key=lambda s: s.day.date)
-        for s in l_slots:
-            if L_rec_used >= L_min_rec:
-                break
-            reserve_slot(s)
-
     Y_pool_counts = Counter()
     # Night equalization target (if divisible)
     night_pool = set()
@@ -2032,8 +1947,8 @@ def solve_greedy(cfg: dict, days: List[DayRow], slots: List[Slot]) -> Tuple[Dict
     if night_pool and night_slots_total > 0 and night_slots_total % len(night_pool) == 0:
         night_target = night_slots_total // len(night_pool)
     def can_assign(s: Slot, doc: str) -> bool:
-        # per-day uniqueness
-        if (not _slot_is_exempt_daily(s)) and doc in used_per_day[s.day.date]:
+        # per-day uniqueness (ignore placeholder 'Recupero')
+        if (not _slot_is_exempt_daily(s)) and doc != "Recupero" and doc in used_per_day[s.day.date]:
             return False
         # L cap for Recupero
         if s.columns == ["L"] and doc == "Recupero" and L_cap_rec is not None and L_rec_used >= L_cap_rec:
@@ -2096,35 +2011,12 @@ def solve_greedy(cfg: dict, days: List[DayRow], slots: List[Slot]) -> Tuple[Dict
                 return None
             # otherwise, leave blank to keep flexibility
             return None
-
-        # Force Recupero on T when needed to reach minimum (excluding Saturdays by default)
-        if s.columns == ["T"] and T_need_rec:
-            remaining_after_this = (T_slots_total - (T_slots_done + 1))
-            remaining_need = (T_need_rec - T_rec_used)
-            if remaining_need > 0 and remaining_need > remaining_after_this:
-                if "Recupero" in candidates:
-                    return "Recupero"
-
-        # Force Recupero on L when needed to reach minimum (if configured)
-        if s.columns == ["L"] and L_min_rec:
-            remaining_after_this = (L_slots_total - (L_slots_done + 1))
-            remaining_need = (L_min_rec - L_rec_used)
-            if remaining_need > 0 and remaining_need > remaining_after_this:
-                if "Recupero" in candidates:
-                    return "Recupero"
-
         candidates.sort(key=lambda d: score_candidate(s, d))
         return candidates[0]
     conflicts = []
     for s in slots_sorted:
-        if assignment.get(s.slot_id) is not None:
-            continue
         if (s.rule_tag or "") == "Y_REC":
             Y_rec_slots_done += 1
-        if s.columns == ["T"] and getattr(s.day, "dow", "") != "Sat":
-            T_slots_done += 1
-        if s.columns == ["L"]:
-            L_slots_done += 1
         chosen = pick(s)
         if chosen is None:
             if s.required:
@@ -2139,8 +2031,6 @@ def solve_greedy(cfg: dict, days: List[DayRow], slots: List[Slot]) -> Tuple[Dict
             nights_by_doc[chosen].append(s.day.date)
         if s.columns == ["L"] and chosen == "Recupero":
             L_rec_used += 1
-        if s.columns == ["T"] and chosen == "Recupero" and getattr(s.day, "dow", "") != "Sat":
-            T_rec_used += 1
         if (s.rule_tag or "") == "Y_REC":
             if chosen == "Recupero":
                 Y_rec_used += 1
