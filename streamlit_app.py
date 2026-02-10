@@ -405,6 +405,27 @@ def load_doctor_contacts_from_github() -> dict:
         out[str(k)] = {"email": str(v.get("email") or ""), "phone": str(v.get("phone") or "")}
     return out
 
+
+def _doctor_key_norm(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", (str(s or "")).casefold())
+
+def get_doctor_contact(doctor: str) -> dict:
+    """Robust contact lookup (exact / casefold / normalized)."""
+    contacts = load_doctor_contacts_from_github()
+    dk = str(doctor or "").strip()
+    if dk in contacts:
+        return contacts[dk] or {}
+    dkl = dk.casefold()
+    for k, v in contacts.items():
+        if str(k).strip().casefold() == dkl:
+            return v or {}
+    dkn = _doctor_key_norm(dk)
+    if dkn:
+        for k, v in contacts.items():
+            if _doctor_key_norm(k) == dkn:
+                return v or {}
+    return {}
+
 def load_doctor_pin_record(doctor: str) -> tuple[dict | None, str | None]:
     """Load the per-doctor PIN record file from GitHub."""
     g = _github_cfg()
@@ -1511,8 +1532,23 @@ if mode == "Indisponibilità (Medico)":
                     st.error("PIN non valido. Controlla il PIN e riprova.")
 
         def _do_pin_setup_flow(mode_label: str):
-            contacts = load_doctor_contacts_from_github()
-            c = contacts.get(doctor) or {}
+            # Se hai appena aggiornato data/doctor_contacts.yml, la cache può mantenere i vecchi valori per ~2 minuti.
+
+            if st.button("🔄 Ricarica contatti", key=f"reload_contacts_{mode_label}"):
+
+                try:
+
+                    load_doctor_contacts_from_github.clear()
+
+                except Exception:
+
+                    pass
+
+                st.rerun()
+
+
+            c = get_doctor_contact(doctor)
+
             email = str(c.get("email") or "").strip()
             phone = str(c.get("phone") or "").strip()
 
@@ -1522,12 +1558,28 @@ if mode == "Indisponibilità (Medico)":
             if _sms_is_configured() and phone:
                 available_channels.append(("SMS", "sms", _mask_phone(phone)))
 
+
             if not available_channels:
-                st.error(
-                    "Non posso inviare il codice di verifica: per questo medico non è configurata "
-                    "una Email/numero di telefono oppure il servizio Email/SMS non è configurato."
+                missing = []
+                if not (email or phone):
+                    missing.append("contatto non trovato per questo medico")
+                if email and not _email_is_configured():
+                    missing.append("SMTP non configurato")
+                if phone and not _sms_is_configured():
+                    missing.append("SMS non configurato")
+                if not missing:
+                    missing.append("canale non disponibile")
+
+                st.error("Non posso inviare il codice di verifica (" + "; ".join(missing) + ").")
+                if email:
+                    st.caption(f"Email configurata per il medico: {_mask_email(email)}")
+                if phone:
+                    st.caption(f"Telefono configurato per il medico: {_mask_phone(phone)}")
+
+                st.info(
+                    "Soluzione: verifica che la chiave nel file data/doctor_contacts.yml coincida con il nome selezionato nel menu (o una variante equivalente: maiuscole/minuscole/spazi/punteggiatura non contano). "
+                    "Poi configura SMTP (Gmail) o Twilio nei secrets."
                 )
-                st.info("Soluzione: aggiungi i contatti in data/doctor_contacts.yml e configura SMTP o Twilio nei secrets.")
                 return
 
             st.caption("Per motivi di sicurezza, per impostare o resettare il PIN serve un codice inviato via Email o SMS.")
