@@ -7,7 +7,7 @@ on:
 
 concurrency:
   group: keep-streamlit-awake
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   ping:
@@ -17,31 +17,33 @@ jobs:
         env:
           STREAMLIT_APP_URL: ${{ secrets.STREAMLIT_APP_URL }}
         run: |
-          set -euo pipefail
+          set -u  # niente variabili non definite
 
           if [ -z "${STREAMLIT_APP_URL:-}" ]; then
             echo "Missing secret STREAMLIT_APP_URL (Repo → Settings → Secrets and variables → Actions)."
             exit 1
           fi
 
-          # Config: modalità recupero
+          # Modalità recupero: riprova ogni 30s fino a 25 min
           RETRY_EVERY_SECONDS=30
-          MAX_RECOVERY_SECONDS=$((25*60))   # 25 minuti
+          MAX_RECOVERY_SECONDS=$((25*60))
           DEADLINE=$(( $(date +%s) + MAX_RECOVERY_SECONDS ))
 
           attempt=0
           while true; do
             attempt=$((attempt+1))
 
-            # Timeout abbastanza lungo per consentire il wake-up di Streamlit Cloud
+            # Non far terminare lo script se curl fallisce
+            set +e
             http_code=$(curl -L -sS -o /dev/null -w "%{http_code}" \
               --connect-timeout 15 --max-time 180 "$STREAMLIT_APP_URL")
             rc=$?
+            set -e
 
             ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
             echo "[$ts] Attempt $attempt: curl_rc=$rc http=$http_code url=$STREAMLIT_APP_URL"
 
-            # Successo se 2xx o 3xx
+            # OK se 2xx o 3xx
             if [ $rc -eq 0 ] && [ "$http_code" -ge 200 ] && [ "$http_code" -lt 400 ]; then
               echo "Ping OK"
               exit 0
