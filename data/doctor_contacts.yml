@@ -6,8 +6,56 @@
 #
 # NOTA: se vuoi usare solo Email, puoi omettere phone.
 
+"Allegra":
+  email: "martallegra@ymail.com"
+
+"Calabrò":
+  email: "danilacalabro@gmail.com"
+
+"Colarusso":
+  email: "dott.luigicolarusso@gmail.com"
+
+"Crea":
+  email: "pasqualecrea85@gmail.com"
+
+"Cusmà":
+  email: "maurizio.cusma@gmail.com"
+
+"Crea":
+  email: "pasqualecrea85@gmail.com"
+  
+"D'Angelo":
+  email: "myriamdangelo85@gmail.com"
+
+"Cimino":
+  email: "claudia.cimino@polime.it"
+
+"Dattilo":
+  email: "giuseppe.dattilo@unime.it"
+
+"De Gregorio":
+  email: "019330@polime.it"
+
+"Grimaldi":
+  email: "patgrima@alice.it"
+
 "Licordari":
   email: "robertolicordari@gmail.com"
-  phone: "+393331234567"
 
+"Manganaro":
+  email: "manganaro.roberta@gmail.com"
 
+"Migliorato":
+  email: "alessandro.migliorato@polime.it"
+
+"Pugliatti":
+  email: "pietropugliatti@tiscali.it"
+
+"Recupero":
+  email: "toninorecupero@virgilio.it"
+
+"Trio":
+  email: "olimpia.trio@gmail.com"
+
+"Zito":
+  email: "concetta.zito@unime.it"
