@@ -1,0 +1,14 @@
+# Mappa contatti medici per OTP (Email/SMS) – repository PRIVATA consigliata
+# Esempio:
+# "Cognome Nome":
+#   email: "nome.cognome@ospedale.it"
+#   phone: "+39XXXXXXXXXX"
+#
+# NOTA: se vuoi usare solo Email, puoi omettere phone.
+
+"Rossi Mario":
+  email: "mario.rossi@ospedale.it"
+  phone: "+393331234567"
+
+"Bianchi Laura":
+  email: "laura.bianchi@ospedale.it"
