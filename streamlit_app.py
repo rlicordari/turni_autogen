@@ -1721,51 +1721,59 @@ if mode == "Indisponibilità (Medico)":
         7: "Luglio", 8: "Agosto", 9: "Settembre", 10: "Ottobre", 11: "Novembre", 12: "Dicembre",
     }
 
+    # Default month/year: the NEXT month relative to today's date
+    # Example: if today is 2026-02-12, default is 2026-03
+    _first_of_this_month = today.replace(day=1)
+    _first_of_next_month = (_first_of_this_month + timedelta(days=32)).replace(day=1)
+    default_year = _first_of_next_month.year
+    default_month = _first_of_next_month.month
 
-# Default month/year: the NEXT month relative to today's date
-# Example: if today is 2026-02-12, default is 2026-03
-_first_of_this_month = today.replace(day=1)
-_first_of_next_month = (_first_of_this_month + timedelta(days=32)).replace(day=1)
-default_year = _first_of_next_month.year
-default_month = _first_of_next_month.month
+    # Initialize widget defaults only once per session (Streamlit keys persist across reruns)
+    st.session_state.setdefault("doctor_year_sel", default_year)
+    st.session_state.setdefault("doctor_month_sel", default_month)
+    sel_default = st.session_state.get("doctor_selected_months") or [(default_year, default_month)]
 
-# Initialize widget defaults only once per session (Streamlit keys persist across reruns)
-st.session_state.setdefault("doctor_year_sel", default_year)
-st.session_state.setdefault("doctor_month_sel", default_month)# Keep month selection ORDERED (first tab opens by default).
-# We want: when the user clicks "Aggiungi", the added month becomes the first tab (open immediately).
-selected = list(st.session_state.get("doctor_selected_months") or [(default_year, default_month)])
-
-# Deduplicate while preserving order
-_seen = set()
-selected = [x for x in selected if (x not in _seen and not _seen.add(x))]
-
+    # Preserve order (most recently added first) and de-duplicate
+    selected = []
+    _seen = set()
+    for _t in (sel_default or []):
+        try:
+            _yy, _mm = int(_t[0]), int(_t[1])
+        except Exception:
+            continue
+        _k = (_yy, _mm)
+        if _k in _seen:
+            continue
+        _seen.add(_k)
+        selected.append(_k)
     st.subheader("3) Seleziona mese/i da compilare")
     c1, c2, c3, c4 = st.columns([1, 1.4, 1, 1])
     with c1:
-        yy_sel = st.selectbox("Anno", year_options, index=year_options.index(st.session_state.get("doctor_year_sel", default_year)), key="doctor_year_sel")
+        yy_sel = st.selectbox("Anno", year_options, key="doctor_year_sel")
     with c2:
         mm_sel = st.selectbox(
             "Mese",
             list(range(1, 13)),
             format_func=lambda m: f"{m:02d} - {month_names.get(m, str(m))}",
-            index=(int(st.session_state.get("doctor_month_sel", default_month)) - 1),
             key="doctor_month_sel",
         )
     with c3:
         add_month = st.button("Aggiungi", use_container_width=True, help="Aggiunge l’anno/mese selezionato all’elenco.")
     with c4:
-        remove_month = st.button("Rimuovi", use_container_width=True, help="Rimuove l’anno/mese selezionato dall’elenco.")cur = (int(yy_sel), int(mm_sel))
+        remove_month = st.button("Rimuovi", use_container_width=True, help="Rimuove l’anno/mese selezionato dall’elenco.")
 
-if add_month:
-    # Put the added month first so its tab opens immediately
-    if cur in selected:
-        selected = [x for x in selected if x != cur]
-    selected.insert(0, cur)
+    cur = (int(yy_sel), int(mm_sel))
+    if add_month:
+        # Make newly added month the first tab (auto-open)
+        if cur in selected:
+            selected.remove(cur)
+        selected.insert(0, cur)
 
-if remove_month:
-    selected = [x for x in selected if x != cur]
+    if remove_month:
+        if cur in selected:
+            selected.remove(cur)
 
-st.session_state.doctor_selected_months = selected
+    st.session_state.doctor_selected_months = selected
     st.caption("Mesi selezionati: " + ", ".join([f"{yy}-{mm:02d}" for (yy, mm) in selected]))
     if not selected:
         st.info("Aggiungi almeno un mese per iniziare.")
@@ -1855,40 +1863,7 @@ st.session_state.doctor_selected_months = selected
                 init = [{"Data": date(yy, mm, 1), "Fascia": "Mattina", "Note": ""}]
 
             if unav_open:
-editor_key = f"unav_editor_{doctor}_{yy}_{mm}"
-
-# Add a prefilled row so the date picker opens on the selected month
-add_row = st.button(
-    "➕ Aggiungi riga",
-    key=f"add_row_{doctor}_{yy}_{mm}",
-    use_container_width=False,
-    help="Aggiunge una riga precompilata (data nel mese selezionato).",
-)
-if add_row:
-    current = st.session_state.get(editor_key)
-    base_rows = current if isinstance(current, list) else init
-    new_rows = list(base_rows)
-    new_rows.append({"Data": date(yy, mm, 1), "Fascia": None, "Note": ""})
-    st.session_state[editor_key] = new_rows
-    st.rerun()
-
-# If the user added a new blank row using the built-in "+" of the editor,
-# Streamlit may initialize the Date picker around today's month.
-# We prefill the Date for rows that have no Date yet, so the calendar opens on the selected month.
-current_state = st.session_state.get(editor_key)
-if isinstance(current_state, list):
-    changed = False
-    fixed_rows = []
-    for row in current_state:
-        r = dict(row) if isinstance(row, dict) else row
-        if not r.get("Data"):
-            r["Data"] = date(yy, mm, 1)
-            changed = True
-        fixed_rows.append(r)
-    if changed:
-        st.session_state[editor_key] = fixed_rows
-
-                                edited = st.data_editor(
+                edited = st.data_editor(
                     init,
                     num_rows="dynamic",
                     use_container_width=True,
@@ -1897,7 +1872,7 @@ if isinstance(current_state, list):
                         "Fascia": st.column_config.SelectboxColumn("Fascia", options=FASCIA_OPTIONS, required=True),
                         "Note": st.column_config.TextColumn("Note"),
                     },
-                    key=editor_key,
+                    key=f"unav_editor_{doctor}_{yy}_{mm}",
                 )
             else:
                 # Read-only view when the admin closes submissions
