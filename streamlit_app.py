@@ -99,20 +99,6 @@ st.set_page_config(
     layout="wide",
 )
 
-st.markdown(
-    """
-<style>
-/* Tidy up spacing */
-.block-container { padding-top: 1.2rem; padding-bottom: 2.5rem; }
-h1 { margin-bottom: 0.2rem; }
- .small-muted { opacity: 0.75; font-size: 0.92rem; }
-.kpi { padding: 0.75rem 0.9rem; border-radius: 0.75rem; border: 1px solid rgba(128, 128, 128, 0.25); }
-.kpi b { font-size: 1.05rem; }
-hr { margin: 0.9rem 0; }
-</style>
-""",
-    unsafe_allow_html=True,
-)
 
 # Build / version banner
 with st.sidebar:
@@ -238,7 +224,17 @@ def _mask_phone(p: str) -> str:
 def _github_cfg() -> dict:
     cfg = _get_secret(("github_unavailability",), None)
     if isinstance(cfg, Mapping):
-        return dict(cfg)
+        out = dict(cfg)
+
+        # If some path settings are provided under [auth], use them as fallback defaults.
+        auth_cfg = _get_secret(("auth",), None)
+        if isinstance(auth_cfg, Mapping):
+            for k in ("path", "settings_path", "audit_dir", "sessions_dir", "doctor_auth_dir", "contacts_path"):
+                if auth_cfg.get(k) and not out.get(k):
+                    out[k] = auth_cfg.get(k)
+
+        return out
+
     # fallback flat keys
     return {
         "token": _get_secret(("GITHUB_UNAV_TOKEN",), ""),
@@ -603,8 +599,7 @@ def save_doctor_otp_record(doctor: str, rec: dict, sha: str | None, message: str
 
 def request_pin_otp(doctor: str, channel: str) -> str:
     """Send an OTP to the doctor's configured email/SMS. Returns masked destination."""
-    contacts = load_doctor_contacts_from_github()
-    c = contacts.get(doctor) or {}
+    c = get_doctor_contact(doctor) or {}
     email = str(c.get("email") or "").strip()
     phone = str(c.get("phone") or "").strip()
 
@@ -1427,7 +1422,7 @@ def release_doctor_session(doctor: str):
 
 
 # ---------------- UI: Header ----------------
-st.title("Turni UTIC – Autogeneratore")
+st.title("Turni UOC Cardiologia – UTIC")
 st.markdown(
     '<div class="small-muted">Genera il file turni del mese rispettando regole e indisponibilità. '
     'I medici possono inserire solo le <b>proprie</b> indisponibilità (privacy).</div>',
@@ -1697,113 +1692,80 @@ if mode == "Indisponibilità (Medico)":
         st.error(f"Errore gestione sessione: {e}")
         st.stop()
 
-    # ---- Selezione mesi da compilare (Anno + Mese separati) ----
-    today = date.today()
-    horizon_years = 20  # ampia finestra per evitare modifiche future
-    year_options = list(range(today.year, today.year + horizon_years + 1))
-    month_names = {
-        1: "Gennaio", 2: "Febbraio", 3: "Marzo", 4: "Aprile", 5: "Maggio", 6: "Giugno",
-        7: "Luglio", 8: "Agosto", 9: "Settembre", 10: "Ottobre", 11: "Novembre", 12: "Dicembre",
-    }
+# ---- Selezione mesi da compilare (Anno + Mese separati) ----
+today = date.today()
+horizon_years = 20  # ampia finestra per evitare modifiche future
+year_options = list(range(today.year, today.year + horizon_years + 1))
+month_names = {
+    1: "Gennaio", 2: "Febbraio", 3: "Marzo", 4: "Aprile", 5: "Maggio", 6: "Giugno",
+    7: "Luglio", 8: "Agosto", 9: "Settembre", 10: "Ottobre", 11: "Novembre", 12: "Dicembre",
+}
 
+# Default mese/anno = mese successivo rispetto a oggi.
+_first_of_this_month = today.replace(day=1)
+_first_of_next_month = (_first_of_this_month + timedelta(days=32)).replace(day=1)
+default_year = _first_of_next_month.year
+default_month = _first_of_next_month.month
 
-
-    # Default month/year: the NEXT month relative to today's date
-
-
-    # Example: if today is 2026-02-12, default is 2026-03
-
-
-    _first_of_this_month = today.replace(day=1)
-
-
-    _first_of_next_month = (_first_of_this_month + timedelta(days=32)).replace(day=1)
-
-
-    default_year = _first_of_next_month.year
-
-
-    default_month = _first_of_next_month.month
-
-
-
-    # Initialize widget defaults only once per browser session
-
-
-    st.session_state.setdefault("doctor_year_sel", default_year)
-
-
-    st.session_state.setdefault("doctor_month_sel", default_month)
-
-
-# Sanitize persisted widget state (in case of old sessions / invalid values)
+# Inizializza i default dei widget (solo se mancanti/non validi)
 if st.session_state.get("doctor_year_sel") not in year_options:
     st.session_state["doctor_year_sel"] = default_year
-if not isinstance(st.session_state.get("doctor_month_sel"), int) or not (1 <= int(st.session_state["doctor_month_sel"]) <= 12):
+if st.session_state.get("doctor_month_sel") not in range(1, 13):
     st.session_state["doctor_month_sel"] = default_month
 
+selected = list(st.session_state.get("doctor_selected_months") or [])
+if not selected:
+    selected = [(default_year, default_month)]
 
+# Unicità preservando l'ordine (il primo sarà la tab aperta)
+_seen = set()
+selected = [x for x in selected if not (x in _seen or _seen.add(x))]
 
-    sel_default = st.session_state.get("doctor_selected_months") or [(default_year, default_month)]
-    sel_set = set(sel_default)
+st.subheader("3) Seleziona mese/i da compilare")
+c1, c2, c3, c4 = st.columns([1, 1.4, 1, 1])
+with c1:
+    yy_sel = st.selectbox("Anno", year_options, key="doctor_year_sel")
+with c2:
+    mm_sel = st.selectbox(
+        "Mese",
+        list(range(1, 13)),
+        format_func=lambda m: f"{m:02d} - {month_names.get(m, str(m))}",
+        key="doctor_month_sel",
+    )
+with c3:
+    add_month = st.button("Aggiungi", use_container_width=True, help="Aggiunge l’anno/mese selezionato all’elenco.")
+with c4:
+    remove_month = st.button("Rimuovi", use_container_width=True, help="Rimuove l’anno/mese selezionato dall’elenco.")
 
-    st.subheader("3) Seleziona mese/i da compilare")
-    c1, c2, c3, c4 = st.columns([1, 1.4, 1, 1])
-    with c1:
-        yy_sel = st.selectbox("Anno", year_options, key="doctor_year_sel")
-    with c2:
-        mm_sel = st.selectbox(
-            "Mese",
-            list(range(1, 13)),
-            format_func=lambda m: f"{m:02d} - {month_names.get(m, str(m))}",
-            key="doctor_month_sel",
-        )
-    with c3:
-        add_month = st.button("Aggiungi", use_container_width=True, help="Aggiunge l’anno/mese selezionato all’elenco.")
-    with c4:
-        remove_month = st.button("Rimuovi", use_container_width=True, help="Rimuove l’anno/mese selezionato dall’elenco.")
-
-    cur = (int(yy_sel), int(mm_sel))
-
-    if add_month:
-
-        # Put the newly added month at the top so its tab opens immediately
-
-        if cur in sel_set:
-
-            sel_set.discard(cur)
-
-        selected = [cur] + sorted(sel_set)
-
-    elif remove_month:
-
-        sel_set.discard(cur)
-
-        selected = sorted(sel_set)
-
-    else:
-
-        selected = sorted(sel_set)
-
-
+cur = (int(yy_sel), int(mm_sel))
+if add_month:
+    # Metti il mese appena aggiunto come primo → tab subito aperta
+    if cur in selected:
+        selected.remove(cur)
+    selected.insert(0, cur)
     st.session_state.doctor_selected_months = selected
-    st.caption("Mesi selezionati: " + ", ".join([f"{yy}-{mm:02d}" for (yy, mm) in selected]))
-    if not selected:
-        st.info("Aggiungi almeno un mese per iniziare.")
-        st.stop()
+    st.rerun()
+if remove_month:
+    if cur in selected:
+        selected = [x for x in selected if x != cur]
+        st.session_state.doctor_selected_months = selected
+        st.rerun()
+
+st.session_state.doctor_selected_months = selected
+
+st.caption("Mesi selezionati: " + ", ".join([f"{yy}-{mm:02d}" for (yy, mm) in selected]))
+if not selected:
+    st.info("Aggiungi almeno un mese per iniziare.")
+    st.stop()
 
     label_map = {(yy, mm): f"{yy}-{mm:02d}" for (yy, mm) in selected}
 
     # Stable baseline (snapshot) for this editing session.
     # This is what we compare against at save-time to detect a stale editor.
-    cR1, cR2 = st.columns([1, 3])
-    with cR1:
-        refresh_baseline = st.button(
-            "🔄 Ricarica dati",
-            help="Ricarica l’archivio dal server (utile se qualcuno ha appena salvato).",
-        )
-    with cR2:
-        st.caption("La sessione usa uno snapshot per evitare conflitti: al salvataggio viene sempre verificato sul server.")
+    refresh_baseline = st.button(
+        "🔄 Ricarica dati",
+        help="Ricarica l’archivio dal server (utile se qualcuno ha appena salvato).",
+    )
 
     if refresh_baseline:
         # Reset baseline + editors so the UI reflects the latest server state.
@@ -1838,10 +1800,6 @@ if not isinstance(st.session_state.get("doctor_month_sel"), int) or not (1 <= in
 
     if not unav_open:
         st.warning("🔒 Inserimento indisponibilità temporaneamente **chiuso** dall'amministratore. Puoi solo visualizzare (non puoi salvare).")
-    st.caption(
-        f"Limite per medico: **max {max_per_shift}** inserimenti per ogni fascia "
-        "(Mattina/Pomeriggio/Notte/Diurno/Tutto il giorno) per ogni mese."
-    )
 
     st.divider()
 
@@ -1881,48 +1839,12 @@ if not isinstance(st.session_state.get("doctor_month_sel"), int) or not (1 <= in
             if not init:
                 init = [{"Data": date(yy, mm, 1), "Fascia": "Mattina", "Note": ""}]
 
+            editor_key = f"unav_editor_{doctor}_{yy}_{mm}"
+
             if unav_open:
-                editor_key = f"unav_editor_{doctor}_{yy}_{mm}"
-
-                cAdd1, cAdd2 = st.columns([1, 1])
-                with cAdd1:
-                    add_row = st.button(
-                        "➕ Aggiungi riga",
-                        key=f"add_row_{doctor}_{yy}_{mm}",
-                        help="Aggiunge una riga precompilata (data nel mese selezionato).",
-                    )
-                with cAdd2:
-                    clean_rows = st.button(
-                        "🧹 Pulisci righe vuote",
-                        key=f"clean_rows_{doctor}_{yy}_{mm}",
-                        help="Rimuove le righe completamente vuote dal foglio.",
-                    )
-
-                if add_row or clean_rows:
-                    current = st.session_state.get(editor_key)
-                    base_rows = current if isinstance(current, list) else init
-                    new_rows = []
-
-                    for r in base_rows:
-                        d = r.get("Data") if isinstance(r, dict) else None
-                        f = r.get("Fascia") if isinstance(r, dict) else None
-                        n = r.get("Note") if isinstance(r, dict) else None
-                        if (d in (None, "", "None")) and (f in (None, "", "None")) and (n in (None, "", "None")):
-                            continue
-                        new_rows.append(dict(r))
-
-                    if add_row:
-                        new_rows.append({"Data": date(yy, mm, 1), "Fascia": "Mattina", "Note": ""})
-
-                    if not new_rows:
-                        new_rows = [{"Data": date(yy, mm, 1), "Fascia": "Mattina", "Note": ""}]
-
-                    st.session_state[editor_key] = new_rows
-                    st.rerun()
-
                 edited = st.data_editor(
                     init,
-                    num_rows="fixed",
+                    num_rows="dynamic",
                     use_container_width=True,
                     column_config={
                         "Data": st.column_config.DateColumn("Data", required=True),
@@ -1931,6 +1853,27 @@ if not isinstance(st.session_state.get("doctor_month_sel"), int) or not (1 <= in
                     },
                     key=editor_key,
                 )
+
+                # Auto-fill defaults for newly added rows:
+                # Streamlit adds a blank row with Data=None; date picker then opens on *today*.
+                # By pre-filling Data to the first day of the selected month, the calendar opens on the correct month.
+                _changed = False
+                _filled = []
+                for _row in (edited or []):
+                    _r = dict(_row or {})
+                    if not _r.get("Data"):
+                        _r["Data"] = date(yy, mm, 1)
+                        _changed = True
+                    if not _r.get("Fascia"):
+                        _r["Fascia"] = "Mattina"
+                        _changed = True
+                    if _r.get("Note") is None:
+                        _r["Note"] = ""
+                        _changed = True
+                    _filled.append(_r)
+                if _changed:
+                    st.session_state[editor_key] = _filled
+                    st.rerun()
 
             else:
                 # Read-only view when the admin closes submissions
@@ -1968,11 +1911,7 @@ if not isinstance(st.session_state.get("doctor_month_sel"), int) or not (1 <= in
     any_over = any(bool(v) for v in (violations_by_month or {}).values())
     can_save = bool(unav_open) and (not any_over)
 
-    c1, c2 = st.columns([1, 2])
-    with c1:
-        save = st.button("Salva indisponibilità", type="primary", disabled=not can_save)
-    with c2:
-        st.caption("Privacy: salviamo solo le righe del tuo nominativo nei mesi selezionati.")
+    save = st.button("Salva indisponibilità", type="primary", disabled=not can_save)
 
     if save:
         if not unav_open:
@@ -2068,7 +2007,7 @@ if not isinstance(st.session_state.get("doctor_month_sel"), int) or not (1 <= in
 # =====================================================================
 #                           ADMIN – Generazione
 # =====================================================================
-else:
+elif mode == "Genera turni (Admin)":
     st.subheader("Generazione turni (Admin)")
     admin_pin = _get_admin_pin()
     if not admin_pin:
@@ -2290,10 +2229,8 @@ else:
     # Step 3: Vincolo post-notte (carryover)
     st.markdown("### 3) Vincolo post-notte a cavallo mese")
     st.info(
-        "Serve solo se qualcuno ha fatto **NOTTE l’ultimo giorno del mese precedente**: "
-        "quella persona **non può lavorare il Giorno 1** del mese corrente.\n\n"
-        "✅ Consigliato: carica l’**output del mese precedente**.\n"
-        "🔁 Alternativa: seleziona manualmente chi ha fatto la NOTTE.",
+        "Compila questo solo se nel mese precedente qualcuno ha fatto **NOTTE l’ultimo giorno**: "
+        "quella persona **non può lavorare il Giorno 1** del mese corrente.\n\n",
         icon="💡",
     )
 
