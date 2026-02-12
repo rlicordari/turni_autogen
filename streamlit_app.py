@@ -94,7 +94,7 @@ def normalize_fascia(val: object) -> tuple[str, bool, bool]:
     return "Tutto il giorno", True, True
 # ---------------- Page config & style ----------------
 st.set_page_config(
-    page_title="Turni UOC Cardiologia – UTIC",
+    page_title="Turni UTIC – Autogeneratore",
     page_icon="🗓️",
     layout="wide",
 )
@@ -236,47 +236,22 @@ def _mask_phone(p: str) -> str:
         return "***"
     return f"***{s[-3:]}"
 def _github_cfg() -> dict:
-    """GitHub storage configuration.
-
-    Priority:
-      1) [github_unavailability] mapping in Streamlit secrets
-      2) flat env/secrets keys (GITHUB_UNAV_*)
-    Convenience:
-      - if some path keys are not present, we also look under [auth] (legacy/compat).
-    """
-    base: dict = {}
-
     cfg = _get_secret(("github_unavailability",), None)
     if isinstance(cfg, Mapping):
-        base.update(dict(cfg))
-
-    # Fill missing from flat keys / defaults
-    def _set_default(k: str, v: object) -> None:
-        if not str(base.get(k) or "").strip():
-            base[k] = v
-
-    _set_default("token", _get_secret(("GITHUB_UNAV_TOKEN",), ""))
-    _set_default("owner", _get_secret(("GITHUB_UNAV_OWNER",), ""))
-    _set_default("repo", _get_secret(("GITHUB_UNAV_REPO",), ""))
-    _set_default("branch", _get_secret(("GITHUB_UNAV_BRANCH",), "main"))
-
-    _set_default("path", _get_secret(("GITHUB_UNAV_PATH",), "data/unavailability_store.csv"))
-    _set_default("settings_path", _get_secret(("GITHUB_UNAV_SETTINGS_PATH",), "data/unavailability_settings.yml"))
-    _set_default("audit_dir", _get_secret(("GITHUB_UNAV_AUDIT_DIR",), "data/unavailability_audit"))
-    _set_default("sessions_dir", _get_secret(("GITHUB_UNAV_SESSIONS_DIR",), "data/unavailability_sessions"))
-    _set_default("doctor_auth_dir", _get_secret(("GITHUB_DOCTOR_AUTH_DIR",), "data/doctor_auth"))
-    _set_default("contacts_path", _get_secret(("GITHUB_DOCTOR_CONTACTS_PATH",), "data/doctor_contacts.yml"))
-
-    # Optional legacy section [auth] (many installs already have these keys there)
-    auth = _get_secret(("auth",), None)
-    if isinstance(auth, Mapping):
-        for k in ("path", "settings_path", "audit_dir", "sessions_dir", "doctor_auth_dir", "contacts_path"):
-            if not str(base.get(k) or "").strip():
-                v = auth.get(k)
-                if isinstance(v, str) and v.strip():
-                    base[k] = v.strip()
-
-    return base
+        return dict(cfg)
+    # fallback flat keys
+    return {
+        "token": _get_secret(("GITHUB_UNAV_TOKEN",), ""),
+        "owner": _get_secret(("GITHUB_UNAV_OWNER",), ""),
+        "repo": _get_secret(("GITHUB_UNAV_REPO",), ""),
+        "branch": _get_secret(("GITHUB_UNAV_BRANCH",), "main"),
+        "path": _get_secret(("GITHUB_UNAV_PATH",), "data/unavailability_store.csv"),
+        "settings_path": _get_secret(("GITHUB_UNAV_SETTINGS_PATH",), "data/unavailability_settings.yml"),
+        "audit_dir": _get_secret(("GITHUB_UNAV_AUDIT_DIR",), "data/unavailability_audit"),
+        "sessions_dir": _get_secret(("GITHUB_UNAV_SESSIONS_DIR",), "data/unavailability_sessions"),
+        "doctor_auth_dir": _get_secret(("GITHUB_DOCTOR_AUTH_DIR",), "data/doctor_auth"),
+        "contacts_path": _get_secret(("GITHUB_DOCTOR_CONTACTS_PATH",), "data/doctor_contacts.yml"),
+    }
 
 # ---------------- Rules / doctors ----------------
 def load_rules_from_source(uploaded) -> tuple[dict, Path]:
@@ -411,23 +386,17 @@ def _verify_pin(pin: str, rec: dict) -> bool:
 def load_doctor_contacts_from_github() -> dict:
     """Return {doctor: {email, phone}} from a YAML file.
 
-    Primary source: GitHub repo configured for the unavailability store.
+    Primary source: GitHub repo configured in secrets (same repo used for the unavailability store).
     Fallback: local file inside the deployed app repo (useful if you keep contacts in the code repo).
-
-    Notes:
-      - contacts_path may be configured under [github_unavailability].contacts_path
-      - for backward compatibility we also accept [auth].contacts_path
     """
     g = _github_cfg()
-    auth = _get_secret(("auth",), None)
-    auth_path = (auth.get("contacts_path") if isinstance(auth, Mapping) else None)
-    remote_path = (g.get("contacts_path") or "").strip() or (str(auth_path).strip() if isinstance(auth_path, str) else "") or "data/doctor_contacts.yml"
+    path = g.get("contacts_path") or "data/doctor_contacts.yml"
 
     text: str | None = None
     gf = None
     try:
         gf = github_utils.get_file(
-            owner=g["owner"], repo=g["repo"], path=remote_path, token=g["token"], branch=g.get("branch", "main")
+            owner=g["owner"], repo=g["repo"], path=path, token=g["token"], branch=g.get("branch", "main")
         )
     except Exception:
         gf = None
@@ -436,22 +405,12 @@ def load_doctor_contacts_from_github() -> dict:
         text = gf.text
     else:
         # local fallback (Streamlit Cloud has the repo checked out on disk)
-        candidates = []
-        for p in (auth_path, remote_path, "data/doctor_contacts.yml"):
-            if isinstance(p, str) and p.strip():
-                candidates.append(p.strip())
-        seen = set()
-        for p in candidates:
-            if p in seen:
-                continue
-            seen.add(p)
-            try:
-                lp = Path(p)
-                if lp.exists() and lp.is_file():
-                    text = lp.read_text(encoding="utf-8", errors="replace")
-                    break
-            except Exception:
-                continue
+        try:
+            lp = Path(path)
+            if lp.exists() and lp.is_file():
+                text = lp.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            text = None
 
     if not text:
         return {}
@@ -462,7 +421,6 @@ def load_doctor_contacts_from_github() -> dict:
         data = {}
     if not isinstance(data, Mapping):
         return {}
-
     out: dict = {}
     for k, v in data.items():
         if not isinstance(v, Mapping):
@@ -572,7 +530,7 @@ def _send_otp_email(dest: str, code: str) -> None:
     if not _email_is_configured():
         raise RuntimeError("Invio email non configurato (smtp).")
     msg = EmailMessage()
-    msg["Subject"] = "Codice verifica – Turni UOC Cardiologia UTIC"
+    msg["Subject"] = "Codice verifica – Turni UTIC"
     msg["From"] = cfg.get("from")
     msg["To"] = dest
     msg.set_content(
@@ -605,7 +563,7 @@ def _send_otp_sms(dest: str, code: str) -> None:
     data = {
         "From": from_num,
         "To": dest,
-        "Body": f"Turni UOC Cardiologia UTIC - codice verifica PIN: {code}",
+        "Body": f"Turni UTIC - codice verifica PIN: {code}",
     }
     r = requests.post(url, data=data, auth=(sid, token), timeout=20)
     if r.status_code >= 400:
@@ -645,7 +603,8 @@ def save_doctor_otp_record(doctor: str, rec: dict, sha: str | None, message: str
 
 def request_pin_otp(doctor: str, channel: str) -> str:
     """Send an OTP to the doctor's configured email/SMS. Returns masked destination."""
-    c = get_doctor_contact(doctor)
+    contacts = load_doctor_contacts_from_github()
+    c = contacts.get(doctor) or {}
     email = str(c.get("email") or "").strip()
     phone = str(c.get("phone") or "").strip()
 
@@ -1468,7 +1427,12 @@ def release_doctor_session(doctor: str):
 
 
 # ---------------- UI: Header ----------------
-st.title("Turni UOC Cardiologia – UTIC")
+st.title("Turni UTIC – Autogeneratore")
+st.markdown(
+    '<div class="small-muted">Genera il file turni del mese rispettando regole e indisponibilità. '
+    'I medici possono inserire solo le <b>proprie</b> indisponibilità (privacy).</div>',
+    unsafe_allow_html=True,
+)
 
 mode = st.sidebar.radio(
     "Sezione",
@@ -1606,6 +1570,17 @@ if mode == "Indisponibilità (Medico)":
                 st.rerun()
 
 
+
+            contacts_all = load_doctor_contacts_from_github()
+            if not contacts_all:
+                g = _github_cfg()
+                path = g.get("contacts_path") or "data/doctor_contacts.yml"
+                st.error(
+                    "Non posso inviare il codice di verifica (contatti non caricati: file mancante/non leggibile oppure YAML non valido)."
+                )
+                st.caption(f"Sto cercando contatti in: {g.get('owner','')}/{g.get('repo','')}:{g.get('branch','main')}/{path}")
+                return
+
             c = get_doctor_contact(doctor)
 
             email = str(c.get("email") or "").strip()
@@ -1630,6 +1605,16 @@ if mode == "Indisponibilità (Medico)":
                     missing.append("canale non disponibile")
 
                 st.error("Non posso inviare il codice di verifica (" + "; ".join(missing) + ").")
+                # Diagnostica leggera (non mostra email/telefono)
+                try:
+                    _keys = list(load_doctor_contacts_from_github().keys())
+                    if _keys and ("contatto non trovato per questo medico" in missing):
+                        shown = ", ".join([str(k) for k in _keys[:30]])
+                        more = " …" if len(_keys) > 30 else ""
+                        st.caption(f"Contatti caricati per: {shown}{more}")
+                except Exception:
+                    pass
+
                 if email:
                     st.caption(f"Email configurata per il medico: {_mask_email(email)}")
                 if phone:
@@ -1721,40 +1706,49 @@ if mode == "Indisponibilità (Medico)":
         7: "Luglio", 8: "Agosto", 9: "Settembre", 10: "Ottobre", 11: "Novembre", 12: "Dicembre",
     }
 
+
+
     # Default month/year: the NEXT month relative to today's date
+
+
     # Example: if today is 2026-02-12, default is 2026-03
+
+
     _first_of_this_month = today.replace(day=1)
+
+
     _first_of_next_month = (_first_of_this_month + timedelta(days=32)).replace(day=1)
+
+
     default_year = _first_of_next_month.year
+
+
     default_month = _first_of_next_month.month
 
-    # Initialize widget defaults only once per session (Streamlit keys persist across reruns)
-    st.session_state.setdefault("doctor_year_sel", default_year)
-    st.session_state.setdefault("doctor_month_sel", default_month)
-    sel_default = st.session_state.get("doctor_selected_months") or [(default_year, default_month)]
 
-    # Preserve order (most recently added first) and de-duplicate
-    selected = []
-    _seen = set()
-    for _t in (sel_default or []):
-        try:
-            _yy, _mm = int(_t[0]), int(_t[1])
-        except Exception:
-            continue
-        _k = (_yy, _mm)
-        if _k in _seen:
-            continue
-        _seen.add(_k)
-        selected.append(_k)
+
+    # Initialize widget defaults only once per browser session
+
+
+    st.session_state.setdefault("doctor_year_sel", default_year)
+
+
+    st.session_state.setdefault("doctor_month_sel", default_month)
+
+
+    sel_default = st.session_state.get("doctor_selected_months") or [(default_year, default_month)]
+    sel_set = set(sel_default)
+
     st.subheader("3) Seleziona mese/i da compilare")
     c1, c2, c3, c4 = st.columns([1, 1.4, 1, 1])
     with c1:
-        yy_sel = st.selectbox("Anno", year_options, key="doctor_year_sel")
+        yy_sel = st.selectbox("Anno", year_options, index=year_options.index(int(st.session_state.get("doctor_year_sel", default_year))), key="doctor_year_sel")
     with c2:
         mm_sel = st.selectbox(
             "Mese",
             list(range(1, 13)),
             format_func=lambda m: f"{m:02d} - {month_names.get(m, str(m))}",
+            index=(int(st.session_state.get("doctor_month_sel", default_month)) - 1),
             key="doctor_month_sel",
         )
     with c3:
@@ -1763,15 +1757,27 @@ if mode == "Indisponibilità (Medico)":
         remove_month = st.button("Rimuovi", use_container_width=True, help="Rimuove l’anno/mese selezionato dall’elenco.")
 
     cur = (int(yy_sel), int(mm_sel))
-    if add_month:
-        # Make newly added month the first tab (auto-open)
-        if cur in selected:
-            selected.remove(cur)
-        selected.insert(0, cur)
 
-    if remove_month:
-        if cur in selected:
-            selected.remove(cur)
+    if add_month:
+
+        # Put the newly added month at the top so its tab opens immediately
+
+        if cur in sel_set:
+
+            sel_set.discard(cur)
+
+        selected = [cur] + sorted(sel_set)
+
+    elif remove_month:
+
+        sel_set.discard(cur)
+
+        selected = sorted(sel_set)
+
+    else:
+
+        selected = sorted(sel_set)
+
 
     st.session_state.doctor_selected_months = selected
     st.caption("Mesi selezionati: " + ", ".join([f"{yy}-{mm:02d}" for (yy, mm) in selected]))
@@ -1789,6 +1795,8 @@ if mode == "Indisponibilità (Medico)":
             "🔄 Ricarica dati",
             help="Ricarica l’archivio dal server (utile se qualcuno ha appena salvato).",
         )
+    with cR2:
+        st.caption("La sessione usa uno snapshot per evitare conflitti: al salvataggio viene sempre verificato sul server.")
 
     if refresh_baseline:
         # Reset baseline + editors so the UI reflects the latest server state.
@@ -1823,6 +1831,10 @@ if mode == "Indisponibilità (Medico)":
 
     if not unav_open:
         st.warning("🔒 Inserimento indisponibilità temporaneamente **chiuso** dall'amministratore. Puoi solo visualizzare (non puoi salvare).")
+    st.caption(
+        f"Limite per medico: **max {max_per_shift}** inserimenti per ogni fascia "
+        "(Mattina/Pomeriggio/Notte/Diurno/Tutto il giorno) per ogni mese."
+    )
 
     st.divider()
 
@@ -1863,17 +1875,56 @@ if mode == "Indisponibilità (Medico)":
                 init = [{"Data": date(yy, mm, 1), "Fascia": "Mattina", "Note": ""}]
 
             if unav_open:
+                editor_key = f"unav_editor_{doctor}_{yy}_{mm}"
+
+                cAdd1, cAdd2 = st.columns([1, 1])
+                with cAdd1:
+                    add_row = st.button(
+                        "➕ Aggiungi riga",
+                        key=f"add_row_{doctor}_{yy}_{mm}",
+                        help="Aggiunge una riga precompilata (data nel mese selezionato).",
+                    )
+                with cAdd2:
+                    clean_rows = st.button(
+                        "🧹 Pulisci righe vuote",
+                        key=f"clean_rows_{doctor}_{yy}_{mm}",
+                        help="Rimuove le righe completamente vuote dal foglio.",
+                    )
+
+                if add_row or clean_rows:
+                    current = st.session_state.get(editor_key)
+                    base_rows = current if isinstance(current, list) else init
+                    new_rows = []
+
+                    for r in base_rows:
+                        d = r.get("Data") if isinstance(r, dict) else None
+                        f = r.get("Fascia") if isinstance(r, dict) else None
+                        n = r.get("Note") if isinstance(r, dict) else None
+                        if (d in (None, "", "None")) and (f in (None, "", "None")) and (n in (None, "", "None")):
+                            continue
+                        new_rows.append(dict(r))
+
+                    if add_row:
+                        new_rows.append({"Data": date(yy, mm, 1), "Fascia": "Mattina", "Note": ""})
+
+                    if not new_rows:
+                        new_rows = [{"Data": date(yy, mm, 1), "Fascia": "Mattina", "Note": ""}]
+
+                    st.session_state[editor_key] = new_rows
+                    st.rerun()
+
                 edited = st.data_editor(
                     init,
-                    num_rows="dynamic",
+                    num_rows="fixed",
                     use_container_width=True,
                     column_config={
                         "Data": st.column_config.DateColumn("Data", required=True),
                         "Fascia": st.column_config.SelectboxColumn("Fascia", options=FASCIA_OPTIONS, required=True),
                         "Note": st.column_config.TextColumn("Note"),
                     },
-                    key=f"unav_editor_{doctor}_{yy}_{mm}",
+                    key=editor_key,
                 )
+
             else:
                 # Read-only view when the admin closes submissions
                 st.dataframe(init, use_container_width=True, hide_index=True)
@@ -1914,7 +1965,7 @@ if mode == "Indisponibilità (Medico)":
     with c1:
         save = st.button("Salva indisponibilità", type="primary", disabled=not can_save)
     with c2:
-        st.empty()
+        st.caption("Privacy: salviamo solo le righe del tuo nominativo nei mesi selezionati.")
 
     if save:
         if not unav_open:
@@ -2232,10 +2283,12 @@ else:
     # Step 3: Vincolo post-notte (carryover)
     st.markdown("### 3) Vincolo post-notte a cavallo mese")
     st.info(
-    "Compila questo solo se nel mese precedente qualcuno ha fatto **NOTTE l’ultimo giorno**: "
-    "in tal caso, quel medico **non può essere assegnato al Giorno 1** del mese corrente.",
-    icon="💡",
-)
+        "Serve solo se qualcuno ha fatto **NOTTE l’ultimo giorno del mese precedente**: "
+        "quella persona **non può lavorare il Giorno 1** del mese corrente.\n\n"
+        "✅ Consigliato: carica l’**output del mese precedente**.\n"
+        "🔁 Alternativa: seleziona manualmente chi ha fatto la NOTTE.",
+        icon="💡",
+    )
 
     # Admin advanced (rules/template/carryover file)
     with st.expander("⚙️ Avanzate (Regole, Template, Carryover file)", expanded=False):
