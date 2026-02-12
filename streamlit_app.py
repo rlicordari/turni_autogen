@@ -1736,19 +1736,26 @@ if mode == "Indisponibilità (Medico)":
     st.session_state.setdefault("doctor_month_sel", default_month)
 
 
+# Sanitize persisted widget state (in case of old sessions / invalid values)
+if st.session_state.get("doctor_year_sel") not in year_options:
+    st.session_state["doctor_year_sel"] = default_year
+if not isinstance(st.session_state.get("doctor_month_sel"), int) or not (1 <= int(st.session_state["doctor_month_sel"]) <= 12):
+    st.session_state["doctor_month_sel"] = default_month
+
+
+
     sel_default = st.session_state.get("doctor_selected_months") or [(default_year, default_month)]
     sel_set = set(sel_default)
 
     st.subheader("3) Seleziona mese/i da compilare")
     c1, c2, c3, c4 = st.columns([1, 1.4, 1, 1])
     with c1:
-        yy_sel = st.selectbox("Anno", year_options, index=year_options.index(int(st.session_state.get("doctor_year_sel", default_year))), key="doctor_year_sel")
+        yy_sel = st.selectbox("Anno", year_options, key="doctor_year_sel")
     with c2:
         mm_sel = st.selectbox(
             "Mese",
             list(range(1, 13)),
             format_func=lambda m: f"{m:02d} - {month_names.get(m, str(m))}",
-            index=(int(st.session_state.get("doctor_month_sel", default_month)) - 1),
             key="doctor_month_sel",
         )
     with c3:
