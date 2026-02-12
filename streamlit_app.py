@@ -1834,7 +1834,8 @@ for (yy, mm), tab in zip(selected, tabs):
         if not init:
             init = [{"Data": date(yy, mm, 1), "Fascia": "Mattina", "Note": ""}]
 
-        editor_key = f"unav_editor_{doctor}_{yy}_{mm}"
+        editor_widget_key = f"unav_editor_{doctor}_{yy}_{mm}"
+                editor_data_key = f"{editor_widget_key}__data"
 
         if unav_open:
             # Aggiungi righe sempre precompilate: evita Data=None (che apre il calendario sul mese corrente).
@@ -1844,15 +1845,19 @@ for (yy, mm), tab in zip(selected, tabs):
                 help="Aggiunge una riga precompilata (data nel mese selezionato).",
             )
             if _add_row:
-                _current = st.session_state.get(editor_key)
+                _current = st.session_state.get(editor_data_key)
                 _base = _current if isinstance(_current, list) else init
                 _new = list(_base)
                 _new.append({"Data": date(yy, mm, 1), "Fascia": "Mattina", "Note": ""})
-                st.session_state[editor_key] = _new
+                st.session_state[editor_widget_key] = _new
                 st.rerun()
 
+            # Editor state is stored separately from the widget key to comply with Streamlit policies
+
+            st.session_state.setdefault(editor_data_key, init)
+
             edited = st.data_editor(
-                init,
+                    st.session_state[editor_data_key],
                 num_rows="fixed",
                 use_container_width=True,
                 column_config={
@@ -1860,8 +1865,10 @@ for (yy, mm), tab in zip(selected, tabs):
                     "Fascia": st.column_config.SelectboxColumn("Fascia", options=FASCIA_OPTIONS, required=True),
                     "Note": st.column_config.TextColumn("Note"),
                 },
-                key=editor_key,
+                key=editor_widget_key,
             )
+            st.session_state[editor_data_key] = edited
+
 
             # Auto-fill defaults for newly added rows:
             # Streamlit adds a blank row with Data=None; date picker then opens on *today*.
@@ -1881,7 +1888,7 @@ for (yy, mm), tab in zip(selected, tabs):
                     _changed = True
                 _filled.append(_r)
             if _changed:
-                st.session_state[editor_key] = _filled
+                st.session_state[editor_widget_key] = _filled
                 st.rerun()
 
         else:
