@@ -1387,6 +1387,30 @@ def _logout_doctor(reason: str):
     st.session_state["doctor_logout_msg"] = reason
     st.rerun()
 
+def _set_doctor_flash(kind: str, message: str):
+    """Persist a one-shot message across a rerun (so the user actually sees it)."""
+    st.session_state["doctor_flash"] = {
+        "kind": str(kind),
+        "message": str(message),
+        "ts": _utc_now_iso(),
+    }
+
+def _render_doctor_flash():
+    flash = st.session_state.pop("doctor_flash", None)
+    if not isinstance(flash, dict):
+        return
+    kind = str(flash.get("kind") or "")
+    msg = str(flash.get("message") or "")
+    if not msg:
+        return
+    if kind == "success":
+        st.success(msg)
+    elif kind == "warning":
+        st.warning(msg)
+    else:
+        st.error(msg)
+
+
 
 def _doctor_session_state_key(doctor: str) -> str:
     return f"doctor_session::{_doctor_slug(doctor)}"
@@ -1509,10 +1533,12 @@ if mode == "Indisponibilità (Medico)":
 
     # If this browser session was kicked out by a newer login elsewhere, show the reason.
     if st.session_state.get("doctor_logout_msg"):
-        st.warning(str(st.session_state.pop("doctor_logout_msg")))
+        st.error(str(st.session_state.pop("doctor_logout_msg")))
 
     if st.session_state.doctor_auth_ok:
         st.success(f"Accesso attivo: **{st.session_state.doctor_name}**")
+        _render_doctor_flash()
+
 
         with st.expander("🔐 Cambia PIN", expanded=False):
             st.caption("Puoi cambiare il PIN in qualsiasi momento. Il nuovo PIN deve essere di 4 cifre.")
@@ -2034,16 +2060,15 @@ if mode == "Indisponibilità (Medico)":
             # don't trigger false "stale" conflicts.
             clear_doctor_baseline()
 
-            st.success("Salvato ✅")
+            _set_doctor_flash("success", "Salvato ✅")
             st.rerun()
         except Exception as e:
-            st.error(f"Errore salvataggio su GitHub: {e}")
-            st.info(
-                "Se vedi 404: (1) token senza accesso alla repo privata, "
-                "(2) owner/repo/branch/path errati, (3) token non autorizzato SSO (se repo in Organization)."
+            _set_doctor_flash(
+                "error",
+                f"Salvataggio NON riuscito ❌\n\nDettaglio: {e}\n\n"
+                "Suggerimento: ricarica la pagina e riprova. Se stai usando due dispositivi/browser, resta solo su uno.",
             )
-
-
+            st.rerun()
 # =====================================================================
 #                           ADMIN – Generazione
 # =====================================================================
