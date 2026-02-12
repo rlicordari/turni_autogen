@@ -94,11 +94,25 @@ def normalize_fascia(val: object) -> tuple[str, bool, bool]:
     return "Tutto il giorno", True, True
 # ---------------- Page config & style ----------------
 st.set_page_config(
-    page_title="Turni UTIC – Autogeneratore",
+    page_title="Turni UOC Cardiologia – UTIC",
     page_icon="🗓️",
     layout="wide",
 )
 
+st.markdown(
+    """
+<style>
+/* Tidy up spacing */
+.block-container { padding-top: 1.2rem; padding-bottom: 2.5rem; }
+h1 { margin-bottom: 0.2rem; }
+ .small-muted { opacity: 0.75; font-size: 0.92rem; }
+.kpi { padding: 0.75rem 0.9rem; border-radius: 0.75rem; border: 1px solid rgba(128, 128, 128, 0.25); }
+.kpi b { font-size: 1.05rem; }
+hr { margin: 0.9rem 0; }
+</style>
+""",
+    unsafe_allow_html=True,
+)
 
 # Build / version banner
 with st.sidebar:
@@ -222,32 +236,47 @@ def _mask_phone(p: str) -> str:
         return "***"
     return f"***{s[-3:]}"
 def _github_cfg() -> dict:
+    """GitHub storage configuration.
+
+    Priority:
+      1) [github_unavailability] mapping in Streamlit secrets
+      2) flat env/secrets keys (GITHUB_UNAV_*)
+    Convenience:
+      - if some path keys are not present, we also look under [auth] (legacy/compat).
+    """
+    base: dict = {}
+
     cfg = _get_secret(("github_unavailability",), None)
     if isinstance(cfg, Mapping):
-        out = dict(cfg)
+        base.update(dict(cfg))
 
-        # If some path settings are provided under [auth], use them as fallback defaults.
-        auth_cfg = _get_secret(("auth",), None)
-        if isinstance(auth_cfg, Mapping):
-            for k in ("path", "settings_path", "audit_dir", "sessions_dir", "doctor_auth_dir", "contacts_path"):
-                if auth_cfg.get(k) and not out.get(k):
-                    out[k] = auth_cfg.get(k)
+    # Fill missing from flat keys / defaults
+    def _set_default(k: str, v: object) -> None:
+        if not str(base.get(k) or "").strip():
+            base[k] = v
 
-        return out
+    _set_default("token", _get_secret(("GITHUB_UNAV_TOKEN",), ""))
+    _set_default("owner", _get_secret(("GITHUB_UNAV_OWNER",), ""))
+    _set_default("repo", _get_secret(("GITHUB_UNAV_REPO",), ""))
+    _set_default("branch", _get_secret(("GITHUB_UNAV_BRANCH",), "main"))
 
-    # fallback flat keys
-    return {
-        "token": _get_secret(("GITHUB_UNAV_TOKEN",), ""),
-        "owner": _get_secret(("GITHUB_UNAV_OWNER",), ""),
-        "repo": _get_secret(("GITHUB_UNAV_REPO",), ""),
-        "branch": _get_secret(("GITHUB_UNAV_BRANCH",), "main"),
-        "path": _get_secret(("GITHUB_UNAV_PATH",), "data/unavailability_store.csv"),
-        "settings_path": _get_secret(("GITHUB_UNAV_SETTINGS_PATH",), "data/unavailability_settings.yml"),
-        "audit_dir": _get_secret(("GITHUB_UNAV_AUDIT_DIR",), "data/unavailability_audit"),
-        "sessions_dir": _get_secret(("GITHUB_UNAV_SESSIONS_DIR",), "data/unavailability_sessions"),
-        "doctor_auth_dir": _get_secret(("GITHUB_DOCTOR_AUTH_DIR",), "data/doctor_auth"),
-        "contacts_path": _get_secret(("GITHUB_DOCTOR_CONTACTS_PATH",), "data/doctor_contacts.yml"),
-    }
+    _set_default("path", _get_secret(("GITHUB_UNAV_PATH",), "data/unavailability_store.csv"))
+    _set_default("settings_path", _get_secret(("GITHUB_UNAV_SETTINGS_PATH",), "data/unavailability_settings.yml"))
+    _set_default("audit_dir", _get_secret(("GITHUB_UNAV_AUDIT_DIR",), "data/unavailability_audit"))
+    _set_default("sessions_dir", _get_secret(("GITHUB_UNAV_SESSIONS_DIR",), "data/unavailability_sessions"))
+    _set_default("doctor_auth_dir", _get_secret(("GITHUB_DOCTOR_AUTH_DIR",), "data/doctor_auth"))
+    _set_default("contacts_path", _get_secret(("GITHUB_DOCTOR_CONTACTS_PATH",), "data/doctor_contacts.yml"))
+
+    # Optional legacy section [auth] (many installs already have these keys there)
+    auth = _get_secret(("auth",), None)
+    if isinstance(auth, Mapping):
+        for k in ("path", "settings_path", "audit_dir", "sessions_dir", "doctor_auth_dir", "contacts_path"):
+            if not str(base.get(k) or "").strip():
+                v = auth.get(k)
+                if isinstance(v, str) and v.strip():
+                    base[k] = v.strip()
+
+    return base
 
 # ---------------- Rules / doctors ----------------
 def load_rules_from_source(uploaded) -> tuple[dict, Path]:
@@ -382,17 +411,23 @@ def _verify_pin(pin: str, rec: dict) -> bool:
 def load_doctor_contacts_from_github() -> dict:
     """Return {doctor: {email, phone}} from a YAML file.
 
-    Primary source: GitHub repo configured in secrets (same repo used for the unavailability store).
+    Primary source: GitHub repo configured for the unavailability store.
     Fallback: local file inside the deployed app repo (useful if you keep contacts in the code repo).
+
+    Notes:
+      - contacts_path may be configured under [github_unavailability].contacts_path
+      - for backward compatibility we also accept [auth].contacts_path
     """
     g = _github_cfg()
-    path = g.get("contacts_path") or "data/doctor_contacts.yml"
+    auth = _get_secret(("auth",), None)
+    auth_path = (auth.get("contacts_path") if isinstance(auth, Mapping) else None)
+    remote_path = (g.get("contacts_path") or "").strip() or (str(auth_path).strip() if isinstance(auth_path, str) else "") or "data/doctor_contacts.yml"
 
     text: str | None = None
     gf = None
     try:
         gf = github_utils.get_file(
-            owner=g["owner"], repo=g["repo"], path=path, token=g["token"], branch=g.get("branch", "main")
+            owner=g["owner"], repo=g["repo"], path=remote_path, token=g["token"], branch=g.get("branch", "main")
         )
     except Exception:
         gf = None
@@ -401,12 +436,22 @@ def load_doctor_contacts_from_github() -> dict:
         text = gf.text
     else:
         # local fallback (Streamlit Cloud has the repo checked out on disk)
-        try:
-            lp = Path(path)
-            if lp.exists() and lp.is_file():
-                text = lp.read_text(encoding="utf-8", errors="replace")
-        except Exception:
-            text = None
+        candidates = []
+        for p in (auth_path, remote_path, "data/doctor_contacts.yml"):
+            if isinstance(p, str) and p.strip():
+                candidates.append(p.strip())
+        seen = set()
+        for p in candidates:
+            if p in seen:
+                continue
+            seen.add(p)
+            try:
+                lp = Path(p)
+                if lp.exists() and lp.is_file():
+                    text = lp.read_text(encoding="utf-8", errors="replace")
+                    break
+            except Exception:
+                continue
 
     if not text:
         return {}
@@ -417,6 +462,7 @@ def load_doctor_contacts_from_github() -> dict:
         data = {}
     if not isinstance(data, Mapping):
         return {}
+
     out: dict = {}
     for k, v in data.items():
         if not isinstance(v, Mapping):
@@ -526,7 +572,7 @@ def _send_otp_email(dest: str, code: str) -> None:
     if not _email_is_configured():
         raise RuntimeError("Invio email non configurato (smtp).")
     msg = EmailMessage()
-    msg["Subject"] = "Codice verifica – Turni UTIC"
+    msg["Subject"] = "Codice verifica – Turni UOC Cardiologia UTIC"
     msg["From"] = cfg.get("from")
     msg["To"] = dest
     msg.set_content(
@@ -559,7 +605,7 @@ def _send_otp_sms(dest: str, code: str) -> None:
     data = {
         "From": from_num,
         "To": dest,
-        "Body": f"Turni UTIC - codice verifica PIN: {code}",
+        "Body": f"Turni UOC Cardiologia UTIC - codice verifica PIN: {code}",
     }
     r = requests.post(url, data=data, auth=(sid, token), timeout=20)
     if r.status_code >= 400:
@@ -599,7 +645,7 @@ def save_doctor_otp_record(doctor: str, rec: dict, sha: str | None, message: str
 
 def request_pin_otp(doctor: str, channel: str) -> str:
     """Send an OTP to the doctor's configured email/SMS. Returns masked destination."""
-    c = get_doctor_contact(doctor) or {}
+    c = get_doctor_contact(doctor)
     email = str(c.get("email") or "").strip()
     phone = str(c.get("phone") or "").strip()
 
@@ -1560,17 +1606,6 @@ if mode == "Indisponibilità (Medico)":
                 st.rerun()
 
 
-
-            contacts_all = load_doctor_contacts_from_github()
-            if not contacts_all:
-                g = _github_cfg()
-                path = g.get("contacts_path") or "data/doctor_contacts.yml"
-                st.error(
-                    "Non posso inviare il codice di verifica (contatti non caricati: file mancante/non leggibile oppure YAML non valido)."
-                )
-                st.caption(f"Sto cercando contatti in: {g.get('owner','')}/{g.get('repo','')}:{g.get('branch','main')}/{path}")
-                return
-
             c = get_doctor_contact(doctor)
 
             email = str(c.get("email") or "").strip()
@@ -1595,16 +1630,6 @@ if mode == "Indisponibilità (Medico)":
                     missing.append("canale non disponibile")
 
                 st.error("Non posso inviare il codice di verifica (" + "; ".join(missing) + ").")
-                # Diagnostica leggera (non mostra email/telefono)
-                try:
-                    _keys = list(load_doctor_contacts_from_github().keys())
-                    if _keys and ("contatto non trovato per questo medico" in missing):
-                        shown = ", ".join([str(k) for k in _keys[:30]])
-                        more = " …" if len(_keys) > 30 else ""
-                        st.caption(f"Contatti caricati per: {shown}{more}")
-                except Exception:
-                    pass
-
                 if email:
                     st.caption(f"Email configurata per il medico: {_mask_email(email)}")
                 if phone:
@@ -1687,343 +1712,342 @@ if mode == "Indisponibilità (Medico)":
         st.error(f"Errore gestione sessione: {e}")
         st.stop()
 
-# ---- Selezione mesi da compilare (Anno + Mese separati) ----
-today = date.today()
-horizon_years = 20  # ampia finestra per evitare modifiche future
-year_options = list(range(today.year, today.year + horizon_years + 1))
-month_names = {
-    1: "Gennaio", 2: "Febbraio", 3: "Marzo", 4: "Aprile", 5: "Maggio", 6: "Giugno",
-    7: "Luglio", 8: "Agosto", 9: "Settembre", 10: "Ottobre", 11: "Novembre", 12: "Dicembre",
-}
+    # ---- Selezione mesi da compilare (Anno + Mese separati) ----
+    today = date.today()
+    horizon_years = 20  # ampia finestra per evitare modifiche future
+    year_options = list(range(today.year, today.year + horizon_years + 1))
+    month_names = {
+        1: "Gennaio", 2: "Febbraio", 3: "Marzo", 4: "Aprile", 5: "Maggio", 6: "Giugno",
+        7: "Luglio", 8: "Agosto", 9: "Settembre", 10: "Ottobre", 11: "Novembre", 12: "Dicembre",
+    }
 
-# Default mese/anno = mese successivo rispetto a oggi.
-_first_of_this_month = today.replace(day=1)
-_first_of_next_month = (_first_of_this_month + timedelta(days=32)).replace(day=1)
-default_year = _first_of_next_month.year
-default_month = _first_of_next_month.month
+    # Default: mese SUCCESSIVO rispetto a oggi (es. oggi Febbraio → default Marzo)
+    _first_of_this_month = today.replace(day=1)
+    _first_of_next_month = (_first_of_this_month + timedelta(days=32)).replace(day=1)
+    default_year = _first_of_next_month.year
+    default_month = _first_of_next_month.month
 
-# Inizializza i default dei widget (solo se mancanti/non validi)
-if st.session_state.get("doctor_year_sel") not in year_options:
-    st.session_state["doctor_year_sel"] = default_year
-if st.session_state.get("doctor_month_sel") not in range(1, 13):
-    st.session_state["doctor_month_sel"] = default_month
+    # Inizializza i selettori Anno/Mese solo alla prima apertura della sessione
+    if "doctor_year_sel" not in st.session_state or st.session_state.get("doctor_year_sel") not in year_options:
+        st.session_state["doctor_year_sel"] = default_year
+    if "doctor_month_sel" not in st.session_state or int(st.session_state.get("doctor_month_sel") or 0) not in range(1, 13):
+        st.session_state["doctor_month_sel"] = default_month
 
-selected = list(st.session_state.get("doctor_selected_months") or [])
-if not selected:
-    selected = [(default_year, default_month)]
+    # Manteniamo l'ordine dei mesi selezionati: il primo è quello che si apre in tab
+    selected = st.session_state.get("doctor_selected_months")
+    if not selected:
+        selected = [(default_year, default_month)]
+    selected = list(selected)
 
-# Unicità preservando l'ordine (il primo sarà la tab aperta)
-_seen = set()
-selected = [x for x in selected if not (x in _seen or _seen.add(x))]
-
-st.subheader("3) Seleziona mese/i da compilare")
-c1, c2, c3, c4 = st.columns([1, 1.4, 1, 1])
-with c1:
-    yy_sel = st.selectbox("Anno", year_options, key="doctor_year_sel")
-with c2:
-    mm_sel = st.selectbox(
-        "Mese",
-        list(range(1, 13)),
-        format_func=lambda m: f"{m:02d} - {month_names.get(m, str(m))}",
-        key="doctor_month_sel",
-    )
-with c3:
-    add_month = st.button("Aggiungi", use_container_width=True, help="Aggiunge l’anno/mese selezionato all’elenco.")
-with c4:
-    remove_month = st.button("Rimuovi", use_container_width=True, help="Rimuove l’anno/mese selezionato dall’elenco.")
-
-cur = (int(yy_sel), int(mm_sel))
-if add_month:
-    # Metti il mese appena aggiunto come primo → tab subito aperta
-    if cur in selected:
-        selected.remove(cur)
-    selected.insert(0, cur)
-    st.session_state.doctor_selected_months = selected
-    st.rerun()
-if remove_month:
-    if cur in selected:
-        selected = [x for x in selected if x != cur]
-        st.session_state.doctor_selected_months = selected
-        st.rerun()
-
-st.session_state.doctor_selected_months = selected
-
-st.caption("Mesi selezionati: " + ", ".join([f"{yy}-{mm:02d}" for (yy, mm) in selected]))
-if not selected:
-    st.info("Aggiungi almeno un mese per iniziare.")
-    st.stop()
-
-label_map = {(yy, mm): f"{yy}-{mm:02d}" for (yy, mm) in selected}
-
-# Stable baseline (snapshot) for this editing session.
-# This is what we compare against at save-time to detect a stale editor.
-refresh_baseline = st.button(
-    "🔄 Ricarica dati",
-    help="Ricarica l’archivio dal server (utile se qualcuno ha appena salvato).",
-)
-
-if refresh_baseline:
-    # Reset baseline + editors so the UI reflects the latest server state.
-    clear_doctor_baseline()
-    for (yy, mm) in selected:
-        st.session_state.pop(f"unav_editor_{doctor}_{yy}_{mm}", None)
-    st.rerun()
-
-try:
-    baseline = get_or_load_doctor_baseline(doctor, selected, force_reload=bool(refresh_baseline))
-    store_rows = list(baseline.get("rows") or [])
-    store_sha = baseline.get("sha")
-    expected_signatures = dict(baseline.get("expected_signatures") or {})
-except Exception as e:
-    st.error(f"Errore accesso archivio indisponibilità: {e}")
-    st.stop()
-
-# Load app settings (open/closed + limits)
-try:
-    app_settings, _settings_sha = load_app_settings_from_github()
-except Exception as e:
-    app_settings, _settings_sha = dict(DEFAULT_SETTINGS), None
-    st.warning(f"Impostazioni indisponibilità non leggibili (uso default): {e}")
-
-unav_open = bool(app_settings.get("unavailability_open", True))
-try:
-    max_per_shift = int(app_settings.get("max_unavailability_per_shift", DEFAULT_SETTINGS["max_unavailability_per_shift"]))
-except Exception:
-    max_per_shift = DEFAULT_SETTINGS["max_unavailability_per_shift"]
-if max_per_shift < 0:
-    max_per_shift = 0
-
-if not unav_open:
-    st.warning("🔒 Inserimento indisponibilità temporaneamente **chiuso** dall'amministratore. Puoi solo visualizzare (non puoi salvare).")
-
-st.divider()
-
-tabs = st.tabs([label_map[x] for x in selected])
-edited_by_month = {}
-normalized_entries_by_month = {}
-violations_by_month = {}
-info_by_month = {}
-
-for (yy, mm), tab in zip(selected, tabs):
-    with tab:
-        st.caption("Inserisci righe con Data + Fascia. Le righe vuote verranno ignorate.")
-        existing = ustore.filter_doctor_month(store_rows, doctor, yy, mm)
-        init = []
-        conversions = []
-        for r in existing:
-            try:
-                d = datetime.fromisoformat(r["date"]).date()
-            except Exception:
-                d = r["date"]
-            raw_shift = r.get("shift", "")
-            canon_shift, changed, unknown = normalize_fascia(raw_shift)
-            if changed:
-                conversions.append({
-                    "Data": d,
-                    "Fascia_originale": raw_shift,
-                    "Fascia_impostata": canon_shift,
-                    "Nota": "Non riconosciuta (default applicato)" if unknown else "Normalizzata",
-                })
-            init.append({"Data": d, "Fascia": canon_shift or "Tutto il giorno", "Note": r.get("note", "")})
-
-        if conversions:
-            st.warning("Abbiamo trovato alcune fasce non standard salvate in passato. Le abbiamo normalizzate automaticamente: controlla e, se necessario, modifica dal menu a tendina prima di salvare.")
-            st.dataframe(conversions, use_container_width=True, hide_index=True)
-
-
-        if not init:
-            init = [{"Data": date(yy, mm, 1), "Fascia": "Mattina", "Note": ""}]
-
-        editor_widget_key = f"unav_editor_{doctor}_{yy}_{mm}"
-        editor_data_key = f"{editor_widget_key}__data"
-
-        if unav_open:
-            # Aggiungi righe sempre precompilate: evita Data=None (che apre il calendario sul mese corrente).
-            _add_row = st.button(
-                "➕ Aggiungi riga",
-                key=f"add_row_{doctor}_{yy}_{mm}",
-                help="Aggiunge una riga precompilata (data nel mese selezionato).",
-            )
-            if _add_row:
-                _current = st.session_state.get(editor_data_key)
-                _base = _current if isinstance(_current, list) else init
-                _new = list(_base)
-                _new.append({"Data": date(yy, mm, 1), "Fascia": "Mattina", "Note": ""})
-                st.session_state[editor_widget_key] = _new
-                st.rerun()
-
-            # Editor state is stored separately from the widget key to comply with Streamlit policies
-
-            st.session_state.setdefault(editor_data_key, init)
-
-            edited = st.data_editor(
-                    st.session_state[editor_data_key],
-                num_rows="fixed",
-                use_container_width=True,
-                column_config={
-                    "Data": st.column_config.DateColumn("Data", required=True),
-                    "Fascia": st.column_config.SelectboxColumn("Fascia", options=FASCIA_OPTIONS, required=True),
-                    "Note": st.column_config.TextColumn("Note"),
-                },
-                key=editor_widget_key,
-            )
-            st.session_state[editor_data_key] = edited
-
-
-            # Auto-fill defaults for newly added rows:
-            # Streamlit adds a blank row with Data=None; date picker then opens on *today*.
-            # By pre-filling Data to the first day of the selected month, the calendar opens on the correct month.
-            _changed = False
-            _filled = []
-            for _row in (edited or []):
-                _r = dict(_row or {})
-                if not _r.get("Data"):
-                    _r["Data"] = date(yy, mm, 1)
-                    _changed = True
-                if not _r.get("Fascia"):
-                    _r["Fascia"] = "Mattina"
-                    _changed = True
-                if _r.get("Note") is None:
-                    _r["Note"] = ""
-                    _changed = True
-                _filled.append(_r)
-            if _changed:
-                st.session_state[editor_widget_key] = _filled
-                st.rerun()
-
-        else:
-            # Read-only view when the admin closes submissions
-            st.dataframe(init, use_container_width=True, hide_index=True)
-            edited = init
-
-        edited_by_month[(yy, mm)] = edited
-
-        # Normalize & validate + enforce max per shift (per month)
-        entries_norm, info = extract_entries_from_editor(edited, yy, mm)
-        normalized_entries_by_month[(yy, mm)] = entries_norm
-        info_by_month[(yy, mm)] = info
-
-        counts = info.get("counts", {}) or {}
-        over = {sh: n for sh, n in counts.items() if n > max_per_shift}
-        violations_by_month[(yy, mm)] = over
-
-        if info.get("out_of_month"):
-            st.warning(
-                f"⚠️ {info['out_of_month']} righe con data fuori mese sono state ignorate "
-                f"(devono essere in {yy}-{mm:02d})."
-            )
-        if info.get("invalid_date"):
-            st.warning(f"⚠️ {info['invalid_date']} righe hanno una data non valida e sono state ignorate.")
-
-        st.caption(
-            "Conteggi mese (per fascia): "
-            + ", ".join([f"{sh} {counts.get(sh, 0)}/{max_per_shift}" for sh in FASCIA_OPTIONS])
+    st.subheader("3) Seleziona mese/i da compilare")
+    c1, c2, c3, c4 = st.columns([1, 1.4, 1, 1])
+    with c1:
+        yy_sel = st.selectbox("Anno", year_options, key="doctor_year_sel")
+    with c2:
+        mm_sel = st.selectbox(
+            "Mese",
+            list(range(1, 13)),
+            format_func=lambda m: f"{m:02d} - {month_names.get(m, str(m))}",
+            key="doctor_month_sel",
         )
+    with c3:
+        add_month = st.button("Aggiungi", use_container_width=True, help="Aggiunge l’anno/mese selezionato all’elenco.")
+    with c4:
+        remove_month = st.button("Rimuovi", use_container_width=True, help="Rimuove l’anno/mese selezionato dall’elenco.")
 
-        if over:
-            pretty = ", ".join([f"{sh}: {n}/{max_per_shift}" for sh, n in over.items()])
-            st.error(f"Limite superato in questo mese → {pretty}. Rimuovi alcune righe prima di salvare.")
+    cur = (int(yy_sel), int(mm_sel))
+    if add_month:
+        # Porta in cima (così la tab si apre subito)
+        selected = [m for m in selected if m != cur]
+        selected.insert(0, cur)
+    if remove_month:
+        selected = [m for m in selected if m != cur]
 
-any_over = any(bool(v) for v in (violations_by_month or {}).values())
-can_save = bool(unav_open) and (not any_over)
+    st.session_state.doctor_selected_months = selected
 
-save = st.button("Salva indisponibilità", type="primary", disabled=not can_save)
-
-if save:
-    if not unav_open:
-        st.error("Inserimento indisponibilità chiuso dall'amministratore: non è possibile salvare.")
+    st.caption("Mesi selezionati: " + ", ".join([f"{yy}-{mm:02d}" for (yy, mm) in selected]))
+    if not selected:
+        st.info("Aggiungi almeno un mese per iniziare.")
         st.stop()
 
-    # Force a lease ownership check right before saving (no throttle).
+    label_map = {(yy, mm): f"{yy}-{mm:02d}" for (yy, mm) in selected}
+
+    # Stable baseline (snapshot) for this editing session.
+    # This is what we compare against at save-time to detect a stale editor.
+    cR1, cR2 = st.columns([1, 3])
+    with cR1:
+        refresh_baseline = st.button(
+            "🔄 Ricarica dati",
+            help="Ricarica l’archivio dal server (utile se qualcuno ha appena salvato).",
+        )
+
+    if refresh_baseline:
+        # Reset baseline + editors so the UI reflects the latest server state.
+        clear_doctor_baseline()
+        for (yy, mm) in selected:
+            # Reset editor state (legacy + v2) so UI reflects latest server state.
+            st.session_state.pop(f"unav_editor_{doctor}_{yy}_{mm}", None)
+            st.session_state.pop(f"unav_editor_v2_{doctor}_{yy}_{mm}", None)
+            st.session_state.pop(f"unav_editor_v2_{doctor}_{yy}_{mm}__data", None)
+        st.rerun()
+
     try:
-        _ss_key = _doctor_session_state_key(doctor)
-        _cur = st.session_state.get(_ss_key) if isinstance(st.session_state.get(_ss_key), dict) else {}
-        _sid = str((_cur or {}).get("session_id") or "")
-        if not _sid:
-            # Should not happen, but be safe.
-            _sid = ensure_doctor_session_active(doctor)
-        if not check_doctor_session_lease(doctor, _sid):
-            _logout_doctor(
-                "Impossibile salvare: la sessione è stata sostituita da un accesso dello stesso utente da un altro dispositivo/browser."
+        baseline = get_or_load_doctor_baseline(doctor, selected, force_reload=bool(refresh_baseline))
+        store_rows = list(baseline.get("rows") or [])
+        store_sha = baseline.get("sha")
+        expected_signatures = dict(baseline.get("expected_signatures") or {})
+    except Exception as e:
+        st.error(f"Errore accesso archivio indisponibilità: {e}")
+        st.stop()
+
+    # Load app settings (open/closed + limits)
+    try:
+        app_settings, _settings_sha = load_app_settings_from_github()
+    except Exception as e:
+        app_settings, _settings_sha = dict(DEFAULT_SETTINGS), None
+        st.warning(f"Impostazioni indisponibilità non leggibili (uso default): {e}")
+
+    unav_open = bool(app_settings.get("unavailability_open", True))
+    try:
+        max_per_shift = int(app_settings.get("max_unavailability_per_shift", DEFAULT_SETTINGS["max_unavailability_per_shift"]))
+    except Exception:
+        max_per_shift = DEFAULT_SETTINGS["max_unavailability_per_shift"]
+    if max_per_shift < 0:
+        max_per_shift = 0
+
+    if not unav_open:
+        st.warning("🔒 Inserimento indisponibilità temporaneamente **chiuso** dall'amministratore. Puoi solo visualizzare (non puoi salvare).")
+
+    st.divider()
+
+    tabs = st.tabs([label_map[x] for x in selected])
+    edited_by_month = {}
+    normalized_entries_by_month = {}
+    violations_by_month = {}
+    info_by_month = {}
+
+    for (yy, mm), tab in zip(selected, tabs):
+        with tab:
+            st.caption("Inserisci righe con Data + Fascia. Le righe vuote verranno ignorate.")
+            existing = ustore.filter_doctor_month(store_rows, doctor, yy, mm)
+            init = []
+            conversions = []
+            for r in existing:
+                try:
+                    d = datetime.fromisoformat(r["date"]).date()
+                except Exception:
+                    d = r["date"]
+                raw_shift = r.get("shift", "")
+                canon_shift, changed, unknown = normalize_fascia(raw_shift)
+                if changed:
+                    conversions.append({
+                        "Data": d,
+                        "Fascia_originale": raw_shift,
+                        "Fascia_impostata": canon_shift,
+                        "Nota": "Non riconosciuta (default applicato)" if unknown else "Normalizzata",
+                    })
+                init.append({"Data": d, "Fascia": canon_shift or "Tutto il giorno", "Note": r.get("note", "")})
+
+            if conversions:
+                st.warning("Abbiamo trovato alcune fasce non standard salvate in passato. Le abbiamo normalizzate automaticamente: controlla e, se necessario, modifica dal menu a tendina prima di salvare.")
+                st.dataframe(conversions, use_container_width=True, hide_index=True)
+
+
+            if not init:
+                init = [{"Data": date(yy, mm, 1), "Fascia": "Mattina", "Note": ""}]
+
+            if unav_open:
+                # Use separate keys for widget vs stored data to avoid Streamlit session_state policy errors.
+                editor_widget_key = f"unav_editor_v2_{doctor}_{yy}_{mm}"
+                editor_data_key = f"{editor_widget_key}__data"
+
+                # Initialize editor data only once per (doctor, year, month) or after a manual refresh.
+                st.session_state.setdefault(editor_data_key, init)
+
+                b1, b2 = st.columns([1, 1])
+                with b1:
+                    add_row = st.button(
+                        "➕ Aggiungi riga",
+                        key=f"add_row_{doctor}_{yy}_{mm}",
+                        help="Aggiunge una riga precompilata (data nel mese selezionato).",
+                    )
+                with b2:
+                    clean_rows = st.button(
+                        "🧹 Pulisci righe vuote",
+                        key=f"clean_rows_{doctor}_{yy}_{mm}",
+                        help="Rimuove eventuali righe completamente vuote.",
+                    )
+
+                if add_row:
+                    rows = list(st.session_state.get(editor_data_key) or [])
+                    rows.append({"Data": date(yy, mm, 1), "Fascia": "Mattina", "Note": ""})
+                    st.session_state[editor_data_key] = rows
+                    st.rerun()
+
+                if clean_rows:
+                    rows = list(st.session_state.get(editor_data_key) or [])
+                    cleaned = []
+                    for r in rows:
+                        d = r.get("Data")
+                        fsh = (r.get("Fascia") or "").strip()
+                        note = (r.get("Note") or "").strip()
+                        if d is None and (not fsh) and (not note):
+                            continue
+                        cleaned.append({"Data": d, "Fascia": (fsh or "Mattina"), "Note": note})
+                    if not cleaned:
+                        cleaned = [{"Data": date(yy, mm, 1), "Fascia": "Mattina", "Note": ""}]
+                    st.session_state[editor_data_key] = cleaned
+                    st.rerun()
+
+                edited = st.data_editor(
+                    st.session_state[editor_data_key],
+                    num_rows="fixed",
+                    use_container_width=True,
+                    column_config={
+                        "Data": st.column_config.DateColumn("Data", required=True),
+                        "Fascia": st.column_config.SelectboxColumn("Fascia", options=FASCIA_OPTIONS, required=True),
+                        "Note": st.column_config.TextColumn("Note"),
+                    },
+                    key=editor_widget_key,
+                )
+                st.session_state[editor_data_key] = edited
+            else:
+                # Read-only view when the admin closes submissions
+                st.dataframe(init, use_container_width=True, hide_index=True)
+                edited = init
+
+            edited_by_month[(yy, mm)] = edited
+
+            # Normalize & validate + enforce max per shift (per month)
+            entries_norm, info = extract_entries_from_editor(edited, yy, mm)
+            normalized_entries_by_month[(yy, mm)] = entries_norm
+            info_by_month[(yy, mm)] = info
+
+            counts = info.get("counts", {}) or {}
+            over = {sh: n for sh, n in counts.items() if n > max_per_shift}
+            violations_by_month[(yy, mm)] = over
+
+            if info.get("out_of_month"):
+                st.warning(
+                    f"⚠️ {info['out_of_month']} righe con data fuori mese sono state ignorate "
+                    f"(devono essere in {yy}-{mm:02d})."
+                )
+            if info.get("invalid_date"):
+                st.warning(f"⚠️ {info['invalid_date']} righe hanno una data non valida e sono state ignorate.")
+
+            st.caption(
+                "Conteggi mese (per fascia): "
+                + ", ".join([f"{sh} {counts.get(sh, 0)}/{max_per_shift}" for sh in FASCIA_OPTIONS])
+            )
+
+            if over:
+                pretty = ", ".join([f"{sh}: {n}/{max_per_shift}" for sh, n in over.items()])
+                st.error(f"Limite superato in questo mese → {pretty}. Rimuovi alcune righe prima di salvare.")
+
+    any_over = any(bool(v) for v in (violations_by_month or {}).values())
+    can_save = bool(unav_open) and (not any_over)
+
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        save = st.button("Salva indisponibilità", type="primary", disabled=not can_save)
+    with c2:
+        st.empty()
+
+    if save:
+        if not unav_open:
+            st.error("Inserimento indisponibilità chiuso dall'amministratore: non è possibile salvare.")
+            st.stop()
+
+        # Force a lease ownership check right before saving (no throttle).
+        try:
+            _ss_key = _doctor_session_state_key(doctor)
+            _cur = st.session_state.get(_ss_key) if isinstance(st.session_state.get(_ss_key), dict) else {}
+            _sid = str((_cur or {}).get("session_id") or "")
+            if not _sid:
+                # Should not happen, but be safe.
+                _sid = ensure_doctor_session_active(doctor)
+            if not check_doctor_session_lease(doctor, _sid):
+                _logout_doctor(
+                    "Impossibile salvare: la sessione è stata sostituita da un accesso dello stesso utente da un altro dispositivo/browser."
+                )
+                st.stop()
+            # refresh lease timestamp so an in-progress save won't appear "expired"
+            acquire_doctor_session_lease(doctor=doctor, session_id=_sid)
+        except Exception as e:
+            st.error(f"Errore verifica sessione prima del salvataggio: {e}")
+            st.stop()
+
+        # Server-side re-check (in caso di race / rerun)
+        hard_viol = []
+        for (yy, mm), entries_norm in (normalized_entries_by_month or {}).items():
+            counts = {}
+            for _d, sh, _n in entries_norm:
+                counts[sh] = counts.get(sh, 0) + 1
+            over = {sh: n for sh, n in counts.items() if n > max_per_shift}
+            if over:
+                hard_viol.append(
+                    f"{yy}-{mm:02d}: " + ", ".join([f"{sh} {n}/{max_per_shift}" for sh, n in over.items()])
+                )
+
+        if hard_viol:
+            st.error(
+                "Impossibile salvare: limite indisponibilità superato.\n\n"
+                + "\n".join([f"- {x}" for x in hard_viol])
             )
             st.stop()
-        # refresh lease timestamp so an in-progress save won't appear "expired"
-        acquire_doctor_session_lease(doctor=doctor, session_id=_sid)
-    except Exception as e:
-        st.error(f"Errore verifica sessione prima del salvataggio: {e}")
-        st.stop()
 
-    # Server-side re-check (in caso di race / rerun)
-    hard_viol = []
-    for (yy, mm), entries_norm in (normalized_entries_by_month or {}).items():
-        counts = {}
-        for _d, sh, _n in entries_norm:
-            counts[sh] = counts.get(sh, 0) + 1
-        over = {sh: n for sh, n in counts.items() if n > max_per_shift}
-        if over:
-            hard_viol.append(
-                f"{yy}-{mm:02d}: " + ", ".join([f"{sh} {n}/{max_per_shift}" for sh, n in over.items()])
+        updated_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+        try:
+            audit_todo, _final_sha = save_doctor_unavailability_with_retry(
+                doctor=doctor,
+                normalized_entries_by_month=normalized_entries_by_month or {},
+                updated_at=updated_at,
+                message=f"Update unavailability: {doctor} ({updated_at})",
+                initial_rows=store_rows,
+                initial_sha=store_sha,
+                expected_signatures=expected_signatures,
+                max_retries=6,
             )
 
-    if hard_viol:
-        st.error(
-            "Impossibile salvare: limite indisponibilità superato.\n\n"
-            + "\n".join([f"- {x}" for x in hard_viol])
-        )
-        st.stop()
+            # Monthly audit log (best-effort)
+            for mk_audit, diff in audit_todo:
+                audit_row = {
+                    "ts_utc": updated_at,
+                    "doctor": doctor,
+                    "month": mk_audit,
+                    "action": "save",
+                    "before_count": diff.get("before_count", 0),
+                    "after_count": diff.get("after_count", 0),
+                    "added_count": diff.get("added_count", 0),
+                    "removed_count": diff.get("removed_count", 0),
+                    "note_changed_count": diff.get("note_changed_count", 0),
+                    "details_json": json.dumps(diff.get("details", {}), ensure_ascii=False),
+                    "app_build": APP_BUILD,
+                }
+                try:
+                    append_unavailability_audit_log(mk_audit, audit_row)
+                except Exception as e:
+                    st.warning(f"Audit log non aggiornato per {mk_audit}: {e}")
 
-    updated_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+            # After a successful save, refresh our baseline snapshot so next saves
+            # don't trigger false "stale" conflicts.
+            clear_doctor_baseline()
 
-    try:
-        audit_todo, _final_sha = save_doctor_unavailability_with_retry(
-            doctor=doctor,
-            normalized_entries_by_month=normalized_entries_by_month or {},
-            updated_at=updated_at,
-            message=f"Update unavailability: {doctor} ({updated_at})",
-            initial_rows=store_rows,
-            initial_sha=store_sha,
-            expected_signatures=expected_signatures,
-            max_retries=6,
-        )
-
-        # Monthly audit log (best-effort)
-        for mk_audit, diff in audit_todo:
-            audit_row = {
-                "ts_utc": updated_at,
-                "doctor": doctor,
-                "month": mk_audit,
-                "action": "save",
-                "before_count": diff.get("before_count", 0),
-                "after_count": diff.get("after_count", 0),
-                "added_count": diff.get("added_count", 0),
-                "removed_count": diff.get("removed_count", 0),
-                "note_changed_count": diff.get("note_changed_count", 0),
-                "details_json": json.dumps(diff.get("details", {}), ensure_ascii=False),
-                "app_build": APP_BUILD,
-            }
-            try:
-                append_unavailability_audit_log(mk_audit, audit_row)
-            except Exception as e:
-                st.warning(f"Audit log non aggiornato per {mk_audit}: {e}")
-
-        # After a successful save, refresh our baseline snapshot so next saves
-        # don't trigger false "stale" conflicts.
-        clear_doctor_baseline()
-
-        st.success("Salvato ✅")
-        st.rerun()
-    except Exception as e:
-        st.error(f"Errore salvataggio su GitHub: {e}")
-        st.info(
-            "Se vedi 404: (1) token senza accesso alla repo privata, "
-            "(2) owner/repo/branch/path errati, (3) token non autorizzato SSO (se repo in Organization)."
-        )
+            st.success("Salvato ✅")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Errore salvataggio su GitHub: {e}")
+            st.info(
+                "Se vedi 404: (1) token senza accesso alla repo privata, "
+                "(2) owner/repo/branch/path errati, (3) token non autorizzato SSO (se repo in Organization)."
+            )
 
 
 # =====================================================================
 #                           ADMIN – Generazione
 # =====================================================================
-elif mode == "Genera turni (Admin)":
+else:
     st.subheader("Generazione turni (Admin)")
     admin_pin = _get_admin_pin()
     if not admin_pin:
@@ -2245,10 +2269,10 @@ elif mode == "Genera turni (Admin)":
     # Step 3: Vincolo post-notte (carryover)
     st.markdown("### 3) Vincolo post-notte a cavallo mese")
     st.info(
-        "Compila questo solo se nel mese precedente qualcuno ha fatto **NOTTE l’ultimo giorno**: "
-        "quella persona **non può lavorare il Giorno 1** del mese corrente.\n\n",
-        icon="💡",
-    )
+    "Compila questo solo se nel mese precedente qualcuno ha fatto **NOTTE l’ultimo giorno**: "
+    "in tal caso, quel medico **non può essere assegnato al Giorno 1** del mese corrente.",
+    icon="💡",
+)
 
     # Admin advanced (rules/template/carryover file)
     with st.expander("⚙️ Avanzate (Regole, Template, Carryover file)", expanded=False):
