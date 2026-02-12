@@ -1837,9 +1837,23 @@ for (yy, mm), tab in zip(selected, tabs):
         editor_key = f"unav_editor_{doctor}_{yy}_{mm}"
 
         if unav_open:
+            # Aggiungi righe sempre precompilate: evita Data=None (che apre il calendario sul mese corrente).
+            _add_row = st.button(
+                "➕ Aggiungi riga",
+                key=f"add_row_{doctor}_{yy}_{mm}",
+                help="Aggiunge una riga precompilata (data nel mese selezionato).",
+            )
+            if _add_row:
+                _current = st.session_state.get(editor_key)
+                _base = _current if isinstance(_current, list) else init
+                _new = list(_base)
+                _new.append({"Data": date(yy, mm, 1), "Fascia": "Mattina", "Note": ""})
+                st.session_state[editor_key] = _new
+                st.rerun()
+
             edited = st.data_editor(
                 init,
-                num_rows="dynamic",
+                num_rows="fixed",
                 use_container_width=True,
                 column_config={
                     "Data": st.column_config.DateColumn("Data", required=True),
