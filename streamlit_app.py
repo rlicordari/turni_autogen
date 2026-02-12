@@ -1835,7 +1835,7 @@ for (yy, mm), tab in zip(selected, tabs):
             init = [{"Data": date(yy, mm, 1), "Fascia": "Mattina", "Note": ""}]
 
         editor_widget_key = f"unav_editor_{doctor}_{yy}_{mm}"
-                editor_data_key = f"{editor_widget_key}__data"
+        editor_data_key = f"{editor_widget_key}__data"
 
         if unav_open:
             # Aggiungi righe sempre precompilate: evita Data=None (che apre il calendario sul mese corrente).
