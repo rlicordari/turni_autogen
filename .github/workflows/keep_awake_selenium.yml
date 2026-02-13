@@ -1,0 +1,42 @@
+name: Keep Streamlit Awake (Selenium)
+
+on:
+  schedule:
+    - cron: "0 */3 * * *"   # ogni 3 ore (sotto le 12h di sleep)
+  workflow_dispatch:
+
+concurrency:
+  group: keep-streamlit-awake-selenium
+  cancel-in-progress: false
+
+jobs:
+  wake:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install selenium
+
+      - name: Setup Chrome + ChromeDriver
+        id: setup-chrome
+        uses: browser-actions/setup-chrome@v2
+        with:
+          chrome-version: latest
+          install-chromedriver: true
+          install-dependencies: true
+
+      - name: Wake app via Selenium (browser traffic)
+        env:
+          STREAMLIT_APP_URL: ${{ secrets.STREAMLIT_APP_URL }}
+          CHROME_PATH: ${{ steps.setup-chrome.outputs.chrome-path }}
+          CHROMEDRIVER_PATH: ${{ steps.setup-chrome.outputs.chromedriver-path }}
+        run: |
+          python scripts/wake_streamlit.py
