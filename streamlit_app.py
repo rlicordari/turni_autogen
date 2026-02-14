@@ -1706,13 +1706,24 @@ if mode == "Indisponibilità (Medico)":
         7: "Luglio", 8: "Agosto", 9: "Settembre", 10: "Ottobre", 11: "Novembre", 12: "Dicembre",
     }
 
-    sel_default = st.session_state.get("doctor_selected_months") or [(today.year, today.month)]
-    sel_set = set(sel_default)
+    # Default month/year: the NEXT month relative to today's date
+    # Example: if today is 2026-02-12, default is 2026-03
+    _first_of_this_month = today.replace(day=1)
+    _first_of_next_month = (_first_of_this_month + timedelta(days=32)).replace(day=1)
+    default_year = _first_of_next_month.year
+    default_month = _first_of_next_month.month
+
+    # Initialize widget defaults only once per session (Streamlit keys persist across reruns)
+    st.session_state.setdefault("doctor_year_sel", default_year)
+    st.session_state.setdefault("doctor_month_sel", default_month)
+
+    # Keep months ordered (first month opens as the first tab). Default = next month.
+    selected = list(st.session_state.get("doctor_selected_months") or [(default_year, default_month)])
 
     st.subheader("3) Seleziona mese/i da compilare")
     c1, c2, c3, c4 = st.columns([1, 1.4, 1, 1])
     with c1:
-        yy_sel = st.selectbox("Anno", year_options, index=0, key="doctor_year_sel")
+        yy_sel = st.selectbox("Anno", year_options, key="doctor_year_sel")
     with c2:
         mm_sel = st.selectbox(
             "Mese",
@@ -1726,14 +1737,20 @@ if mode == "Indisponibilità (Medico)":
         remove_month = st.button("Rimuovi", use_container_width=True, help="Rimuove l’anno/mese selezionato dall’elenco.")
 
     cur = (int(yy_sel), int(mm_sel))
+
+    # If user adds a month, move it to the front so its tab opens immediately.
     if add_month:
-        sel_set.add(cur)
+        selected = [m for m in selected if m != cur]
+        selected.insert(0, cur)
+
     if remove_month:
-        sel_set.discard(cur)
+        selected = [m for m in selected if m != cur]
 
-    selected = sorted(sel_set)
+    # De-duplicate while preserving order
+    _seen = set()
+    selected = [m for m in selected if not (m in _seen or _seen.add(m))]
+
     st.session_state.doctor_selected_months = selected
-
     st.caption("Mesi selezionati: " + ", ".join([f"{yy}-{mm:02d}" for (yy, mm) in selected]))
     if not selected:
         st.info("Aggiungi almeno un mese per iniziare.")
@@ -1753,16 +1770,10 @@ if mode == "Indisponibilità (Medico)":
         st.caption("La sessione usa uno snapshot per evitare conflitti: al salvataggio viene sempre verificato sul server.")
 
     if refresh_baseline:
-        # Reset baseline + local editors so the UI reflects the latest server state.
+        # Reset baseline + editors so the UI reflects the latest server state.
         clear_doctor_baseline()
         for (yy, mm) in selected:
-            # legacy key (older UI)
             st.session_state.pop(f"unav_editor_{doctor}_{yy}_{mm}", None)
-            # new robust UI keys (row-based widgets)
-            _rows_prefix = f"unav_rows_{doctor}_{yy}_{mm}"
-            for _k in list(st.session_state.keys()):
-                if str(_k).startswith(_rows_prefix):
-                    st.session_state.pop(_k, None)
         st.rerun()
 
     try:
@@ -1834,160 +1845,18 @@ if mode == "Indisponibilità (Medico)":
             if not init:
                 init = [{"Data": date(yy, mm, 1), "Fascia": "Mattina", "Note": ""}]
 
-            # --- Editor righe (UI robusta: niente st.data_editor) ---
-            rows_key = f"unav_rows_{doctor}_{yy}_{mm}"
-
-            # Initialize per-month rows state once (or after refresh)
-            if rows_key not in st.session_state:
-                rows_init = []
-                for _r in init:
-                    rows_init.append({
-                        "id": str(uuid.uuid4()),
-                        "Data": _r.get("Data"),
-                        "Fascia": _r.get("Fascia") or "Mattina",
-                        "Note": _r.get("Note", ""),
-                    })
-                st.session_state[rows_key] = rows_init
-
-            first_day = date(yy, mm, 1)
-            if mm == 12:
-                last_day = date(yy + 1, 1, 1) - timedelta(days=1)
-            else:
-                last_day = date(yy, mm + 1, 1) - timedelta(days=1)
-
             if unav_open:
-                cA, cB, cC = st.columns([1, 1, 6])
-                with cA:
-                    add_row = st.button("➕ Aggiungi riga", key=f"{rows_key}__add", use_container_width=True)
-                with cB:
-                    clean_rows = st.button("🧹 Pulisci righe vuote", key=f"{rows_key}__clean", use_container_width=True)
-                with cC:
-                    st.caption("Aggiungi e modifica le righe qui sotto. La data è vincolata al mese selezionato.")
-
-                rows = list(st.session_state.get(rows_key) or [])
-
-                if add_row:
-                    rows.append({
-                        "id": str(uuid.uuid4()),
-                        "Data": first_day,
-                        "Fascia": "Mattina",
-                        "Note": "",
-                    })
-                    st.session_state[rows_key] = rows
-                    st.rerun()
-
-                if clean_rows:
-                    def _is_empty(_x: dict) -> bool:
-                        d = _x.get("Data")
-                        sh = str(_x.get("Fascia") or "").strip()
-                        note = str(_x.get("Note") or "").strip()
-                        return (not d) and (not sh) and (not note)
-
-                    rows = [r for r in rows if not _is_empty(r)]
-                    if not rows:
-                        # keep at least one starter row (precompilata)
-                        rows = [{
-                            "id": str(uuid.uuid4()),
-                            "Data": first_day,
-                            "Fascia": "Mattina",
-                            "Note": "",
-                        }]
-                    st.session_state[rows_key] = rows
-                    st.rerun()
-
-                if not rows:
-                    rows = [{
-                        "id": str(uuid.uuid4()),
-                        "Data": first_day,
-                        "Fascia": "Mattina",
-                        "Note": "",
-                    }]
-                    st.session_state[rows_key] = rows
-
-                # Header
-                h1, h2, h3, h4 = st.columns([2, 2, 6, 1])
-                h1.markdown("**Data**")
-                h2.markdown("**Fascia**")
-                h3.markdown("**Note**")
-                h4.markdown("**Rimuovi**")
-
-                remove_ids = []
-                new_rows = []
-
-                for r in rows:
-                    rid = str(r.get("id") or uuid.uuid4())
-                    d_key = f"{rows_key}__d__{rid}"
-                    s_key = f"{rows_key}__s__{rid}"
-                    n_key = f"{rows_key}__n__{rid}"
-                    rm_key = f"{rows_key}__rm__{rid}"
-
-                    # Seed widget state once to avoid "first change gets lost" behaviour
-                    if d_key not in st.session_state:
-                        st.session_state[d_key] = r.get("Data") or first_day
-                    if s_key not in st.session_state:
-                        st.session_state[s_key] = r.get("Fascia") or "Mattina"
-                    if n_key not in st.session_state:
-                        st.session_state[n_key] = r.get("Note", "")
-
-                    c1, c2, c3, c4 = st.columns([2, 2, 6, 1])
-                    with c1:
-                        d_val = st.date_input(
-                            "Data",
-                            key=d_key,
-                            min_value=first_day,
-                            max_value=last_day,
-                            label_visibility="collapsed",
-                        )
-                    with c2:
-                        sh_val = st.selectbox(
-                            "Fascia",
-                            options=FASCIA_OPTIONS,
-                            key=s_key,
-                            label_visibility="collapsed",
-                        )
-                    with c3:
-                        note_val = st.text_input(
-                            "Note",
-                            key=n_key,
-                            label_visibility="collapsed",
-                        )
-                    with c4:
-                        if st.button("🗑️", key=rm_key, help="Rimuovi questa riga"):
-                            remove_ids.append(rid)
-
-                    # Enforce month bounds (extra safety)
-                    if isinstance(d_val, date):
-                        if d_val < first_day:
-                            d_val = first_day
-                            st.session_state[d_key] = d_val
-                        if d_val > last_day:
-                            d_val = last_day
-                            st.session_state[d_key] = d_val
-
-                    new_rows.append({
-                        "id": rid,
-                        "Data": d_val,
-                        "Fascia": sh_val,
-                        "Note": note_val,
-                    })
-
-                if remove_ids:
-                    new_rows = [r for r in new_rows if str(r.get("id")) not in set(remove_ids)]
-                    if not new_rows:
-                        new_rows = [{
-                            "id": str(uuid.uuid4()),
-                            "Data": first_day,
-                            "Fascia": "Mattina",
-                            "Note": "",
-                        }]
-                    st.session_state[rows_key] = new_rows
-                    st.rerun()
-
-                # Persist updated rows for this rerun (safe: not a widget key)
-                st.session_state[rows_key] = new_rows
-
-                # Build "edited" compatible with existing save/validation pipeline
-                edited = [{"Data": rr["Data"], "Fascia": rr["Fascia"], "Note": rr.get("Note", "")} for rr in new_rows]
+                edited = st.data_editor(
+                    init,
+                    num_rows="dynamic",
+                    use_container_width=True,
+                    column_config={
+                        "Data": st.column_config.DateColumn("Data", required=True),
+                        "Fascia": st.column_config.SelectboxColumn("Fascia", options=FASCIA_OPTIONS, required=True),
+                        "Note": st.column_config.TextColumn("Note"),
+                    },
+                    key=f"unav_editor_{doctor}_{yy}_{mm}",
+                )
             else:
                 # Read-only view when the admin closes submissions
                 st.dataframe(init, use_container_width=True, hide_index=True)
