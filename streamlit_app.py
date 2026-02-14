@@ -1292,66 +1292,6 @@ def append_unavailability_audit_log(mk: str, row: dict, max_retries: int = 3):
     if last_err:
         raise last_err
 
-
-def coerce_editor_rows(obj, default_date, default_fascia="Mattina"):
-    """Coerce st.data_editor output/state into list[dict] with Data/Fascia/Note.
-
-    Accepts: list[dict], pandas.DataFrame. Ignores other Streamlit internal state dicts.
-    """
-    try:
-        import pandas as _pd
-    except Exception:
-        _pd = None
-
-    rows = None
-    if _pd is not None and isinstance(obj, _pd.DataFrame):
-        rows = obj.to_dict("records")
-    elif isinstance(obj, list):
-        rows = obj
-
-    if rows is None:
-        return None
-
-    out = []
-    for r in rows:
-        if not isinstance(r, dict):
-            continue
-        d = r.get("Data", None)
-        # Normalize date values possibly coming from Streamlit editor as str / datetime / Timestamp
-        if isinstance(d, datetime):
-            d = d.date()
-        elif isinstance(d, str):
-            try:
-                d = datetime.fromisoformat(d).date()
-            except Exception:
-                try:
-                    d = date.fromisoformat(d)
-                except Exception:
-                    pass
-        try:
-            import pandas as _pd2
-            if isinstance(d, _pd2.Timestamp):
-                d = d.to_pydatetime().date()
-        except Exception:
-            pass
-
-        fsh = r.get("Fascia", None)
-        note = r.get("Note", "")
-
-        if d is None:
-            d = default_date
-        if fsh is None or str(fsh).strip() == "":
-            fsh = default_fascia
-        if note is None:
-            note = ""
-
-        out.append({"Data": d, "Fascia": str(fsh).strip(), "Note": str(note)})
-
-    if not out:
-        out = [{"Data": default_date, "Fascia": default_fascia, "Note": ""}]
-    return out
-
-
 def extract_entries_from_editor(edited_rows: list[dict], yy: int, mm: int) -> tuple[list[tuple[date, str, str]], dict]:
     """Normalize and validate editor rows for a specific (yy,mm).
 
@@ -1872,8 +1812,7 @@ if mode == "Indisponibilità (Medico)":
         clear_doctor_baseline()
         for (yy, mm) in selected:
             # Reset editor state (legacy + v2) so UI reflects latest server state.
-            st.session_state.pop(f"unav_editor_{doctor}_{yy}_{mm}__data", None)
-            st.session_state.pop(f"unav_editor_{doctor}_{yy}_{mm}__ver", None)
+            st.session_state.pop(f"unav_editor_{doctor}_{yy}_{mm}", None)
             st.session_state.pop(f"unav_editor_v2_{doctor}_{yy}_{mm}", None)
             st.session_state.pop(f"unav_editor_v2_{doctor}_{yy}_{mm}__data", None)
         st.rerun()
@@ -1945,16 +1884,11 @@ if mode == "Indisponibilità (Medico)":
 
             if unav_open:
                 # Use separate keys for widget vs stored data to avoid Streamlit session_state policy errors.
-                # NOTE: Streamlit's data_editor can sometimes 'lose' the first edit on Selectbox cells unless we
-                # sync the widget's own state back into our canonical data on each rerun.
-                base_key = f"unav_editor_{doctor}_{yy}_{mm}"
-                editor_data_key = f"{base_key}__data"
-                editor_ver_key = f"{base_key}__ver"
-                ver = int(st.session_state.get(editor_ver_key, 0))
-                editor_widget_key = f"{base_key}__v{ver}"
+                editor_widget_key = f"unav_editor_v2_{doctor}_{yy}_{mm}"
+                editor_data_key = f"{editor_widget_key}__data"
 
-                # Initialize editor data only once per (doctor, year, month).
-                st.session_state.setdefault(editor_data_key, coerce_editor_rows(init, date(yy, mm, 1)) or init)
+                # Initialize editor data only once per (doctor, year, month) or after a manual refresh.
+                st.session_state.setdefault(editor_data_key, init)
 
                 b1, b2 = st.columns([1, 1])
                 with b1:
@@ -1969,15 +1903,14 @@ if mode == "Indisponibilità (Medico)":
                         key=f"clean_rows_{doctor}_{yy}_{mm}",
                         help="Rimuove eventuali righe completamente vuote.",
                     )
+
                 if add_row:
                     rows = list(st.session_state.get(editor_data_key) or [])
                     rows.append({"Data": date(yy, mm, 1), "Fascia": "Mattina", "Note": ""})
                     st.session_state[editor_data_key] = rows
-                    st.session_state[editor_ver_key] = ver + 1
                     st.rerun()
 
                 if clean_rows:
-
                     rows = list(st.session_state.get(editor_data_key) or [])
                     cleaned = []
                     for r in rows:
@@ -1990,7 +1923,6 @@ if mode == "Indisponibilità (Medico)":
                     if not cleaned:
                         cleaned = [{"Data": date(yy, mm, 1), "Fascia": "Mattina", "Note": ""}]
                     st.session_state[editor_data_key] = cleaned
-                    st.session_state[editor_ver_key] = ver + 1
                     st.rerun()
 
                 edited = st.data_editor(
@@ -2004,57 +1936,11 @@ if mode == "Indisponibilità (Medico)":
                     },
                     key=editor_widget_key,
                 )
-                # Persist editor value in our canonical state (fix first-selectbox-edit revert)
-                state_val = st.session_state.get(editor_widget_key)
 
-                # Start from the returned table data
-                rows_val = coerce_editor_rows(edited, date(yy, mm, 1))
-
-                # If Streamlit exposes editor state (edited_rows/added_rows/deleted_rows), merge it.
-                # This avoids the "first selectbox edit reverts" glitch.
-                if isinstance(state_val, dict):
-                    rows_tmp = [dict(r) for r in (rows_val or [])]
-
-                    edited_rows = state_val.get("edited_rows")
-                    if isinstance(edited_rows, dict):
-                        for k, changes in edited_rows.items():
-                            try:
-                                irow = int(k)
-                            except Exception:
-                                continue
-                            if 0 <= irow < len(rows_tmp) and isinstance(changes, dict):
-                                for col, val in changes.items():
-                                    if col in ("Data", "Fascia", "Note"):
-                                        rows_tmp[irow][col] = val
-
-                    added_rows = state_val.get("added_rows")
-                    if isinstance(added_rows, list):
-                        for r2 in added_rows:
-                            if isinstance(r2, dict):
-                                rows_tmp.append(
-                                    {"Data": r2.get("Data"), "Fascia": r2.get("Fascia"), "Note": r2.get("Note", "")}
-                                )
-
-                    deleted_rows = state_val.get("deleted_rows")
-                    if isinstance(deleted_rows, list):
-                        del_idx = []
-                        for x in deleted_rows:
-                            try:
-                                del_idx.append(int(x))
-                            except Exception:
-                                pass
-                        for irow in sorted(set(del_idx), reverse=True):
-                            if 0 <= irow < len(rows_tmp):
-                                rows_tmp.pop(irow)
-
-                    rows_val = coerce_editor_rows(rows_tmp, date(yy, mm, 1))
-
-                # Fallback: try to coerce the widget state directly (should be rare)
-                if rows_val is None:
-                    rows_val = coerce_editor_rows(state_val, date(yy, mm, 1))
-
-                st.session_state[editor_data_key] = rows_val or [{"Data": date(yy, mm, 1), "Fascia": "Mattina", "Note": ""}]
-                edited = st.session_state[editor_data_key]
+                # IMPORTANT: st.data_editor can lag one rerun with SelectboxColumn.
+                # The widget's own value in session_state is the most reliable source.
+                edited_effective = st.session_state.get(editor_widget_key, edited)
+                st.session_state[editor_data_key] = edited_effective
 
             else:
                 # Read-only view when the admin closes submissions
