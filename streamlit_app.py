@@ -46,6 +46,46 @@ DOCTOR_SESSION_HEARTBEAT_SECONDS = 60     # throttle for lease keep-alive writes
 def _utc_now_iso() -> str:
     return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
+# ---- UI flash messages (persist across reruns) ----
+def _unav_flash_key(doctor: str) -> str:
+    return f"unav_flash__{doctor}"
+
+def set_unav_flash(doctor: str, kind: str, msg: str, details: str | None = None) -> None:
+    """Persist a message (success/error/info) so it doesn't disappear on rerun."""
+    st.session_state[_unav_flash_key(doctor)] = {
+        "kind": kind,
+        "msg": msg,
+        "details": details,
+        "ts": _utc_now_iso(),
+    }
+
+def render_unav_flash(doctor: str) -> None:
+    key = _unav_flash_key(doctor)
+    f = st.session_state.get(key)
+    if not isinstance(f, dict):
+        return
+
+    cols = st.columns([12, 1])
+    with cols[0]:
+        kind = str(f.get("kind") or "info")
+        msg = str(f.get("msg") or "")
+        if kind == "success":
+            st.success(msg)
+        elif kind == "error":
+            st.error(msg)
+        else:
+            st.info(msg)
+
+        details = f.get("details")
+        if details:
+            with st.expander("Dettagli"):
+                st.code(str(details))
+
+    with cols[1]:
+        if st.button("✖", key=f"dismiss__{key}"):
+            st.session_state.pop(key, None)
+            st.rerun()
+
 # ---- Indisponibilità: fasce ammesse e normalizzazione (per compatibilità con valori "storici") ----
 FASCIA_OPTIONS = ["Mattina", "Pomeriggio", "Notte", "Diurno", "Tutto il giorno"]
 
@@ -1689,6 +1729,8 @@ if mode == "Indisponibilità (Medico)":
 
     doctor = st.session_state.doctor_name
 
+
+    render_unav_flash(doctor)
     # Single active session per doctor: this prevents silent overwrites when the
     # same doctor uses multiple devices/browsers.
     try:
@@ -2131,14 +2173,21 @@ if mode == "Indisponibilità (Medico)":
             # don't trigger false "stale" conflicts.
             clear_doctor_baseline()
 
-            st.success("Salvato ✅")
+            set_unav_flash(doctor, "success", "Salvataggio effettuato ✅")
             st.rerun()
         except Exception as e:
-            st.error(f"Errore salvataggio su GitHub: {e}")
-            st.info(
-                "Se vedi 404: (1) token senza accesso alla repo privata, "
-                "(2) owner/repo/branch/path errati, (3) token non autorizzato SSO (se repo in Organization)."
+            set_unav_flash(
+                doctor,
+                "error",
+                "Errore durante il salvataggio ❌",
+                details=(
+                    f"{e}\n\n"
+                    "Suggerimenti (se vedi 404): (1) token senza accesso alla repo privata, "
+                    "(2) owner/repo/branch/path errati, "
+                    "(3) token non autorizzato SSO (se repo in Organization)."
+                ),
             )
+            st.rerun()
 
 
 # =====================================================================
