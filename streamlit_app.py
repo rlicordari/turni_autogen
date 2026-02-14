@@ -1317,6 +1317,24 @@ def coerce_editor_rows(obj, default_date, default_fascia="Mattina"):
         if not isinstance(r, dict):
             continue
         d = r.get("Data", None)
+        # Normalize date values possibly coming from Streamlit editor as str / datetime / Timestamp
+        if isinstance(d, datetime):
+            d = d.date()
+        elif isinstance(d, str):
+            try:
+                d = datetime.fromisoformat(d).date()
+            except Exception:
+                try:
+                    d = date.fromisoformat(d)
+                except Exception:
+                    pass
+        try:
+            import pandas as _pd2
+            if isinstance(d, _pd2.Timestamp):
+                d = d.to_pydatetime().date()
+        except Exception:
+            pass
+
         fsh = r.get("Fascia", None)
         note = r.get("Note", "")
 
@@ -1988,11 +2006,56 @@ if mode == "Indisponibilità (Medico)":
                 )
                 # Persist editor value in our canonical state (fix first-selectbox-edit revert)
                 state_val = st.session_state.get(editor_widget_key)
-                rows_val = coerce_editor_rows(state_val, date(yy, mm, 1)) or coerce_editor_rows(edited, date(yy, mm, 1))
-                st.session_state[editor_data_key] = rows_val
-                edited = rows_val
 
-                st.session_state[editor_data_key] = st.session_state.get(editor_widget_key, edited)
+                # Start from the returned table data
+                rows_val = coerce_editor_rows(edited, date(yy, mm, 1))
+
+                # If Streamlit exposes editor state (edited_rows/added_rows/deleted_rows), merge it.
+                # This avoids the "first selectbox edit reverts" glitch.
+                if isinstance(state_val, dict):
+                    rows_tmp = [dict(r) for r in (rows_val or [])]
+
+                    edited_rows = state_val.get("edited_rows")
+                    if isinstance(edited_rows, dict):
+                        for k, changes in edited_rows.items():
+                            try:
+                                irow = int(k)
+                            except Exception:
+                                continue
+                            if 0 <= irow < len(rows_tmp) and isinstance(changes, dict):
+                                for col, val in changes.items():
+                                    if col in ("Data", "Fascia", "Note"):
+                                        rows_tmp[irow][col] = val
+
+                    added_rows = state_val.get("added_rows")
+                    if isinstance(added_rows, list):
+                        for r2 in added_rows:
+                            if isinstance(r2, dict):
+                                rows_tmp.append(
+                                    {"Data": r2.get("Data"), "Fascia": r2.get("Fascia"), "Note": r2.get("Note", "")}
+                                )
+
+                    deleted_rows = state_val.get("deleted_rows")
+                    if isinstance(deleted_rows, list):
+                        del_idx = []
+                        for x in deleted_rows:
+                            try:
+                                del_idx.append(int(x))
+                            except Exception:
+                                pass
+                        for irow in sorted(set(del_idx), reverse=True):
+                            if 0 <= irow < len(rows_tmp):
+                                rows_tmp.pop(irow)
+
+                    rows_val = coerce_editor_rows(rows_tmp, date(yy, mm, 1))
+
+                # Fallback: try to coerce the widget state directly (should be rare)
+                if rows_val is None:
+                    rows_val = coerce_editor_rows(state_val, date(yy, mm, 1))
+
+                st.session_state[editor_data_key] = rows_val or [{"Data": date(yy, mm, 1), "Fascia": "Mattina", "Note": ""}]
+                edited = st.session_state[editor_data_key]
+
             else:
                 # Read-only view when the admin closes submissions
                 st.dataframe(init, use_container_width=True, hide_index=True)
