@@ -1884,11 +1884,20 @@ if mode == "Indisponibilità (Medico)":
 
             if unav_open:
                 # Use separate keys for widget vs stored data to avoid Streamlit session_state policy errors.
-                editor_widget_key = f"unav_editor_v2_{doctor}_{yy}_{mm}"
-                editor_data_key = f"{editor_widget_key}__data"
+                # NOTE: Streamlit's data_editor can sometimes 'lose' the first edit on Selectbox cells unless we
+                # sync the widget's own state back into our canonical data on each rerun.
+                base_key = f"unav_editor_{doctor}_{yy}_{mm}"
+                editor_data_key = f"{base_key}__data"
+                editor_ver_key = f"{base_key}__ver"
+                ver = int(st.session_state.get(editor_ver_key, 0))
+                editor_widget_key = f"{base_key}__v{ver}"
 
-                # Initialize editor data only once per (doctor, year, month) or after a manual refresh.
+                # Initialize editor data only once per (doctor, year, month).
                 st.session_state.setdefault(editor_data_key, init)
+
+                # Sync latest widget edits into the canonical data to avoid first-edit revert (SelectboxColumn quirk).
+                if editor_widget_key in st.session_state:
+                    st.session_state[editor_data_key] = st.session_state[editor_widget_key]
 
                 b1, b2 = st.columns([1, 1])
                 with b1:
@@ -1908,6 +1917,7 @@ if mode == "Indisponibilità (Medico)":
                     rows = list(st.session_state.get(editor_data_key) or [])
                     rows.append({"Data": date(yy, mm, 1), "Fascia": "Mattina", "Note": ""})
                     st.session_state[editor_data_key] = rows
+                    st.session_state[editor_ver_key] = ver + 1
                     st.rerun()
 
                 if clean_rows:
@@ -1923,6 +1933,7 @@ if mode == "Indisponibilità (Medico)":
                     if not cleaned:
                         cleaned = [{"Data": date(yy, mm, 1), "Fascia": "Mattina", "Note": ""}]
                     st.session_state[editor_data_key] = cleaned
+                    st.session_state[editor_ver_key] = ver + 1
                     st.rerun()
 
                 edited = st.data_editor(
@@ -1936,7 +1947,7 @@ if mode == "Indisponibilità (Medico)":
                     },
                     key=editor_widget_key,
                 )
-                st.session_state[editor_data_key] = edited
+                st.session_state[editor_data_key] = st.session_state.get(editor_widget_key, edited)
             else:
                 # Read-only view when the admin closes submissions
                 st.dataframe(init, use_container_width=True, hide_index=True)
