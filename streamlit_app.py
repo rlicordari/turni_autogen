@@ -94,7 +94,7 @@ def normalize_fascia(val: object) -> tuple[str, bool, bool]:
     return "Tutto il giorno", True, True
 # ---------------- Page config & style ----------------
 st.set_page_config(
-    page_title="Turni UOC Cardiologia – UTIC",
+    page_title="Turni UTIC – Autogeneratore",
     page_icon="🗓️",
     layout="wide",
 )
@@ -236,47 +236,22 @@ def _mask_phone(p: str) -> str:
         return "***"
     return f"***{s[-3:]}"
 def _github_cfg() -> dict:
-    """GitHub storage configuration.
-
-    Priority:
-      1) [github_unavailability] mapping in Streamlit secrets
-      2) flat env/secrets keys (GITHUB_UNAV_*)
-    Convenience:
-      - if some path keys are not present, we also look under [auth] (legacy/compat).
-    """
-    base: dict = {}
-
     cfg = _get_secret(("github_unavailability",), None)
     if isinstance(cfg, Mapping):
-        base.update(dict(cfg))
-
-    # Fill missing from flat keys / defaults
-    def _set_default(k: str, v: object) -> None:
-        if not str(base.get(k) or "").strip():
-            base[k] = v
-
-    _set_default("token", _get_secret(("GITHUB_UNAV_TOKEN",), ""))
-    _set_default("owner", _get_secret(("GITHUB_UNAV_OWNER",), ""))
-    _set_default("repo", _get_secret(("GITHUB_UNAV_REPO",), ""))
-    _set_default("branch", _get_secret(("GITHUB_UNAV_BRANCH",), "main"))
-
-    _set_default("path", _get_secret(("GITHUB_UNAV_PATH",), "data/unavailability_store.csv"))
-    _set_default("settings_path", _get_secret(("GITHUB_UNAV_SETTINGS_PATH",), "data/unavailability_settings.yml"))
-    _set_default("audit_dir", _get_secret(("GITHUB_UNAV_AUDIT_DIR",), "data/unavailability_audit"))
-    _set_default("sessions_dir", _get_secret(("GITHUB_UNAV_SESSIONS_DIR",), "data/unavailability_sessions"))
-    _set_default("doctor_auth_dir", _get_secret(("GITHUB_DOCTOR_AUTH_DIR",), "data/doctor_auth"))
-    _set_default("contacts_path", _get_secret(("GITHUB_DOCTOR_CONTACTS_PATH",), "data/doctor_contacts.yml"))
-
-    # Optional legacy section [auth] (many installs already have these keys there)
-    auth = _get_secret(("auth",), None)
-    if isinstance(auth, Mapping):
-        for k in ("path", "settings_path", "audit_dir", "sessions_dir", "doctor_auth_dir", "contacts_path"):
-            if not str(base.get(k) or "").strip():
-                v = auth.get(k)
-                if isinstance(v, str) and v.strip():
-                    base[k] = v.strip()
-
-    return base
+        return dict(cfg)
+    # fallback flat keys
+    return {
+        "token": _get_secret(("GITHUB_UNAV_TOKEN",), ""),
+        "owner": _get_secret(("GITHUB_UNAV_OWNER",), ""),
+        "repo": _get_secret(("GITHUB_UNAV_REPO",), ""),
+        "branch": _get_secret(("GITHUB_UNAV_BRANCH",), "main"),
+        "path": _get_secret(("GITHUB_UNAV_PATH",), "data/unavailability_store.csv"),
+        "settings_path": _get_secret(("GITHUB_UNAV_SETTINGS_PATH",), "data/unavailability_settings.yml"),
+        "audit_dir": _get_secret(("GITHUB_UNAV_AUDIT_DIR",), "data/unavailability_audit"),
+        "sessions_dir": _get_secret(("GITHUB_UNAV_SESSIONS_DIR",), "data/unavailability_sessions"),
+        "doctor_auth_dir": _get_secret(("GITHUB_DOCTOR_AUTH_DIR",), "data/doctor_auth"),
+        "contacts_path": _get_secret(("GITHUB_DOCTOR_CONTACTS_PATH",), "data/doctor_contacts.yml"),
+    }
 
 # ---------------- Rules / doctors ----------------
 def load_rules_from_source(uploaded) -> tuple[dict, Path]:
@@ -411,23 +386,17 @@ def _verify_pin(pin: str, rec: dict) -> bool:
 def load_doctor_contacts_from_github() -> dict:
     """Return {doctor: {email, phone}} from a YAML file.
 
-    Primary source: GitHub repo configured for the unavailability store.
+    Primary source: GitHub repo configured in secrets (same repo used for the unavailability store).
     Fallback: local file inside the deployed app repo (useful if you keep contacts in the code repo).
-
-    Notes:
-      - contacts_path may be configured under [github_unavailability].contacts_path
-      - for backward compatibility we also accept [auth].contacts_path
     """
     g = _github_cfg()
-    auth = _get_secret(("auth",), None)
-    auth_path = (auth.get("contacts_path") if isinstance(auth, Mapping) else None)
-    remote_path = (g.get("contacts_path") or "").strip() or (str(auth_path).strip() if isinstance(auth_path, str) else "") or "data/doctor_contacts.yml"
+    path = g.get("contacts_path") or "data/doctor_contacts.yml"
 
     text: str | None = None
     gf = None
     try:
         gf = github_utils.get_file(
-            owner=g["owner"], repo=g["repo"], path=remote_path, token=g["token"], branch=g.get("branch", "main")
+            owner=g["owner"], repo=g["repo"], path=path, token=g["token"], branch=g.get("branch", "main")
         )
     except Exception:
         gf = None
@@ -436,22 +405,12 @@ def load_doctor_contacts_from_github() -> dict:
         text = gf.text
     else:
         # local fallback (Streamlit Cloud has the repo checked out on disk)
-        candidates = []
-        for p in (auth_path, remote_path, "data/doctor_contacts.yml"):
-            if isinstance(p, str) and p.strip():
-                candidates.append(p.strip())
-        seen = set()
-        for p in candidates:
-            if p in seen:
-                continue
-            seen.add(p)
-            try:
-                lp = Path(p)
-                if lp.exists() and lp.is_file():
-                    text = lp.read_text(encoding="utf-8", errors="replace")
-                    break
-            except Exception:
-                continue
+        try:
+            lp = Path(path)
+            if lp.exists() and lp.is_file():
+                text = lp.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            text = None
 
     if not text:
         return {}
@@ -462,7 +421,6 @@ def load_doctor_contacts_from_github() -> dict:
         data = {}
     if not isinstance(data, Mapping):
         return {}
-
     out: dict = {}
     for k, v in data.items():
         if not isinstance(v, Mapping):
@@ -572,7 +530,7 @@ def _send_otp_email(dest: str, code: str) -> None:
     if not _email_is_configured():
         raise RuntimeError("Invio email non configurato (smtp).")
     msg = EmailMessage()
-    msg["Subject"] = "Codice verifica – Turni UOC Cardiologia UTIC"
+    msg["Subject"] = "Codice verifica – Turni UTIC"
     msg["From"] = cfg.get("from")
     msg["To"] = dest
     msg.set_content(
@@ -605,7 +563,7 @@ def _send_otp_sms(dest: str, code: str) -> None:
     data = {
         "From": from_num,
         "To": dest,
-        "Body": f"Turni UOC Cardiologia UTIC - codice verifica PIN: {code}",
+        "Body": f"Turni UTIC - codice verifica PIN: {code}",
     }
     r = requests.post(url, data=data, auth=(sid, token), timeout=20)
     if r.status_code >= 400:
@@ -645,7 +603,8 @@ def save_doctor_otp_record(doctor: str, rec: dict, sha: str | None, message: str
 
 def request_pin_otp(doctor: str, channel: str) -> str:
     """Send an OTP to the doctor's configured email/SMS. Returns masked destination."""
-    c = get_doctor_contact(doctor)
+    contacts = load_doctor_contacts_from_github()
+    c = contacts.get(doctor) or {}
     email = str(c.get("email") or "").strip()
     phone = str(c.get("phone") or "").strip()
 
@@ -1387,30 +1346,6 @@ def _logout_doctor(reason: str):
     st.session_state["doctor_logout_msg"] = reason
     st.rerun()
 
-def _set_doctor_flash(kind: str, message: str):
-    """Persist a one-shot message across a rerun (so the user actually sees it)."""
-    st.session_state["doctor_flash"] = {
-        "kind": str(kind),
-        "message": str(message),
-        "ts": _utc_now_iso(),
-    }
-
-def _render_doctor_flash():
-    flash = st.session_state.pop("doctor_flash", None)
-    if not isinstance(flash, dict):
-        return
-    kind = str(flash.get("kind") or "")
-    msg = str(flash.get("message") or "")
-    if not msg:
-        return
-    if kind == "success":
-        st.success(msg)
-    elif kind == "warning":
-        st.warning(msg)
-    else:
-        st.error(msg)
-
-
 
 def _doctor_session_state_key(doctor: str) -> str:
     return f"doctor_session::{_doctor_slug(doctor)}"
@@ -1492,7 +1427,12 @@ def release_doctor_session(doctor: str):
 
 
 # ---------------- UI: Header ----------------
-st.title("Turni UOC Cardiologia – UTIC")
+st.title("Turni UTIC – Autogeneratore")
+st.markdown(
+    '<div class="small-muted">Genera il file turni del mese rispettando regole e indisponibilità. '
+    'I medici possono inserire solo le <b>proprie</b> indisponibilità (privacy).</div>',
+    unsafe_allow_html=True,
+)
 
 mode = st.sidebar.radio(
     "Sezione",
@@ -1533,12 +1473,10 @@ if mode == "Indisponibilità (Medico)":
 
     # If this browser session was kicked out by a newer login elsewhere, show the reason.
     if st.session_state.get("doctor_logout_msg"):
-        st.error(str(st.session_state.pop("doctor_logout_msg")))
+        st.warning(str(st.session_state.pop("doctor_logout_msg")))
 
     if st.session_state.doctor_auth_ok:
         st.success(f"Accesso attivo: **{st.session_state.doctor_name}**")
-        _render_doctor_flash()
-
 
         with st.expander("🔐 Cambia PIN", expanded=False):
             st.caption("Puoi cambiare il PIN in qualsiasi momento. Il nuovo PIN deve essere di 4 cifre.")
@@ -1632,6 +1570,17 @@ if mode == "Indisponibilità (Medico)":
                 st.rerun()
 
 
+
+            contacts_all = load_doctor_contacts_from_github()
+            if not contacts_all:
+                g = _github_cfg()
+                path = g.get("contacts_path") or "data/doctor_contacts.yml"
+                st.error(
+                    "Non posso inviare il codice di verifica (contatti non caricati: file mancante/non leggibile oppure YAML non valido)."
+                )
+                st.caption(f"Sto cercando contatti in: {g.get('owner','')}/{g.get('repo','')}:{g.get('branch','main')}/{path}")
+                return
+
             c = get_doctor_contact(doctor)
 
             email = str(c.get("email") or "").strip()
@@ -1656,6 +1605,16 @@ if mode == "Indisponibilità (Medico)":
                     missing.append("canale non disponibile")
 
                 st.error("Non posso inviare il codice di verifica (" + "; ".join(missing) + ").")
+                # Diagnostica leggera (non mostra email/telefono)
+                try:
+                    _keys = list(load_doctor_contacts_from_github().keys())
+                    if _keys and ("contatto non trovato per questo medico" in missing):
+                        shown = ", ".join([str(k) for k in _keys[:30]])
+                        more = " …" if len(_keys) > 30 else ""
+                        st.caption(f"Contatti caricati per: {shown}{more}")
+                except Exception:
+                    pass
+
                 if email:
                     st.caption(f"Email configurata per il medico: {_mask_email(email)}")
                 if phone:
@@ -1747,28 +1706,13 @@ if mode == "Indisponibilità (Medico)":
         7: "Luglio", 8: "Agosto", 9: "Settembre", 10: "Ottobre", 11: "Novembre", 12: "Dicembre",
     }
 
-    # Default: mese SUCCESSIVO rispetto a oggi (es. oggi Febbraio → default Marzo)
-    _first_of_this_month = today.replace(day=1)
-    _first_of_next_month = (_first_of_this_month + timedelta(days=32)).replace(day=1)
-    default_year = _first_of_next_month.year
-    default_month = _first_of_next_month.month
-
-    # Inizializza i selettori Anno/Mese solo alla prima apertura della sessione
-    if "doctor_year_sel" not in st.session_state or st.session_state.get("doctor_year_sel") not in year_options:
-        st.session_state["doctor_year_sel"] = default_year
-    if "doctor_month_sel" not in st.session_state or int(st.session_state.get("doctor_month_sel") or 0) not in range(1, 13):
-        st.session_state["doctor_month_sel"] = default_month
-
-    # Manteniamo l'ordine dei mesi selezionati: il primo è quello che si apre in tab
-    selected = st.session_state.get("doctor_selected_months")
-    if not selected:
-        selected = [(default_year, default_month)]
-    selected = list(selected)
+    sel_default = st.session_state.get("doctor_selected_months") or [(today.year, today.month)]
+    sel_set = set(sel_default)
 
     st.subheader("3) Seleziona mese/i da compilare")
     c1, c2, c3, c4 = st.columns([1, 1.4, 1, 1])
     with c1:
-        yy_sel = st.selectbox("Anno", year_options, key="doctor_year_sel")
+        yy_sel = st.selectbox("Anno", year_options, index=0, key="doctor_year_sel")
     with c2:
         mm_sel = st.selectbox(
             "Mese",
@@ -1783,12 +1727,11 @@ if mode == "Indisponibilità (Medico)":
 
     cur = (int(yy_sel), int(mm_sel))
     if add_month:
-        # Porta in cima (così la tab si apre subito)
-        selected = [m for m in selected if m != cur]
-        selected.insert(0, cur)
+        sel_set.add(cur)
     if remove_month:
-        selected = [m for m in selected if m != cur]
+        sel_set.discard(cur)
 
+    selected = sorted(sel_set)
     st.session_state.doctor_selected_months = selected
 
     st.caption("Mesi selezionati: " + ", ".join([f"{yy}-{mm:02d}" for (yy, mm) in selected]))
@@ -1806,15 +1749,20 @@ if mode == "Indisponibilità (Medico)":
             "🔄 Ricarica dati",
             help="Ricarica l’archivio dal server (utile se qualcuno ha appena salvato).",
         )
+    with cR2:
+        st.caption("La sessione usa uno snapshot per evitare conflitti: al salvataggio viene sempre verificato sul server.")
 
     if refresh_baseline:
-        # Reset baseline + editors so the UI reflects the latest server state.
+        # Reset baseline + local editors so the UI reflects the latest server state.
         clear_doctor_baseline()
         for (yy, mm) in selected:
-            # Reset editor state (legacy + v2) so UI reflects latest server state.
+            # legacy key (older UI)
             st.session_state.pop(f"unav_editor_{doctor}_{yy}_{mm}", None)
-            st.session_state.pop(f"unav_editor_v2_{doctor}_{yy}_{mm}", None)
-            st.session_state.pop(f"unav_editor_v2_{doctor}_{yy}_{mm}__data", None)
+            # new robust UI keys (row-based widgets)
+            _rows_prefix = f"unav_rows_{doctor}_{yy}_{mm}"
+            for _k in list(st.session_state.keys()):
+                if str(_k).startswith(_rows_prefix):
+                    st.session_state.pop(_k, None)
         st.rerun()
 
     try:
@@ -1843,6 +1791,10 @@ if mode == "Indisponibilità (Medico)":
 
     if not unav_open:
         st.warning("🔒 Inserimento indisponibilità temporaneamente **chiuso** dall'amministratore. Puoi solo visualizzare (non puoi salvare).")
+    st.caption(
+        f"Limite per medico: **max {max_per_shift}** inserimenti per ogni fascia "
+        "(Mattina/Pomeriggio/Notte/Diurno/Tutto il giorno) per ogni mese."
+    )
 
     st.divider()
 
@@ -1882,66 +1834,160 @@ if mode == "Indisponibilità (Medico)":
             if not init:
                 init = [{"Data": date(yy, mm, 1), "Fascia": "Mattina", "Note": ""}]
 
+            # --- Editor righe (UI robusta: niente st.data_editor) ---
+            rows_key = f"unav_rows_{doctor}_{yy}_{mm}"
+
+            # Initialize per-month rows state once (or after refresh)
+            if rows_key not in st.session_state:
+                rows_init = []
+                for _r in init:
+                    rows_init.append({
+                        "id": str(uuid.uuid4()),
+                        "Data": _r.get("Data"),
+                        "Fascia": _r.get("Fascia") or "Mattina",
+                        "Note": _r.get("Note", ""),
+                    })
+                st.session_state[rows_key] = rows_init
+
+            first_day = date(yy, mm, 1)
+            if mm == 12:
+                last_day = date(yy + 1, 1, 1) - timedelta(days=1)
+            else:
+                last_day = date(yy, mm + 1, 1) - timedelta(days=1)
+
             if unav_open:
-                # Use separate keys for widget vs stored data to avoid Streamlit session_state policy errors.
-                editor_widget_key = f"unav_editor_v2_{doctor}_{yy}_{mm}"
-                editor_data_key = f"{editor_widget_key}__data"
+                cA, cB, cC = st.columns([1, 1, 6])
+                with cA:
+                    add_row = st.button("➕ Aggiungi riga", key=f"{rows_key}__add", use_container_width=True)
+                with cB:
+                    clean_rows = st.button("🧹 Pulisci righe vuote", key=f"{rows_key}__clean", use_container_width=True)
+                with cC:
+                    st.caption("Aggiungi e modifica le righe qui sotto. La data è vincolata al mese selezionato.")
 
-                # Initialize editor data only once per (doctor, year, month) or after a manual refresh.
-                st.session_state.setdefault(editor_data_key, init)
-
-                b1, b2 = st.columns([1, 1])
-                with b1:
-                    add_row = st.button(
-                        "➕ Aggiungi riga",
-                        key=f"add_row_{doctor}_{yy}_{mm}",
-                        help="Aggiunge una riga precompilata (data nel mese selezionato).",
-                    )
-                with b2:
-                    clean_rows = st.button(
-                        "🧹 Pulisci righe vuote",
-                        key=f"clean_rows_{doctor}_{yy}_{mm}",
-                        help="Rimuove eventuali righe completamente vuote.",
-                    )
+                rows = list(st.session_state.get(rows_key) or [])
 
                 if add_row:
-                    rows = list(st.session_state.get(editor_data_key) or [])
-                    rows.append({"Data": date(yy, mm, 1), "Fascia": "Mattina", "Note": ""})
-                    st.session_state[editor_data_key] = rows
+                    rows.append({
+                        "id": str(uuid.uuid4()),
+                        "Data": first_day,
+                        "Fascia": "Mattina",
+                        "Note": "",
+                    })
+                    st.session_state[rows_key] = rows
                     st.rerun()
 
                 if clean_rows:
-                    rows = list(st.session_state.get(editor_data_key) or [])
-                    cleaned = []
-                    for r in rows:
-                        d = r.get("Data")
-                        fsh = (r.get("Fascia") or "").strip()
-                        note = (r.get("Note") or "").strip()
-                        if d is None and (not fsh) and (not note):
-                            continue
-                        cleaned.append({"Data": d, "Fascia": (fsh or "Mattina"), "Note": note})
-                    if not cleaned:
-                        cleaned = [{"Data": date(yy, mm, 1), "Fascia": "Mattina", "Note": ""}]
-                    st.session_state[editor_data_key] = cleaned
+                    def _is_empty(_x: dict) -> bool:
+                        d = _x.get("Data")
+                        sh = str(_x.get("Fascia") or "").strip()
+                        note = str(_x.get("Note") or "").strip()
+                        return (not d) and (not sh) and (not note)
+
+                    rows = [r for r in rows if not _is_empty(r)]
+                    if not rows:
+                        # keep at least one starter row (precompilata)
+                        rows = [{
+                            "id": str(uuid.uuid4()),
+                            "Data": first_day,
+                            "Fascia": "Mattina",
+                            "Note": "",
+                        }]
+                    st.session_state[rows_key] = rows
                     st.rerun()
 
-                edited = st.data_editor(
-                    st.session_state[editor_data_key],
-                    num_rows="fixed",
-                    use_container_width=True,
-                    column_config={
-                        "Data": st.column_config.DateColumn("Data", required=True),
-                        "Fascia": st.column_config.SelectboxColumn("Fascia", options=FASCIA_OPTIONS, required=True),
-                        "Note": st.column_config.TextColumn("Note"),
-                    },
-                    key=editor_widget_key,
-                )
+                if not rows:
+                    rows = [{
+                        "id": str(uuid.uuid4()),
+                        "Data": first_day,
+                        "Fascia": "Mattina",
+                        "Note": "",
+                    }]
+                    st.session_state[rows_key] = rows
 
-                # IMPORTANT: st.data_editor can lag one rerun with SelectboxColumn.
-                # The widget's own value in session_state is the most reliable source.
-                edited_effective = st.session_state.get(editor_widget_key, edited)
-                st.session_state[editor_data_key] = edited_effective
+                # Header
+                h1, h2, h3, h4 = st.columns([2, 2, 6, 1])
+                h1.markdown("**Data**")
+                h2.markdown("**Fascia**")
+                h3.markdown("**Note**")
+                h4.markdown("**Rimuovi**")
 
+                remove_ids = []
+                new_rows = []
+
+                for r in rows:
+                    rid = str(r.get("id") or uuid.uuid4())
+                    d_key = f"{rows_key}__d__{rid}"
+                    s_key = f"{rows_key}__s__{rid}"
+                    n_key = f"{rows_key}__n__{rid}"
+                    rm_key = f"{rows_key}__rm__{rid}"
+
+                    # Seed widget state once to avoid "first change gets lost" behaviour
+                    if d_key not in st.session_state:
+                        st.session_state[d_key] = r.get("Data") or first_day
+                    if s_key not in st.session_state:
+                        st.session_state[s_key] = r.get("Fascia") or "Mattina"
+                    if n_key not in st.session_state:
+                        st.session_state[n_key] = r.get("Note", "")
+
+                    c1, c2, c3, c4 = st.columns([2, 2, 6, 1])
+                    with c1:
+                        d_val = st.date_input(
+                            "Data",
+                            key=d_key,
+                            min_value=first_day,
+                            max_value=last_day,
+                            label_visibility="collapsed",
+                        )
+                    with c2:
+                        sh_val = st.selectbox(
+                            "Fascia",
+                            options=FASCIA_OPTIONS,
+                            key=s_key,
+                            label_visibility="collapsed",
+                        )
+                    with c3:
+                        note_val = st.text_input(
+                            "Note",
+                            key=n_key,
+                            label_visibility="collapsed",
+                        )
+                    with c4:
+                        if st.button("🗑️", key=rm_key, help="Rimuovi questa riga"):
+                            remove_ids.append(rid)
+
+                    # Enforce month bounds (extra safety)
+                    if isinstance(d_val, date):
+                        if d_val < first_day:
+                            d_val = first_day
+                            st.session_state[d_key] = d_val
+                        if d_val > last_day:
+                            d_val = last_day
+                            st.session_state[d_key] = d_val
+
+                    new_rows.append({
+                        "id": rid,
+                        "Data": d_val,
+                        "Fascia": sh_val,
+                        "Note": note_val,
+                    })
+
+                if remove_ids:
+                    new_rows = [r for r in new_rows if str(r.get("id")) not in set(remove_ids)]
+                    if not new_rows:
+                        new_rows = [{
+                            "id": str(uuid.uuid4()),
+                            "Data": first_day,
+                            "Fascia": "Mattina",
+                            "Note": "",
+                        }]
+                    st.session_state[rows_key] = new_rows
+                    st.rerun()
+
+                # Persist updated rows for this rerun (safe: not a widget key)
+                st.session_state[rows_key] = new_rows
+
+                # Build "edited" compatible with existing save/validation pipeline
+                edited = [{"Data": rr["Data"], "Fascia": rr["Fascia"], "Note": rr.get("Note", "")} for rr in new_rows]
             else:
                 # Read-only view when the admin closes submissions
                 st.dataframe(init, use_container_width=True, hide_index=True)
@@ -1982,7 +2028,7 @@ if mode == "Indisponibilità (Medico)":
     with c1:
         save = st.button("Salva indisponibilità", type="primary", disabled=not can_save)
     with c2:
-        st.empty()
+        st.caption("Privacy: salviamo solo le righe del tuo nominativo nei mesi selezionati.")
 
     if save:
         if not unav_open:
@@ -2065,15 +2111,16 @@ if mode == "Indisponibilità (Medico)":
             # don't trigger false "stale" conflicts.
             clear_doctor_baseline()
 
-            _set_doctor_flash("success", "Salvato ✅")
+            st.success("Salvato ✅")
             st.rerun()
         except Exception as e:
-            _set_doctor_flash(
-                "error",
-                f"Salvataggio NON riuscito ❌\n\nDettaglio: {e}\n\n"
-                "Suggerimento: ricarica la pagina e riprova. Se stai usando due dispositivi/browser, resta solo su uno.",
+            st.error(f"Errore salvataggio su GitHub: {e}")
+            st.info(
+                "Se vedi 404: (1) token senza accesso alla repo privata, "
+                "(2) owner/repo/branch/path errati, (3) token non autorizzato SSO (se repo in Organization)."
             )
-            st.rerun()
+
+
 # =====================================================================
 #                           ADMIN – Generazione
 # =====================================================================
@@ -2299,10 +2346,12 @@ else:
     # Step 3: Vincolo post-notte (carryover)
     st.markdown("### 3) Vincolo post-notte a cavallo mese")
     st.info(
-    "Compila questo solo se nel mese precedente qualcuno ha fatto **NOTTE l’ultimo giorno**: "
-    "in tal caso, quel medico **non può essere assegnato al Giorno 1** del mese corrente.",
-    icon="💡",
-)
+        "Serve solo se qualcuno ha fatto **NOTTE l’ultimo giorno del mese precedente**: "
+        "quella persona **non può lavorare il Giorno 1** del mese corrente.\n\n"
+        "✅ Consigliato: carica l’**output del mese precedente**.\n"
+        "🔁 Alternativa: seleziona manualmente chi ha fatto la NOTTE.",
+        icon="💡",
+    )
 
     # Admin advanced (rules/template/carryover file)
     with st.expander("⚙️ Avanzate (Regole, Template, Carryover file)", expanded=False):
