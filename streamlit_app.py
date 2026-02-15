@@ -134,7 +134,7 @@ def normalize_fascia(val: object) -> tuple[str, bool, bool]:
     return "Tutto il giorno", True, True
 # ---------------- Page config & style ----------------
 st.set_page_config(
-    page_title="Turni UTIC – Autogeneratore",
+    page_title="UOC Cardiologia con UTIC - Turni",
     page_icon="🗓️",
     layout="wide",
 )
@@ -1467,9 +1467,8 @@ def release_doctor_session(doctor: str):
 
 
 # ---------------- UI: Header ----------------
-st.title("Turni UTIC – Autogeneratore")
+st.title("UOC Cardiologia con UTIC - Turni")
 st.markdown(
-    '<div class="small-muted">Genera il file turni del mese rispettando regole e indisponibilità. '
     'I medici possono inserire solo le <b>proprie</b> indisponibilità (privacy).</div>',
     unsafe_allow_html=True,
 )
@@ -1812,7 +1811,7 @@ if mode == "Indisponibilità (Medico)":
             help="Ricarica l’archivio dal server (utile se qualcuno ha appena salvato).",
         )
     with cR2:
-        st.caption("La sessione usa uno snapshot per evitare conflitti: al salvataggio viene sempre verificato sul server.")
+        pass
 
     if refresh_baseline:
         # Reset baseline + local editors so the UI reflects the latest server state.
@@ -1924,7 +1923,7 @@ if mode == "Indisponibilità (Medico)":
                 with cB:
                     clean_rows = st.button("🧹 Pulisci righe vuote", key=f"{rows_key}__clean", use_container_width=True)
                 with cC:
-                    st.caption("Aggiungi e modifica le righe qui sotto. La data è vincolata al mese selezionato.")
+                    pass
 
                 rows = list(st.session_state.get(rows_key) or [])
 
@@ -2090,7 +2089,7 @@ if mode == "Indisponibilità (Medico)":
     with c1:
         save = st.button("Salva indisponibilità", type="primary", disabled=not can_save)
     with c2:
-        st.caption("Privacy: salviamo solo le righe del tuo nominativo nei mesi selezionati.")
+        pass
 
     if save:
         if not unav_open:
@@ -2414,13 +2413,8 @@ else:
 
     # Step 3: Vincolo post-notte (carryover)
     st.markdown("### 3) Vincolo post-notte a cavallo mese")
-    st.info(
-        "Serve solo se qualcuno ha fatto **NOTTE l’ultimo giorno del mese precedente**: "
-        "quella persona **non può lavorare il Giorno 1** del mese corrente.\n\n"
-        "✅ Consigliato: carica l’**output del mese precedente**.\n"
-        "🔁 Alternativa: seleziona manualmente chi ha fatto la NOTTE.",
-        icon="💡",
-    )
+    st.info("Inserire medico che ha fatto turno di NOTTE l'ultimo giorno del mese precedente.", icon="💡")
+
 
     # Admin advanced (rules/template/carryover file)
     with st.expander("⚙️ Avanzate (Regole, Template, Carryover file)", expanded=False):
