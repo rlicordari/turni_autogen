@@ -983,6 +983,9 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                     if special in doctors_set and special not in allowed:
                         allowed.append(special)
                 allowed = [d for d in allowed if d != "Recupero"]
+                # Esclusioni permanenti da J (mai in notte, qualunque giorno)
+                j_never = {norm_name(d) for d in (rJ.get("never_in_J") or ["De Gregorio", "Manganaro"])}
+                allowed = [d for d in allowed if norm_name(d) not in j_never]
                 # Weekend exclusions (e.g., Calabrò not allowed on Sat/Sun nights)
                 wex = [norm_name(x) for x in (rJ.get('weekend_excluded_doctors') or [])]
                 if day.dow in ['Sat','Sun'] and wex:
@@ -1678,13 +1681,28 @@ def solve_with_ortools(
                         model.Add(x[(s2.slot_id, doc)] == 0).OnlyEnforceIf(night_var)
     # Night spacing min
     min_gap = int(gc.get("night_spacing_days_min", 5))
-    # Build night vars by (day,doc)
+    # Build night vars by (day,doc) — include anche variabili create da fixed_assignments
     night_var_by_day_doc = {}
     for s in slots:
         if "J" in s.columns:
             for doc in doctors:
                 if (s.slot_id, doc) in x:
                     night_var_by_day_doc[(s.day.date, doc)] = x[(s.slot_id, doc)]
+    # Aggiungi eventuali variabili J create dai fixed_assignments (medici non nel pool originale)
+    for fa in (fixed_assignments or []):
+        if str(fa.get("column","")).strip().upper() != "J":
+            continue
+        fa_doc = norm_name(str(fa.get("doctor","")).strip())
+        try:
+            fa_date = dt.date.fromisoformat(str(fa.get("date","")).strip())
+        except Exception:
+            continue
+        # Cerca la variabile creata dal blocco fixed_assignments
+        for sid, v in x.items():
+            slot_id, doc = sid
+            if doc == fa_doc and slot_id.startswith(str(fa_date)) and "J" in slot_id:
+                night_var_by_day_doc[(fa_date, fa_doc)] = v
+                break
     # For each doc, prevent nights too close
     for doc in doctors:
         for i, drow in enumerate(days):
@@ -1950,12 +1968,15 @@ def solve_with_ortools(
                     eg_max_v = model.NewIntVar(0, n_eg, "eg_max_load")
                     model.AddMaxEquality(eg_max_v, eg_cnt_vars)
                     extra_obj.append(300 * eg_max_v)  # forte penalità per minimizzare il massimo
-    # Monthly quotas (hard)
-    # J monthly_quotas
+    # Monthly quotas (hard) — J
+    # I fixed_assignments in J vengono applicati PRIMA (vedi sopra) e contano
+    # già come variabili x=1 nel solver. Quindi la quota rimane SEMPRE == q:
+    # se Calabrò ha quota=2 e 1 notte fissa, il solver trovera' esattamente 1
+    # altra notte libera per arrivare a 2 totali.
     if "rules" in cfg and "J" in cfg["rules"]:
         mq = cfg["rules"]["J"].get("monthly_quotas") or {}
-        for doc, q in mq.items():
-            doc = norm_name(doc)
+        for doc_raw, q in mq.items():
+            doc = norm_name(doc_raw)
             if doc not in doctors:
                 continue
             vars_ = [night_var_by_day_doc.get((d.date, doc)) for d in days]
@@ -2223,6 +2244,30 @@ def solve_with_ortools(
                         vars_.append(x[(s.slot_id, "Recupero")])
                 if vars_:
                     model.Add(sum(vars_) <= max_rec)
+        # Q: hard cap per ogni medico del pool per evitare dominanza
+        # Ideale: round(n_Q_slots / pool_size) + 1
+        q_pool_raw = [norm_name(d) for d in (rQ.get("pool") or []) if norm_name(d) in doctors]
+        q_slots = [s for s in slots if s.columns == ["Q"]]
+        if q_pool_raw and q_slots:
+            import math as _math
+            q_cap = _math.ceil(len(q_slots) / len(q_pool_raw)) + 1
+            for doc in q_pool_raw:
+                vars_ = [x[(s.slot_id, doc)] for s in q_slots if (s.slot_id, doc) in x]
+                if vars_:
+                    model.Add(sum(vars_) <= q_cap)
+
+    # T: hard cap per ogni medico del pool per evitare dominanza (Cimino/D'Angelo/Recupero a 5)
+    if "rules" in cfg and "T" in cfg["rules"]:
+        rT2 = cfg["rules"]["T"] or {}
+        t_pool_raw = [norm_name(d) for d in (rT2.get("pool") or []) if norm_name(d) in doctors]
+        t_slots = [s for s in slots if s.columns == ["T"]]
+        if t_pool_raw and t_slots:
+            import math as _math
+            t_cap = _math.ceil(len(t_slots) / len(t_pool_raw)) + 1
+            for doc in t_pool_raw:
+                vars_ = [x[(s.slot_id, doc)] for s in t_slots if (s.slot_id, doc) in x]
+                if vars_:
+                    model.Add(sum(vars_) <= t_cap)
 
     # W: cap Recupero per evitare che domini il turno
     if "rules" in cfg and "W" in cfg["rules"] and "Recupero" in doctors:
@@ -2237,24 +2282,23 @@ def solve_with_ortools(
                 model.Add(sum(vars_) <= w_rec_max)
 
     # ---------------------------------------------------------------
-    # VINCOLI UNIVERSITARI
-    # Zito, Dattilo, De Gregorio: il loro monte ore mensile deve essere
-    # il 60% di quello degli ospedalieri (lun-sab).
+    # VINCOLI UNIVERSITARI — calcolati PRIMA delle assegnazioni generali
+    # Zito, Dattilo, De Gregorio: monte ore = 60% degli ospedalieri.
     #
-    # LOGICA PRE-SOLVE (come richiesto):
     #   working_days = giorni lun-sab del mese (es. marzo 2026 = 26)
-    #   ore_ospedaliero = working_days × 6h20 (= 1 turno/giorno)
-    #   ore_universitario = ore_ospedaliero × 60%
-    #   turni_target = round(working_days × 0.6)  → es. round(15.6) = 16
+    #   target = round(working_days × 0.6)  → es. 16
     #
-    #   Una notte (12h) vale 2 turni per Zito e Dattilo.
+    #   Pesi:
+    #   - J (notte 12h) = 2 turni per Zito e Dattilo
+    #   - Ogni altro turno operativo = 1 (incluso V)
+    #   - C (Reperibilità) = NON conta (turno di guardia extra, non monte ore)
     #
-    # VINCOLI:
-    #   - cap HARD (≤ target+1): il medico non può superare il contratto
-    #   - floor SOFT (penalità se < target): il solver cerca di avvicinarsi
-    #     al minimo ma NON rende infeasible se il pool non lo permette
-    #     (Zito ha solo Q/R/S, non può fisicamente fare 16 turni pesati)
+    #   Vincoli:
+    #   - CAP HARD (≤ target+1): non si può sforare il contratto
+    #   - FLOOR SOFT (penalità se < target): il solver cerca di avvicinarsi
+    #     senza rendere infeasible se il pool è ristretto (es. Zito solo Q/R/S/J)
     # ---------------------------------------------------------------
+    UNIV_EXCLUDE_COLS = {"C"}   # solo Reperibilità esclusa
     gc_uni = gc.get("university_doctors") or {}
     uni_ratio = float(gc.get("university_ratio", 0.6))
     if gc_uni and uni_ratio > 0:
@@ -2265,28 +2309,29 @@ def solve_with_ortools(
             if doc not in doctors:
                 continue
             night_double = bool((doc_cfg or {}).get("night_counts_double", False))
-            # Raccoglie tutti i termini pesati per questo medico
             weighted_terms = []
             for s in slots:
                 v = x.get((s.slot_id, doc))
                 if v is None:
+                    continue
+                # Escludi C dal conteggio
+                if any(c in UNIV_EXCLUDE_COLS for c in (s.columns or [])):
                     continue
                 is_night = "J" in (s.columns or [])
                 weight = 2 if (night_double and is_night) else 1
                 weighted_terms.append(weight * v)
             if not weighted_terms:
                 continue
-            max_possible = len(weighted_terms) * 2  # worst case tutti notti doppie
+            max_possible = len(weighted_terms) * 2
             uni_cnt = model.NewIntVar(0, max_possible, f"uni_cnt_{hash(doc)%10**6}")
             model.Add(uni_cnt == sum(weighted_terms))
             # CAP HARD: mai più di target+1 (contratto)
             model.Add(uni_cnt <= target + 1)
-            # FLOOR SOFT: penalizza se il medico va sotto target
-            # (non hard per evitare infeasibility quando il pool è ristretto)
+            # FLOOR SOFT: penalizza se sotto target
             under = model.NewIntVar(0, target, f"uni_under_{hash(doc)%10**6}")
             model.Add(under >= target - uni_cnt)
             model.Add(under >= 0)
-            extra_obj.append(500 * under)  # penalità importante ma non bloccante
+            extra_obj.append(500 * under)
 
     # AB: MODIFICA 5 — giovedì BILANCIATO (nessuna preferenza per Crea), sabati HARD con Crea
     if "rules" in cfg and "AB" in cfg["rules"]:
@@ -2789,7 +2834,12 @@ def write_output(
         # de-duplicate while preserving order
         seen = set()
         uniq = [d for d in docs if not (d in seen or seen.add(d))]
-        ws[f"{col}{row_idx}"].value = "\n".join(uniq)
+        # Y può legittimamente avere Recupero+medico (affiancamento): usa \n
+        # Tutte le altre colonne: deve esserci un solo medico; se ce ne sono due è un bug → primo
+        if col == "Y":
+            ws[f"{col}{row_idx}"].value = "\n".join(uniq)
+        else:
+            ws[f"{col}{row_idx}"].value = uniq[0] if uniq else None
 
     # Ensure headers exist for new/optional columns (Z, AA) even on older templates.
     for _col, _label in [
