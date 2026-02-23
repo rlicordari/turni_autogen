@@ -903,12 +903,24 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                 # We *prefer* specific behaviors, but we do NOT hard-force them here,
                 # because hard-forcing can make the whole month infeasible when other columns get tight.
                 #
-                # We only mark "force_same_doctor" as a hint for the solver objective:
-                # - True when BOTH Grimaldi/Calabrò are unavailable OR when the H pool is empty while only 1 of the pair is available.
-                prefer_share = (len(pair_avail) == 0) or (len(pair_avail) == 1 and not h_avail)
+                # Eccezione MODIFICA 1: se solo uno del pair è disponibile, restringiamo
+                # l'allowed di ENTRAMBI gli slot a quel medico (D=F share obbligatorio).
+                # Se nessuno del pair è disponibile, restringiamo a H-pool (e poi share via solver).
+                if len(pair_avail) == 1:
+                    # Solo un medico del pair: lui copre sia D che F
+                    allowed_df = pair_avail  # lista con un solo elemento
+                    prefer_share = True
+                elif len(pair_avail) == 0:
+                    # Nessuno del pair: usa H-pool; il solver forzerà D=F share
+                    allowed_df = h_avail if h_avail else sorted(doctors_set)
+                    prefer_share = True
+                else:
+                    # Entrambi disponibili: pool completo, nessun share forzato
+                    allowed_df = allowed_base
+                    prefer_share = False
 
-                slots.append(Slot(day, f"{day.date}-D", ["D"], allowed_base, required=True, shift="Mattina", rule_tag="D_F.D", force_same_doctor=prefer_share))
-                slots.append(Slot(day, f"{day.date}-F", ["F"], allowed_base, required=True, shift="Mattina", rule_tag="D_F.F", force_same_doctor=prefer_share))
+                slots.append(Slot(day, f"{day.date}-D", ["D"], allowed_df, required=True, shift="Mattina", rule_tag="D_F.D", force_same_doctor=prefer_share))
+                slots.append(Slot(day, f"{day.date}-F", ["F"], allowed_df, required=True, shift="Mattina", rule_tag="D_F.F", force_same_doctor=prefer_share))
 # EG paired (Mon-Sat)
             if "E_G" in rules and dayspec_contains(day.dow, rules["E_G"].get("days")):
                 r = rules["E_G"]
@@ -1712,19 +1724,32 @@ def solve_with_ortools(cfg: dict, days: List[DayRow], slots: List[Slot]) -> Tupl
                 elif len(avail_pair) == 1:
                     only_doc = avail_pair[0]
                     vD_only = x.get((sD.slot_id, only_doc))
-                    if vD_only is not None:
-                        notD = model.NewBoolVar(f"df_D_not_{day.date}")
-                        model.Add(notD + vD_only == 1)
-                        extra_obj.append(notD * pen_d_not_available)
+                    vF_only = x.get((sF.slot_id, only_doc))
 
-                    # Prefer F from H.pool_mon_fri (not "any random" doctor)
-                    penalize_outside(sF, hpool, pen_outside_hpool)
+                    # HARD: il solo medico disponibile del pair DEVE stare in D
+                    if vD_only is not None:
+                        model.Add(vD_only == 1)
+
+                    # HARD: il solo medico disponibile del pair DEVE stare anche in F (D=F share)
+                    # Questo è il comportamento richiesto: se Grimaldi è indisponibile,
+                    # Calabrò deve coprire sia D che F.
+                    if vF_only is not None:
+                        model.Add(vF_only == 1)
+
+                    # NON penalizzare altri medici in F (l'unico del pair li occupa entrambi)
 
                 # CASE: none of the pair is available in-domain
                 else:
-                    # Prefer both D and F from H.pool_mon_fri.
+                    # HARD: D e F devono essere assegnati allo stesso medico dell'H-pool.
+                    # Usiamo il vincolo df_share già costruito sopra (df_y_by_doc) per forzare la share.
+                    # Penalizziamo solo dottori fuori dall'H-pool per orientare la scelta.
                     penalize_outside(sD, hpool, pen_outside_hpool)
                     penalize_outside(sF, hpool, pen_outside_hpool)
+                    # Forza D=F tramite il meccanismo df_share già presente
+                    if df_y_by_doc:
+                        share_any = model.NewBoolVar(f"df_share_none_{day.date.isoformat()}")
+                        model.AddMaxEquality(share_any, list(df_y_by_doc.values()))
+                        model.Add(share_any == 1)  # HARD: deve esserci un medico che copre sia D che F
 # E/G weekly blocks (Mon-Sat) if block_days=6
     if "rules" in cfg and "E_G" in cfg["rules"]:
         block_days = int(cfg["rules"]["E_G"].get("block_days", 0) or 0)
@@ -1801,30 +1826,83 @@ def solve_with_ortools(cfg: dict, days: List[DayRow], slots: List[Slot]) -> Tupl
             vars_ = [v for v in vars_ if v is not None]
             if vars_:
                 model.Add(sum(vars_) == int(q))
-    # Night distribution (soft): if the night pool size implies an equal target per doctor (e.g., Feb: 24 nights / 12 docs = 2),
-    # add penalties to keep each doctor close to that target. This avoids extreme imbalances (e.g., 5 nights vs 1).
+    # Night distribution (HARD min/max per dottore + soft balance weekend)
+    # Logica marzo 2026: 27 notti assegnabili.
+    #  - Licordari=3, Colarusso=3, Calabrò=2, Zito=2 (quote fisse YAML)
+    #  - Restano 17 notti per gli altri 8 medici del pool → tutti 2, uno casuale 3
+    #  - Regola generale: ogni medico del pool fa MIN 2, MAX 3 notti. NESSUNO può fare 0,1,4+.
     if "rules" in cfg and "J" in cfg["rules"]:
         rJ = cfg["rules"]["J"]
-        # Night pool = pool_other + monthly_quotas keys
         night_pool = set(norm_name(d) for d in (rJ.get("pool_other") or []))
         night_pool |= set(norm_name(d) for d in (rJ.get("monthly_quotas") or {}).keys())
         night_pool = {d for d in night_pool if d in doctors and d != "Recupero"}
+        mq_fixed = {norm_name(k): int(v) for k,v in (rJ.get("monthly_quotas") or {}).items()
+                    if norm_name(k) in doctors}
         total_nights = sum(1 for s in slots if s.columns == ["J"])
-        if night_pool and total_nights > 0 and total_nights % len(night_pool) == 0:
-            target = total_nights // len(night_pool)
-            for doc in sorted(night_pool):
-                vars_ = []
-                for drow in days:
-                    v = night_var_by_day_doc.get((drow.date, doc))
+
+        if night_pool and total_nights > 0:
+            # Medici con quota fissa: già vincolati con == sopra.
+            # Medici senza quota fissa: imponiamo min=2, max=3 hard.
+            free_docs = [d for d in sorted(night_pool) if d not in mq_fixed]
+            fixed_total = sum(mq_fixed.values())
+            free_total = total_nights - fixed_total
+
+            # Calcola min/max bilanciati per i medici liberi
+            if free_docs:
+                n_free = len(free_docs)
+                # free_total / n_free → es. 21/9 = 2.33 → min=2, max=3
+                min_per = free_total // n_free  # minimo garantito
+                remainder = free_total - min_per * n_free
+                # max_per = min_per se il resto è 0, altrimenti min_per+1
+                max_per = min_per + (1 if remainder > 0 else 0)
+
+                for doc in free_docs:
+                    vars_ = [night_var_by_day_doc.get((d.date, doc)) for d in days
+                             if night_var_by_day_doc.get((d.date, doc)) is not None]
+                    if vars_:
+                        model.Add(sum(vars_) >= min_per)   # HARD: minimo
+                        model.Add(sum(vars_) <= max_per)   # HARD: massimo
+
+                # Soft balance: minimizza la differenza max-min tra i medici liberi
+                # per distribuire equamente il "resto"
+                if remainder > 0 and len(free_docs) > 1:
+                    cnt_vars = []
+                    for doc in free_docs:
+                        vars_ = [night_var_by_day_doc.get((d.date, doc)) for d in days
+                                 if night_var_by_day_doc.get((d.date, doc)) is not None]
+                        if vars_:
+                            cnt = model.NewIntVar(0, total_nights, f"nightcnt_{hash(doc)%10**6}")
+                            model.Add(cnt == sum(vars_))
+                            cnt_vars.append(cnt)
+                    if cnt_vars:
+                        max_cnt = model.NewIntVar(0, total_nights, "night_max_free")
+                        min_cnt = model.NewIntVar(0, total_nights, "night_min_free")
+                        model.AddMaxEquality(max_cnt, cnt_vars)
+                        model.AddMinEquality(min_cnt, cnt_vars)
+                        diff_cnt = model.NewIntVar(0, total_nights, "night_diff_free")
+                        model.Add(diff_cnt == max_cnt - min_cnt)
+                        extra_obj.append(200 * diff_cnt)
+
+        # Weekend nights: ogni dottore al massimo 2 weekend nights (Sat+Sun)
+        # e distribuzione equa (minimizza massimo)
+        weekend_docs = night_pool - {norm_name("Calabrò")}  # Calabrò escluso sabato/domenica
+        we_cnt_vars = []
+        for doc in sorted(weekend_docs):
+            we_vars = []
+            for day in days:
+                if day.dow in ["Sat", "Sun"]:
+                    v = night_var_by_day_doc.get((day.date, doc))
                     if v is not None:
-                        vars_.append(v)
-                if vars_:
-                    cnt = model.NewIntVar(0, total_nights, f"nightcnt_{hash(doc)%10**6}")
-                    model.Add(cnt == sum(vars_))
-                    # abs(cnt - target)
-                    diff = model.NewIntVar(0, total_nights, f"nightdiff_{hash(doc)%10**6}")
-                    model.AddAbsEquality(diff, cnt - target)
-                    extra_obj.append(20 * diff)
+                        we_vars.append(v)
+            if we_vars:
+                we_cnt = model.NewIntVar(0, len(we_vars), f"we_night_{hash(doc)%10**6}")
+                model.Add(we_cnt == sum(we_vars))
+                model.Add(we_cnt <= 2)  # HARD: max 2 weekend nights a testa
+                we_cnt_vars.append(we_cnt)
+        if we_cnt_vars:
+            we_max = model.NewIntVar(0, 10, "we_night_max")
+            model.AddMaxEquality(we_max, we_cnt_vars)
+            extra_obj.append(500 * we_max)  # minimizza il massimo fortemente
     # H monthly quotas Mon-Fri
     # MODIFICA 1: Grimaldi e Calabrò sono esclusi da H; ignora eventuali quote riferite a loro
     _h_df_pair = {norm_name("Grimaldi"), norm_name("Calabrò")}
@@ -2224,20 +2302,7 @@ def solve_with_ortools(cfg: dict, days: List[DayRow], slots: List[Slot]) -> Tupl
                         penalties.append(p)
         if penalties:
             objective_terms.append(3 * sum(penalties))
-    # Weekend night concentration: minimize max weekend nights per doctor
-    weekend_night_max = model.NewIntVar(0, 31, "wk_night_max")
-    for doc in real_doctors:
-        vars_=[]
-        for day in days:
-            if day.dow in ["Fri","Sat","Sun"]:
-                v=night_var_by_day_doc.get((day.date, doc))
-                if v is not None:
-                    vars_.append(v)
-        if vars_:
-            wkload = model.NewIntVar(0, 31, f"wk_night_{hash(doc)%10**6}")
-            model.Add(wkload == sum(vars_))
-            model.Add(wkload <= weekend_night_max)
-    objective_terms.append(weekend_night_max * 2)
+    # Weekend night concentration: già gestito nel blocco J sopra con hard max=2 e strong soft
     model.Minimize(sum(objective_terms + extra_obj))
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = 30.0
