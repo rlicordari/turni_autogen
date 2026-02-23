@@ -806,7 +806,7 @@ def apply_unavailability(allowed: List[str], day: DayRow, shift: str, unav: Dict
             continue
         out.append(doc)
     return out
-def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date, Set[str]]]) -> List[Slot]:
+def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date, Set[str]]], fixed_assignments: Optional[List[dict]] = None) -> List[Slot]:
     """
     Converts YAML column rules into per-day slots.
     Handles exception days (festivi) by merging D+E and H+I, and merging E+G always.
@@ -838,6 +838,20 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                 unav[norm_name(doc)][parse_date(ds)].add("Any")
             except Exception:
                 pass
+    # FASE 0 — PRE-PROCESSA i fixed_assignments PRIMA della costruzione degli slot.
+    # I fixed_assignment in J rendono quel medico di fatto "non disponibile" per D/F
+    # lo stesso giorno (night_off same_day). Li trattiamo come indisponibilità temporanee
+    # per la costruzione dell'allowed D/F.
+    forced_j_by_date: Dict[dt.date, Set[str]] = {}
+    for fa in (fixed_assignments or []):
+        if str(fa.get("column","")).strip().upper() == "J":
+            try:
+                fa_date = dt.date.fromisoformat(str(fa.get("date","")).strip())
+                fa_doc = norm_name(str(fa.get("doctor","")).strip())
+                forced_j_by_date.setdefault(fa_date, set()).add(fa_doc)
+            except Exception:
+                pass
+
     slots: List[Slot] = []
     def mk_allowed(pool: List[str]) -> List[str]:
         # keep only known doctors + keep 'Recupero' if used
@@ -886,6 +900,9 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                 r = rules["D_F"]
                 pair_docs = mk_allowed(r.get("allowed") or [])
                 pair_avail = apply_unavailability(pair_docs, day, "Mattina", unav)
+                # Rimuovi i medici forzati in J quel giorno (night_off same_day li esclude da D/F)
+                forced_j_today = forced_j_by_date.get(day.date, set())
+                pair_avail = [d for d in pair_avail if d not in forced_j_today]
 
                 # Fallback source = H.pool_mon_fri (as requested)
                 h_rule = rules.get("H", {}) if isinstance(rules.get("H", {}), dict) else {}
@@ -900,22 +917,16 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                 if not allowed_base:
                     allowed_base = sorted(doctors_set)
 
-                # We *prefer* specific behaviors, but we do NOT hard-force them here,
-                # because hard-forcing can make the whole month infeasible when other columns get tight.
-                #
-                # Eccezione MODIFICA 1: se solo uno del pair è disponibile, restringiamo
-                # l'allowed di ENTRAMBI gli slot a quel medico (D=F share obbligatorio).
-                # Se nessuno del pair è disponibile, restringiamo a H-pool (e poi share via solver).
+                # Se solo uno del pair disponibile → share obbligatorio (lui fa D e F)
+                # Se nessuno del pair → H-pool con share
+                # Se entrambi → solo il pair, no share
                 if len(pair_avail) == 1:
-                    # Solo un medico del pair disponibile: lui copre sia D che F (share obbligatorio)
                     allowed_df = pair_avail
                     prefer_share = True
                 elif len(pair_avail) == 0:
-                    # Nessuno del pair disponibile: usa solo H-pool (il solver forzerà D=F share)
                     allowed_df = h_avail if h_avail else sorted(doctors_set)
                     prefer_share = True
                 else:
-                    # Entrambi disponibili: allowed SOLO il pair — nessun altro medico può entrare in D o F
                     allowed_df = pair_avail
                     prefer_share = False
 
@@ -3078,14 +3089,14 @@ def solve_across_months(
                             if night_off_next_day and delta == 1:
                                 _add_unav(local_unav, dname, drow.date, {"Mattina", "Pomeriggio"})
 
-        slots_m = slots_for_month(cfg, days_m, local_unav)
-
         # Filtra fixed_assignments e availability_preferences per questo mese
         fixed_m = [f for f in (fixed_assignments or [])
                    if _parse_iso_date(str(f.get("date",""))).__class__.__name__ != "NoneType"
                    and _parse_iso_date(str(f.get("date",""))) is not None
                    and _parse_iso_date(str(f.get("date",""))).year == yy
                    and _parse_iso_date(str(f.get("date",""))).month == mm]
+
+        slots_m = slots_for_month(cfg, days_m, local_unav, fixed_assignments=fixed_m)
         avail_m = [a for a in (availability_preferences or [])
                    if _parse_iso_date(str(a.get("date",""))).__class__.__name__ != "NoneType"
                    and _parse_iso_date(str(a.get("date",""))) is not None
