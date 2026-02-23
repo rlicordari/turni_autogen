@@ -988,20 +988,27 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                     _thu_suppressed_by_override = True
             _skip_j = (_is_normal_thu_blank and not _thu_suppressed_by_override) or _is_override_blank
             if not _skip_j:
-                allowed = mk_allowed(rJ.get("pool_other") or [])
-                # add quota doctors even if not in pool_other
-                for special in (rJ.get("monthly_quotas") or {}).keys():
-                    if special in doctors_set and special not in allowed:
-                        allowed.append(special)
-                allowed = [d for d in allowed if d != "Recupero"]
-                # Esclusioni permanenti da J (mai in notte, qualunque giorno)
-                j_never = {norm_name(d) for d in (rJ.get("never_in_J") or ["De Gregorio", "Manganaro"])}
-                allowed = [d for d in allowed if norm_name(d) not in j_never]
-                # Weekend exclusions (e.g., Calabrò not allowed on Sat/Sun nights)
-                wex = [norm_name(x) for x in (rJ.get('weekend_excluded_doctors') or [])]
-                if day.dow in ['Sat','Sun'] and wex:
-                    allowed = [d for d in allowed if norm_name(d) not in set(wex)]
-                allowed = apply_unavailability(allowed, day, "Notte", unav)
+                # Se esiste un fixed_assignment in J per questo giorno,
+                # lo slot usa SOLO quel medico — l'indisponibilità viene ignorata
+                # perché l'admin ha deciso esplicitamente.
+                forced_j_today = forced_j_by_date.get(day.date, set())
+                if forced_j_today:
+                    allowed = [d for d in forced_j_today if d in doctors_set]
+                else:
+                    allowed = mk_allowed(rJ.get("pool_other") or [])
+                    # add quota doctors even if not in pool_other
+                    for special in (rJ.get("monthly_quotas") or {}).keys():
+                        if special in doctors_set and special not in allowed:
+                            allowed.append(special)
+                    allowed = [d for d in allowed if d != "Recupero"]
+                    # Esclusioni permanenti da J (mai in notte, qualunque giorno)
+                    j_never = {norm_name(d) for d in (rJ.get("never_in_J") or ["De Gregorio", "Manganaro"])}
+                    allowed = [d for d in allowed if norm_name(d) not in j_never]
+                    # Weekend exclusions (e.g., Calabrò not allowed on Sat/Sun nights)
+                    wex = [norm_name(x) for x in (rJ.get('weekend_excluded_doctors') or [])]
+                    if day.dow in ['Sat','Sun'] and wex:
+                        allowed = [d for d in allowed if norm_name(d) not in set(wex)]
+                    allowed = apply_unavailability(allowed, day, "Notte", unav)
                 slots.append(Slot(day, f"{day.date}-J", ["J"], allowed, required=True, shift="Notte", rule_tag="J"))
         # ---- K Letto (daily, but blank on Sundays/festivi)
         # If merge_KT_sat is enabled, we create a single combined slot K+T on Saturday.
@@ -1692,28 +1699,13 @@ def solve_with_ortools(
                         model.Add(x[(s2.slot_id, doc)] == 0).OnlyEnforceIf(night_var)
     # Night spacing min
     min_gap = int(gc.get("night_spacing_days_min", 5))
-    # Build night vars by (day,doc) — include anche variabili create da fixed_assignments
+    # Build night vars by (day,doc)
     night_var_by_day_doc = {}
     for s in slots:
         if "J" in s.columns:
             for doc in doctors:
                 if (s.slot_id, doc) in x:
                     night_var_by_day_doc[(s.day.date, doc)] = x[(s.slot_id, doc)]
-    # Aggiungi eventuali variabili J create dai fixed_assignments (medici non nel pool originale)
-    for fa in (fixed_assignments or []):
-        if str(fa.get("column","")).strip().upper() != "J":
-            continue
-        fa_doc = norm_name(str(fa.get("doctor","")).strip())
-        try:
-            fa_date = dt.date.fromisoformat(str(fa.get("date","")).strip())
-        except Exception:
-            continue
-        # Cerca la variabile creata dal blocco fixed_assignments
-        for sid, v in x.items():
-            slot_id, doc = sid
-            if doc == fa_doc and slot_id.startswith(str(fa_date)) and "J" in slot_id:
-                night_var_by_day_doc[(fa_date, fa_doc)] = v
-                break
     # For each doc, prevent nights too close
     for doc in doctors:
         for i, drow in enumerate(days):
