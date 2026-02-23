@@ -1601,13 +1601,25 @@ def solve_with_ortools(
                 v_f2 = x.get((fslot, doc2))
                 if (v_d1 is None and v_d2 is None) or (v_f1 is None and v_f2 is None):
                     continue
-                # Exception = (H is doc1/doc2) OR (J is doc2)
+                # Exception = (H is doc1/doc2) OR (J is doc1/doc2 oggi) OR (J is doc1/doc2 ieri)
+                # Serve anche "J ieri": se doc2 ha fatto notte ieri, night_off next_day
+                # gli vieta D oggi → il pattern non va imposto (altrimenti INFEASIBLE).
                 conds = []
                 hslot = f"{day.date}-H"
                 jslot = f"{day.date}-J"
-                for v in [x.get((hslot, doc1)), x.get((hslot, doc2)), x.get((jslot, doc2))]:
+                for v in [x.get((hslot, doc1)), x.get((hslot, doc2)),
+                          x.get((jslot, doc1)), x.get((jslot, doc2))]:
                     if v is not None:
                         conds.append(v)
+                # J del giorno precedente
+                _day_idx_map = {d.date: i for i, d in enumerate(days)}
+                _i_today = _day_idx_map.get(day.date)
+                if _i_today is not None and _i_today > 0:
+                    _prev_date = days[_i_today - 1].date
+                    _prev_jslot = f"{_prev_date}-J"
+                    for v in [x.get((_prev_jslot, doc1)), x.get((_prev_jslot, doc2))]:
+                        if v is not None:
+                            conds.append(v)
                 if conds:
                     exc = model.NewBoolVar(f"exc_DF_{day.date}")
                     model.AddMaxEquality(exc, conds)  # exc = OR(conds)
