@@ -1364,14 +1364,19 @@ def solve_with_ortools(
             continue
         for ts in target_slots:
             tv = x.get((ts.slot_id, fa_doc))
-            if tv is not None:
-                model.Add(tv == 1)  # HARD: questo medico deve essere assegnato
-                # Forza gli altri medici a 0 in questo slot
-                for d2 in ts.allowed:
-                    if norm_name(d2) != fa_doc:
-                        v2 = x.get((ts.slot_id, d2))
-                        if v2 is not None:
-                            model.Add(v2 == 0)
+            if tv is None:
+                # Il medico non è nell'allowed originale — aggiunge la variabile
+                tv = model.NewBoolVar(f"x_{hash(ts.slot_id)%10**8}_{hash(fa_doc)%10**8}_forced")
+                x[(ts.slot_id, fa_doc)] = tv
+            model.Add(tv == 1)  # HARD: questo medico deve essere assegnato
+            # Forza tutti gli altri a 0 in questo slot
+            for d2 in list(ts.allowed) + list(doctors):
+                d2n = norm_name(d2)
+                if d2n == fa_doc:
+                    continue
+                v2 = x.get((ts.slot_id, d2n))
+                if v2 is not None:
+                    model.Add(v2 == 0)
 
     # ---------------------------------------------------------------
     # DISPONIBILITÀ (soft): il medico VUOLE comparire in una certa fascia.
@@ -2233,32 +2238,34 @@ def solve_with_ortools(
 
     # ---------------------------------------------------------------
     # VINCOLI UNIVERSITARI
-    # Zito, Dattilo, De Gregorio: devono fare esattamente il 60% dei
-    # turni giornalieri degli ospedalieri (lun-sab), calcolato PRIMA
-    # dell'assegnazione e con le indisponibilità già note.
+    # Zito, Dattilo, De Gregorio: il loro monte ore mensile deve essere
+    # il 60% di quello degli ospedalieri (lun-sab).
     #
-    # Logica corretta:
-    #   working_days = giorni lun-sab del mese (totale ospedaliero)
-    #   target_raw = working_days * 0.6  → es. 26 * 0.6 = 15.6 → 16
-    #   Il target NON si riduce per le indisponibilità: se il medico
-    #   dichiara 3 giorni di indisponibilità, deve comunque fare 16
-    #   turni nei restanti 23 giorni disponibili.
-    #   Notte vale 2 turni per Zito/Dattilo (12h vs 6h20).
-    #   Vincolo: target <= conteggio_pesato <= target+1
+    # LOGICA PRE-SOLVE (come richiesto):
+    #   working_days = giorni lun-sab del mese (es. marzo 2026 = 26)
+    #   ore_ospedaliero = working_days × 6h20 (= 1 turno/giorno)
+    #   ore_universitario = ore_ospedaliero × 60%
+    #   turni_target = round(working_days × 0.6)  → es. round(15.6) = 16
+    #
+    #   Una notte (12h) vale 2 turni per Zito e Dattilo.
+    #
+    # VINCOLI:
+    #   - cap HARD (≤ target+1): il medico non può superare il contratto
+    #   - floor SOFT (penalità se < target): il solver cerca di avvicinarsi
+    #     al minimo ma NON rende infeasible se il pool non lo permette
+    #     (Zito ha solo Q/R/S, non può fisicamente fare 16 turni pesati)
     # ---------------------------------------------------------------
     gc_uni = gc.get("university_doctors") or {}
     uni_ratio = float(gc.get("university_ratio", 0.6))
     if gc_uni and uni_ratio > 0:
-        # Conta giorni lavorativi Lun-Sab del mese (comune a tutti)
         working_days = sum(1 for d in days if d.dow in ["Mon","Tue","Wed","Thu","Fri","Sat"])
+        target = round(working_days * uni_ratio)
         for doc_raw, doc_cfg in gc_uni.items():
             doc = norm_name(doc_raw)
             if doc not in doctors:
                 continue
             night_double = bool((doc_cfg or {}).get("night_counts_double", False))
-            # Target fisso basato sui giorni lavorativi del mese, NON ridotto dalle indisponibilità
-            target = round(working_days * uni_ratio)
-            # Raccogli tutti i slot in cui il medico può essere assegnato, con peso
+            # Raccoglie tutti i termini pesati per questo medico
             weighted_terms = []
             for s in slots:
                 v = x.get((s.slot_id, doc))
@@ -2269,10 +2276,17 @@ def solve_with_ortools(
                 weighted_terms.append(weight * v)
             if not weighted_terms:
                 continue
-            uni_cnt = model.NewIntVar(0, working_days * 2 + 2, f"uni_cnt_{hash(doc)%10**6}")
+            max_possible = len(weighted_terms) * 2  # worst case tutti notti doppie
+            uni_cnt = model.NewIntVar(0, max_possible, f"uni_cnt_{hash(doc)%10**6}")
             model.Add(uni_cnt == sum(weighted_terms))
-            model.Add(uni_cnt >= target)      # HARD: mai meno del 60%
-            model.Add(uni_cnt <= target + 1)  # HARD: mai più (contratto)
+            # CAP HARD: mai più di target+1 (contratto)
+            model.Add(uni_cnt <= target + 1)
+            # FLOOR SOFT: penalizza se il medico va sotto target
+            # (non hard per evitare infeasibility quando il pool è ristretto)
+            under = model.NewIntVar(0, target, f"uni_under_{hash(doc)%10**6}")
+            model.Add(under >= target - uni_cnt)
+            model.Add(under >= 0)
+            extra_obj.append(500 * under)  # penalità importante ma non bloccante
 
     # AB: MODIFICA 5 — giovedì BILANCIATO (nessuna preferenza per Crea), sabati HARD con Crea
     if "rules" in cfg and "AB" in cfg["rules"]:
