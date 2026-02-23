@@ -907,16 +907,16 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                 # l'allowed di ENTRAMBI gli slot a quel medico (D=F share obbligatorio).
                 # Se nessuno del pair è disponibile, restringiamo a H-pool (e poi share via solver).
                 if len(pair_avail) == 1:
-                    # Solo un medico del pair: lui copre sia D che F
-                    allowed_df = pair_avail  # lista con un solo elemento
+                    # Solo un medico del pair disponibile: lui copre sia D che F (share obbligatorio)
+                    allowed_df = pair_avail
                     prefer_share = True
                 elif len(pair_avail) == 0:
-                    # Nessuno del pair: usa H-pool; il solver forzerà D=F share
+                    # Nessuno del pair disponibile: usa solo H-pool (il solver forzerà D=F share)
                     allowed_df = h_avail if h_avail else sorted(doctors_set)
                     prefer_share = True
                 else:
-                    # Entrambi disponibili: pool completo, nessun share forzato
-                    allowed_df = allowed_base
+                    # Entrambi disponibili: allowed SOLO il pair — nessun altro medico può entrare in D o F
+                    allowed_df = pair_avail
                     prefer_share = False
 
                 slots.append(Slot(day, f"{day.date}-D", ["D"], allowed_df, required=True, shift="Mattina", rule_tag="D_F.D", force_same_doctor=prefer_share))
@@ -1540,7 +1540,33 @@ def solve_with_ortools(cfg: dict, days: List[DayRow], slots: List[Slot]) -> Tupl
     # Night off next day
     gc = cfg.get("global_constraints", {}) or {}
     night_off = (gc.get("night_off") or {})
+    night_same = bool(night_off.get("same_day", True))
     night_next = bool(night_off.get("next_day", True))
+    # Identify night slots
+    night_slot_ids = [s.slot_id for s in slots if "J" in s.columns]
+    # Night-off same day: if doctor works night(d) → no other slot(d) [except C which is exempt]
+    if night_same:
+        for drow in days:
+            night_vars_day = []
+            for sid in night_slot_ids:
+                if sid.startswith(str(drow.date)):
+                    for doc in doctors:
+                        if (sid, doc) in x:
+                            pass  # handled per-doc below
+            for doc in doctors:
+                night_vars = [x[(sid, doc)] for sid in night_slot_ids
+                              if sid.startswith(str(drow.date)) and (sid, doc) in x]
+                if not night_vars:
+                    continue
+                night_var = night_vars[0]
+                # Every non-night, non-C slot same day → 0 if night=1
+                for s2 in slots_by_day.get(drow.date, []):
+                    if "J" in s2.columns:
+                        continue  # skip the night slot itself
+                    if any(c in {"C"} for c in (s2.columns or [])):
+                        continue  # C is exempt
+                    if (s2.slot_id, doc) in x:
+                        model.Add(x[(s2.slot_id, doc)] == 0).OnlyEnforceIf(night_var)
     # Identify night slots
     night_slot_ids = [s.slot_id for s in slots if "J" in s.columns]
     if night_next:
