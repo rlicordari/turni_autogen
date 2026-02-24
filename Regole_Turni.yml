@@ -210,7 +210,7 @@ rules:
   L:
     days:
     - Mon
-    - Wed
+    - Tue
     - Thu
     quota_recupero_per_month: 3
     pool_other:
