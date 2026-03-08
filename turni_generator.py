@@ -1138,8 +1138,16 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                 else:
                     pool = mk_allowed(r.get("other_days_pool") or [])
                 pool = apply_unavailability(pool, day, "Mattina", unav)
-                required = bool(day.dow == "Wed" and r.get("wednesday_mandatory", False))
-                slots.append(Slot(day, f"{day.date}-W", ["W"], pool, required=required, shift="Mattina", rule_tag="W"))
+                # W è sempre richiesto (lun-ven); se pool vuoto per indisponibilità
+                # lo slot diventa opzionale con blank_penalty alta → cella gialla
+                if pool:
+                    required = True
+                    blank_pen = 0
+                else:
+                    required = False
+                    blank_pen = 5000
+                slots.append(Slot(day, f"{day.date}-W", ["W"], pool, required=required,
+                                  blank_penalty=blank_pen, shift="Mattina", rule_tag="W"))
         # ---- Y Amb specialistici (Mon only)
         # Requirement:
         #  - Every Monday: 1 doctor among other_pool
