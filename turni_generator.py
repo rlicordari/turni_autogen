@@ -2840,8 +2840,9 @@ def write_output(
         seen = set()
         uniq = [d for d in docs if not (d in seen or seen.add(d))]
         # Y può legittimamente avere Recupero+medico (affiancamento): usa \n
+        # V il venerdì ha legittimamente 2 medici (Crea + Dattilo/Allegra): usa \n
         # Tutte le altre colonne: deve esserci un solo medico; se ce ne sono due è un bug → primo
-        if col == "Y":
+        if col in ("Y", "V"):
             ws[f"{col}{row_idx}"].value = "\n".join(uniq)
         else:
             ws[f"{col}{row_idx}"].value = uniq[0] if uniq else None
