@@ -2054,6 +2054,15 @@ def solve_with_ortools(
         # Weekend nights: ogni dottore al massimo 2 weekend nights (Sat+Sun)
         # e distribuzione equa (minimizza massimo)
         weekend_docs = night_pool - {norm_name("Calabrò")}  # Calabrò escluso sabato/domenica
+        # Calcola il cap minimo feasible: ceil(notti_weekend_totali / medici_disponibili)
+        import math as _math
+        total_we_nights = sum(
+            1 for day in days if day.dow in ["Sat", "Sun"]
+            if any(night_var_by_day_doc.get((day.date, doc)) is not None for doc in weekend_docs)
+        )
+        n_we_docs = len(weekend_docs)
+        min_feasible_cap = _math.ceil(total_we_nights / n_we_docs) if n_we_docs > 0 else 2
+        we_hard_cap = max(2, min_feasible_cap)
         we_cnt_vars = []
         for doc in sorted(weekend_docs):
             we_vars = []
@@ -2065,7 +2074,7 @@ def solve_with_ortools(
             if we_vars:
                 we_cnt = model.NewIntVar(0, len(we_vars), f"we_night_{hash(doc)%10**6}")
                 model.Add(we_cnt == sum(we_vars))
-                model.Add(we_cnt <= 2)  # HARD: max 2 weekend nights a testa
+                model.Add(we_cnt <= we_hard_cap)  # cap dinamico: max(2, ceil(totale/pool))
                 we_cnt_vars.append(we_cnt)
         if we_cnt_vars:
             we_max = model.NewIntVar(0, 10, "we_night_max")
@@ -3096,18 +3105,18 @@ def solve_across_months(
                                 _add_unav(local_unav, dname, drow.date, {"Mattina", "Pomeriggio"})
 
         # Filtra fixed_assignments e availability_preferences per questo mese
-        fixed_m = [f for f in (fixed_assignments or [])
-                   if _parse_iso_date(str(f.get("date",""))).__class__.__name__ != "NoneType"
-                   and _parse_iso_date(str(f.get("date",""))) is not None
-                   and _parse_iso_date(str(f.get("date",""))).year == yy
-                   and _parse_iso_date(str(f.get("date",""))).month == mm]
+        fixed_m = []
+        for f in (fixed_assignments or []):
+            d = _parse_iso_date(str(f.get("date", "")))
+            if d is not None and d.year == yy and d.month == mm:
+                fixed_m.append(f)
 
         slots_m = slots_for_month(cfg, days_m, local_unav, fixed_assignments=fixed_m)
-        avail_m = [a for a in (availability_preferences or [])
-                   if _parse_iso_date(str(a.get("date",""))).__class__.__name__ != "NoneType"
-                   and _parse_iso_date(str(a.get("date",""))) is not None
-                   and _parse_iso_date(str(a.get("date",""))).year == yy
-                   and _parse_iso_date(str(a.get("date",""))).month == mm]
+        avail_m = []
+        for a in (availability_preferences or []):
+            d = _parse_iso_date(str(a.get("date", "")))
+            if d is not None and d.year == yy and d.month == mm:
+                avail_m.append(a)
 
         try:
             assignment_m, stats_m = solve_with_ortools(
