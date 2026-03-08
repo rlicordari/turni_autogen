@@ -1139,7 +1139,7 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                 else:
                     pool = mk_allowed(r.get("other_days_pool") or [])
                 pool = apply_unavailability(pool, day, "Mattina", unav)
-                required = True if (day.dow == "Wed" and r.get("wednesday_mandatory", False)) else True
+                required = bool(day.dow == "Wed" and r.get("wednesday_mandatory", False))
                 slots.append(Slot(day, f"{day.date}-W", ["W"], pool, required=required, shift="Mattina", rule_tag="W"))
         # ---- Y Amb specialistici (Mon only)
         # Requirement:
@@ -1335,6 +1335,8 @@ def solve_with_ortools(
     model = cp_model.CpModel()
     # Collect extra objective terms built during constraint setup
     extra_obj = []
+    # Warnings raccolti durante la costruzione del modello (non bloccanti)
+    pre_solve_warnings: List[str] = []
 
     # Diagnostics for the "Recupero su T in 2 lunedì" rule.
     # NOTE: this MUST be defined in the OR-Tools path too; otherwise the code may
@@ -1886,6 +1888,10 @@ def solve_with_ortools(
                         share_any = model.NewBoolVar(f"df_share_none_{day.date.isoformat()}")
                         model.AddMaxEquality(share_any, list(df_y_by_doc.values()))
                         model.Add(share_any == 1)  # HARD: deve esserci un medico che copre sia D che F
+                    else:
+                        pre_solve_warnings.append(
+                            f"D/F il {day.date}: nessun medico disponibile per coprire entrambe le colonne (D e F lasciate scoperte)"
+                        )
 # E/G weekly blocks (Mon-Sat) if block_days=6
     if "rules" in cfg and "E_G" in cfg["rules"]:
         block_days = int(cfg["rules"]["E_G"].get("block_days", 0) or 0)
@@ -2152,7 +2158,9 @@ def solve_with_ortools(
                 if sT and (sT.slot_id, "Recupero") in x:
                     model.Add(x[(sT.slot_id, "Recupero")] == 1)
                 else:
-                    model.Add(0 == 1)
+                    pre_solve_warnings.append(
+                        f"Recupero non disponibile per T il {d.date} (lunedì target): vincolo ignorato"
+                    )
 
             # For all other Mondays, forbid T=Recupero (so it happens on exactly 2 Mondays)
             for d in other_mondays:
@@ -2172,7 +2180,9 @@ def solve_with_ortools(
             if vars_:
                 model.Add(sum(vars_) == exact)
             else:
-                model.Add(0 == 1)
+                pre_solve_warnings.append(
+                    f"Cimino non ha slot U disponibili questo mese: vincolo cimino_exact_per_month ignorato"
+                )
 
     # MODIFICA 3: se lunedì V=Allegra allora U deve essere Crea o Dattilo (hard constraint nel solver)
     if "rules" in cfg and "U" in cfg["rules"] and "V" in cfg["rules"]:
@@ -2572,6 +2582,7 @@ def solve_with_ortools(
     stats = {
         "status": "OPTIMAL" if status == cp_model.OPTIMAL else "FEASIBLE",
         "objective": solver.ObjectiveValue(),
+        "warnings": pre_solve_warnings,
     }
 
     # Diagnostics for the "2 lunedì" rule (do not affect feasibility).
