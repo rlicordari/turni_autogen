@@ -137,6 +137,7 @@ rules:
     - Cimino
     - D'Angelo
     - Pugliatti
+    - De Gregorio
     - Manganaro
     block_split_penalty: 500
     max_per_doctor: 8
@@ -210,7 +211,9 @@ rules:
     - De Gregorio
     no_consecutive_days_same_doctor: true
     balance: true
-    balance_weight: 100
+    balance_weight: 500
+    max_per_doctor: 4
+    max_per_doctor_penalty: 3000
   L:
     days:
     - Mon
@@ -242,6 +245,9 @@ rules:
     - Licordari
     - Trio
     balance: true
+    balance_weight: 300
+    max_per_doctor: 4
+    max_per_doctor_penalty: 2000
     recupero_max_per_month: 2
   R:
     days: Mon-Fri
@@ -253,7 +259,9 @@ rules:
     - Licordari
     - Trio
     balance: true
-    balance_weight: 200
+    balance_weight: 400
+    max_per_doctor: 5
+    max_per_doctor_penalty: 2000
   S:
     day: Tue
     pool:
@@ -276,7 +284,9 @@ rules:
     recupero_min_per_month: 4
     recupero_target_per_month: 5
     recupero_target_penalty: 2000
-    balance_weight: 100
+    balance_weight: 400
+    max_per_doctor: 5
+    max_per_doctor_penalty: 2500
   U:
     days:
     - Mon
