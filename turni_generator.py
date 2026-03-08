@@ -1993,6 +1993,27 @@ def solve_with_ortools(
             vars_ = [v for v in vars_ if v is not None]
             if vars_:
                 model.Add(sum(vars_) == int(q))
+    # Soft: alcuni medici devono preferibilmente avere almeno N notti weekend (sab/dom)
+    if "rules" in cfg and "J" in cfg["rules"]:
+        rJ_wn = cfg["rules"]["J"]
+        wn_min_soft = rJ_wn.get("weekend_night_min_soft") or {}
+        wn_pen = int(rJ_wn.get("weekend_night_min_soft_penalty") or 3000)
+        for doc_raw, min_we in wn_min_soft.items():
+            doc = norm_name(doc_raw)
+            if doc not in doctors:
+                continue
+            we_vars = [night_var_by_day_doc.get((d.date, doc))
+                       for d in days if d.dow in ("Sat", "Sun")]
+            we_vars = [v for v in we_vars if v is not None]
+            if not we_vars:
+                continue  # Zito indisponibile tutti i weekend: vincolo ignorato
+            min_we = int(min_we)
+            no_we = model.NewBoolVar(f"no_we_night_{hash(doc)%10**6}")
+            we_sum = model.NewIntVar(0, len(we_vars), f"we_sum_{hash(doc)%10**6}")
+            model.Add(we_sum == sum(we_vars))
+            model.Add(we_sum < min_we).OnlyEnforceIf(no_we)
+            model.Add(we_sum >= min_we).OnlyEnforceIf(no_we.Not())
+            extra_obj.append(wn_pen * no_we)
     # Night distribution (HARD min/max per dottore + soft balance weekend)
     # Logica marzo 2026: 27 notti assegnabili.
     #  - Licordari=3, Colarusso=3, Calabrò=2, Zito=2 (quote fisse YAML)
