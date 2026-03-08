@@ -3014,33 +3014,34 @@ def write_output(
             v = cell.value
             if v is None or (isinstance(v, str) and v.strip() == ""):
                 cell.fill = yellow_fill
-    _write_riepilogo_sheet(wb, days, slots, assignment, cfg)
+    _write_riepilogo_sheet(wb, ws, days, slots, assignment, cfg)
     wb.save(out_path)
 
 def _write_riepilogo_sheet(
     wb: openpyxl.Workbook,
+    ws_main: openpyxl.worksheet.worksheet.Worksheet,
     days: List[DayRow],
     slots: List[Slot],
     assignment: Dict[str, Optional[str]],
     cfg: Optional[dict] = None,
 ) -> None:
-    """Aggiunge/aggiorna il foglio 'Riepilogo' con i conteggi turni per medico.
+    """Aggiunge/aggiorna il foglio 'Riepilogo' con conteggi turni per medico.
 
-    Logica di peso per giorno (per tutti i medici):
-      - J (notte) presente nel giorno → 2
-      - C (reperibilità) senza altri turni → 0
-      - Qualsiasi altro caso (anche più colonne nello stesso giorno) → 1
-    Per i medici universitari, la colonna 'Obiettivo' usa la stessa logica
-    ma J vale 2 solo se night_counts_double=True, e C è sempre esclusa.
+    I conteggi sono formule Excel (COUNTIFS) che si aggiornano automaticamente
+    quando l'admin modifica nomi nel foglio principale e salva.
+
+    Colonna helper nascosta: contiene flag festivo (1) / feriale (0) per ogni
+    riga-giorno — statica (calcolata dalle date), non cambia con i nomi.
+
+    Peso per giorno: J (notte) = 2 | C (reperibilità) non conta | altro = 1.
+    Obiettivo universitari usa lo stesso peso ma con J=1 se night_counts_double=False.
     """
     cfg = cfg or {}
     col_map: Dict[str, str] = cfg.get("columns") or {}
-
-    SKIP_COLS = {"AD", "AE", "AF", "AG"}  # medici liberi: non sono turni operativi
-
+    SKIP_COLS = {"AD", "AE", "AF", "AG"}
     op_cols = [c for c in col_map if c not in SKIP_COLS]
 
-    # Festivi
+    # ── Festivi ────────────────────────────────────────────────────────────
     year = days[0].date.year if days else dt.date.today().year
     holidays = italy_public_holidays(year)
     extra_hol: Set[dt.date] = set()
@@ -3055,47 +3056,11 @@ def _write_riepilogo_sheet(
         d = day_info.get(date_)
         return d is not None and (d.dow == "Sun" or date_ in holidays or date_ in extra_hol)
 
-    # ----------------------------------------------------------------
-    # Raccolta: per ogni (medico, giorno) → insieme di colonne assegnate
-    # e per ogni (medico, colonna) → conteggio apparizioni (per display)
-    # ----------------------------------------------------------------
-    # day_cols[doc][date] = set di colonne quel giorno
-    day_cols: Dict[str, Dict[dt.date, Set[str]]] = defaultdict(lambda: defaultdict(set))
-    # col_fer[doc][col] e col_fes[doc][col] = apparizioni per display
-    col_fer: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
-    col_fes: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
-    all_docs: Set[str] = set()
-
-    for s in slots:
-        doc = assignment.get(s.slot_id)
-        if not doc:
-            continue
-        all_docs.add(doc)
-        for col in s.columns:
-            if col in SKIP_COLS:
-                continue
-            day_cols[doc][s.day.date].add(col)
-            if _is_fes(s.day.date):
-                col_fes[doc][col] += 1
-            else:
-                col_fer[doc][col] += 1
-
-    # ----------------------------------------------------------------
-    # Peso per giorno (tutti i medici): J=2, C-only=0, altro=1
-    # ----------------------------------------------------------------
-    def _day_weight(cols: Set[str]) -> int:
-        if "J" in cols:
-            return 2
-        if cols - {"C"}:   # ha almeno una colonna che non è C
-            return 1
-        return 0           # solo C, o nessuna colonna
-
-    # ----------------------------------------------------------------
-    # Peso per giorno universitari: J=2 se night_double, C sempre=0
-    # ----------------------------------------------------------------
+    # ── University doctors config ──────────────────────────────────────────
     gc = cfg.get("global_constraints") or {}
     gc_uni = gc.get("university_doctors") or {}
     uni_ratio = float(gc.get("university_ratio", 0.6))
+    pct = int(uni_ratio * 100)
     working_days_n = sum(1 for d in days if d.dow in ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat"))
     uni_target = round(working_days_n * uni_ratio)
     uni_docs = {norm_name(k) for k in gc_uni}
@@ -3104,40 +3069,14 @@ def _write_riepilogo_sheet(
         for k, v in gc_uni.items()
     }
 
-    def _day_weight_uni(doc_n: str, cols: Set[str]) -> int:
-        nd = uni_night_double.get(doc_n, False)
-        if "J" in cols:
-            return 2 if nd else 1
-        if cols - {"C"}:
-            return 1
-        return 0
+    # ── All assigned doctors (list determines Riepilogo rows) ─────────────
+    all_docs: Set[str] = set()
+    for s in slots:
+        doc = assignment.get(s.slot_id)
+        if doc:
+            all_docs.add(doc)
 
-    # ----------------------------------------------------------------
-    # Calcola totali pesati per medico (feriali e festivi separati)
-    # ----------------------------------------------------------------
-    w_fer: Dict[str, int] = defaultdict(int)
-    w_fes: Dict[str, int] = defaultdict(int)
-    w_uni_fer: Dict[str, int] = defaultdict(int)
-
-    for doc, dates in day_cols.items():
-        doc_n = norm_name(doc)
-        is_uni = doc_n in uni_docs
-        for date_, cols in dates.items():
-            dw = _day_weight(cols)
-            if _is_fes(date_):
-                w_fes[doc] += dw
-            else:
-                w_fer[doc] += dw
-                if is_uni:
-                    w_uni_fer[doc] += _day_weight_uni(doc_n, cols)
-
-    # Crea/ricrea foglio
-    sname = "Riepilogo"
-    if sname in wb.sheetnames:
-        del wb[sname]
-    ws = wb.create_sheet(sname)
-
-    # Stili
+    # ── Styles ────────────────────────────────────────────────────────────
     bold = openpyxl.styles.Font(bold=True)
     title_font = openpyxl.styles.Font(bold=True, size=13)
     hdr_fill = PatternFill(fill_type="solid", start_color="FFD9E1F2", end_color="FFD9E1F2")
@@ -3145,68 +3084,149 @@ def _write_riepilogo_sheet(
     center = openpyxl.styles.Alignment(horizontal="center", wrap_text=True)
 
     mese_label = days[0].date.strftime("%B %Y") if days else ""
+    n_hdr_cols = len(op_cols) + 5  # Medico + op_cols + Feriali + Festivi + Totale + Obiettivo
 
-    # Riga 1 – titolo
-    n_hdr_cols = len(op_cols) + 5
-    ws.cell(1, 1, f"Riepilogo Turni – {mese_label}").font = title_font
+    # ── Create Riepilogo as second sheet (right after main sheet) ─────────
+    sname = "Riepilogo"
+    if sname in wb.sheetnames:
+        del wb[sname]
+    main_idx = wb.sheetnames.index(ws_main.title)
+    ws = wb.create_sheet(sname, main_idx + 1)
+
+    # ── Formula building blocks ────────────────────────────────────────────
+    first_row = days[0].row_idx   # main sheet row of first day (= 2)
+    last_row = days[-1].row_idx
+
+    # Escape sheet name for cross-sheet formula reference
+    ms_name = ws_main.title
+    ms_ref = f"'{ms_name}'" if any(c in ms_name for c in (" ", "'", "!", "[", "]")) else ms_name
+
+    # Hidden helper column: festivo flags at the same row indices as the main sheet.
+    # Riepilogo!$AH$2:$AH$32  ←→  main sheet rows 2..32 (one per day).
+    helper_col_idx = n_hdr_cols + 3
+    hlp_letter = get_column_letter(helper_col_idx)
+    hlp_range = f"Riepilogo!${hlp_letter}${first_row}:${hlp_letter}${last_row}"
+
+    def _main_range(col: str) -> str:
+        return f"{ms_ref}!${col}${first_row}:${col}${last_row}"
+
+    def _cifs(col: str, dc: str, flag: int) -> str:
+        """COUNTIFS: doctor in col filtered by feriale(0)/festivo(1).
+        Wildcard (*name*) handles multi-doctor cells (e.g. V on Friday)."""
+        return f'COUNTIFS({_main_range(col)},"*"&{dc}&"*",{hlp_range},{flag})'
+
+    def _cif(col: str, dc: str) -> str:
+        """COUNTIF (no flag): total occurrences of doctor in col."""
+        return f'COUNTIF({_main_range(col)},"*"&{dc}&"*")'
+
+    def col_display_formula(col: str, r: int) -> str:
+        """Returns cell formula producing 'N+Mf' | 'N' | 'Mf' | ''."""
+        dc = f"$A{r}"
+        fer = _cifs(col, dc, 0)
+        fes = _cifs(col, dc, 1)
+        return (
+            f'=IF(AND({fer}=0,{fes}=0),"",'
+            f'IF({fes}=0,{fer},'
+            f'IF({fer}=0,{fes}&"f",{fer}&"+"&{fes}&"f")))'
+        )
+
+    def weighted_formula(r: int, j_coeff: int, fes_flag: Optional[int]) -> str:
+        """Numeric weighted-turni formula. C always excluded.
+        j_coeff: coefficient for J (2 = standard, 1 = university without night_double).
+        fes_flag: 0=feriali only, 1=festivi only, None=all."""
+        dc = f"$A{r}"
+        terms = []
+        for col in op_cols:
+            if col == "C":
+                continue
+            coeff = j_coeff if col == "J" else 1
+            cf = _cif(col, dc) if fes_flag is None else _cifs(col, dc, fes_flag)
+            terms.append(f"{cf}*{coeff}" if coeff != 1 else cf)
+        return ("=" + "+".join(terms)) if terms else "=0"
+
+    # ── Row 1: title ───────────────────────────────────────────────────────
+    write_row = 1
+    ws.cell(write_row, 1, f"Riepilogo Turni – {mese_label}").font = title_font
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=n_hdr_cols)
 
-    # Riga 2 – intestazioni
-    hdr = (["Medico"]
-           + [col_map.get(c, c) for c in op_cols]
-           + ["Feriali (peso)", "Festivi (peso)", "Totale (peso)", "Obiettivo *"])
+    # ── Row 2: headers ─────────────────────────────────────────────────────
+    write_row = 2
+    hdr = (
+        ["Medico"]
+        + [col_map.get(c, c) for c in op_cols]
+        + ["Feriali (peso)", "Festivi (peso)", "Totale (peso)", "Obiettivo *"]
+    )
     for ci, val in enumerate(hdr, 1):
-        cell = ws.cell(2, ci, val)
+        cell = ws.cell(write_row, ci, val)
         cell.font = bold
         cell.fill = hdr_fill
         cell.alignment = center
 
-    # Righe medici
+    # Column indices for the summary columns
+    fer_col_idx = len(op_cols) + 2
+    fes_col_idx = fer_col_idx + 1
+    tot_col_idx = fes_col_idx + 1
+    obj_col_idx = tot_col_idx + 1
+    fer_letter = get_column_letter(fer_col_idx)
+    fes_letter = get_column_letter(fes_col_idx)
+
+    # ── Rows 3+: one per doctor ────────────────────────────────────────────
     for doc in sorted(all_docs):
+        write_row += 1
+        r = write_row
         doc_n = norm_name(doc)
         is_uni = doc_n in uni_docs
+        night_double = uni_night_double.get(doc_n, False)
 
-        tot_fer = w_fer[doc]
-        tot_fes = w_fes[doc]
-        tot = tot_fer + tot_fes
+        # A: doctor name — static, used by all formulas in this row via $A{r}
+        ws.cell(r, 1, doc)
 
+        # Per-column display: text formula "N+Mf" (updates live)
+        for ci, col in enumerate(op_cols, 2):
+            cell = ws.cell(r, ci)
+            cell.value = col_display_formula(col, r)
+            cell.alignment = center
+
+        # Feriali (peso), Festivi (peso): numeric COUNTIFS formulas
+        ws.cell(r, fer_col_idx).value = weighted_formula(r, j_coeff=2, fes_flag=0)
+        ws.cell(r, fes_col_idx).value = weighted_formula(r, j_coeff=2, fes_flag=1)
+        # Totale = Feriali + Festivi
+        ws.cell(r, tot_col_idx).value = f"={fer_letter}{r}+{fes_letter}{r}"
+
+        # Obiettivo: only for university doctors
         if is_uni:
-            obiettivo = f"{w_uni_fer[doc]} / {uni_target} ({int(uni_ratio * 100)}%)"
-        else:
-            obiettivo = ""
-
-        row: List = [doc]
-        for col in op_cols:
-            n_fer = col_fer[doc].get(col, 0)
-            n_fes = col_fes[doc].get(col, 0)
-            if n_fer == 0 and n_fes == 0:
-                row.append("")
-            elif n_fes == 0:
-                row.append(n_fer)
-            else:
-                row.append(f"{n_fer}+{n_fes}f")  # es. "2+1f" → 2 feriali + 1 festivo
-
-        row += [tot_fer or "", tot_fes or "", tot or "", obiettivo]
-        r = ws.max_row + 1
-        ws.append(row)
-        if is_uni:
-            for ci in range(1, len(row) + 1):
+            j_uni = 2 if night_double else 1
+            uni_body = weighted_formula(r, j_coeff=j_uni, fes_flag=None)[1:]  # strip leading "="
+            ws.cell(r, obj_col_idx).value = f'=TEXT({uni_body},"0")&"/{uni_target} ({pct}%)"'
+            for ci in range(1, n_hdr_cols + 1):
                 ws.cell(r, ci).fill = uni_fill
 
-    # Note a piè di foglio
-    ws.append([])
-    note_row = ws.max_row + 1
-    ws.cell(note_row, 1, "Note:").font = bold
-    ws.append(["  • Peso per giorno: J (notte) = 2 | C (reperibilità) senza altri turni = 0 | qualsiasi altro caso = 1"])
-    ws.append(["  • Se un medico compare in più colonne lo stesso giorno (es. K+T), conta come 1 solo turno"])
-    ws.append(["  • Festivi = domeniche + festivi nazionali italiani"])
-    ws.append(["  • Formato celle colonne: N = feriali  |  N+Mf = N feriali + M festivi"])
-    ws.append([f"  • Giorni lavorativi lun-sab del mese: {working_days_n}"])
-    ws.append([f"  • Obiettivo universitari (arancione): {uni_target} turni-peso "
-               f"= {working_days_n} × {int(uni_ratio * 100)}%  (J=2 se night_counts_double, C esclusa)"])
-    ws.append([f"  • Universitari: {', '.join(sorted(uni_docs))}"])
+    # ── Notes ─────────────────────────────────────────────────────────────
+    write_row += 2
+    ws.cell(write_row, 1, "Note:").font = bold
+    notes = [
+        "  • Peso per giorno: J (notte) = 2 | C (reperibilità) non conta | qualsiasi altro turno = 1",
+        "  • Formato celle colonne: N = feriali  |  N+Mf = N feriali + M festivi  |  Mf = solo festivo",
+        "  • Festivi = domeniche + festivi nazionali italiani",
+        f"  • Giorni lavorativi lun-sab del mese: {working_days_n}",
+        f"  • Obiettivo universitari (arancione): /{uni_target} = {working_days_n}×{pct}%"
+        f"  (J={'2' if any(uni_night_double.values()) else '1'} se night_counts_double, C esclusa)",
+        f"  • Universitari: {', '.join(sorted(uni_docs))}",
+        "  ⚠ I conteggi si aggiornano automaticamente modificando i nomi nel foglio principale.",
+    ]
+    for note in notes:
+        write_row += 1
+        ws.cell(write_row, 1, note)
 
-    # Larghezze colonne
+    # ── Helper column: festivo flags ───────────────────────────────────────
+    # Written last to avoid interfering with write_row tracking.
+    # Row alignment: day.row_idx == row index in this helper column
+    # (both start at 2), so COUNTIFS ranges align correctly.
+    for day in days:
+        ws.cell(day.row_idx, helper_col_idx, 1 if _is_fes(day.date) else 0)
+    ws.column_dimensions[hlp_letter].hidden = True
+
+    # ── Column widths ──────────────────────────────────────────────────────
     ws.column_dimensions["A"].width = 18
     for i in range(2, n_hdr_cols + 1):
         ws.column_dimensions[get_column_letter(i)].width = 13
