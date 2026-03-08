@@ -3006,7 +3006,204 @@ def write_output(
             v = cell.value
             if v is None or (isinstance(v, str) and v.strip() == ""):
                 cell.fill = yellow_fill
+    _write_riepilogo_sheet(wb, days, slots, assignment, cfg)
     wb.save(out_path)
+
+def _write_riepilogo_sheet(
+    wb: openpyxl.Workbook,
+    days: List[DayRow],
+    slots: List[Slot],
+    assignment: Dict[str, Optional[str]],
+    cfg: Optional[dict] = None,
+) -> None:
+    """Aggiunge/aggiorna il foglio 'Riepilogo' con i conteggi turni per medico.
+
+    Logica di peso per giorno (per tutti i medici):
+      - J (notte) presente nel giorno → 2
+      - C (reperibilità) senza altri turni → 0
+      - Qualsiasi altro caso (anche più colonne nello stesso giorno) → 1
+    Per i medici universitari, la colonna 'Obiettivo' usa la stessa logica
+    ma J vale 2 solo se night_counts_double=True, e C è sempre esclusa.
+    """
+    cfg = cfg or {}
+    col_map: Dict[str, str] = cfg.get("columns") or {}
+
+    SKIP_COLS = {"AD", "AE", "AF", "AG"}  # medici liberi: non sono turni operativi
+
+    op_cols = [c for c in col_map if c not in SKIP_COLS]
+
+    # Festivi
+    year = days[0].date.year if days else dt.date.today().year
+    holidays = italy_public_holidays(year)
+    extra_hol: Set[dt.date] = set()
+    for _x in (cfg.get("festivi_extra") or []):
+        try:
+            extra_hol.add(parse_date(_x))
+        except Exception:
+            pass
+    day_info = {d.date: d for d in days}
+
+    def _is_fes(date_: dt.date) -> bool:
+        d = day_info.get(date_)
+        return d is not None and (d.dow == "Sun" or date_ in holidays or date_ in extra_hol)
+
+    # ----------------------------------------------------------------
+    # Raccolta: per ogni (medico, giorno) → insieme di colonne assegnate
+    # e per ogni (medico, colonna) → conteggio apparizioni (per display)
+    # ----------------------------------------------------------------
+    # day_cols[doc][date] = set di colonne quel giorno
+    day_cols: Dict[str, Dict[dt.date, Set[str]]] = defaultdict(lambda: defaultdict(set))
+    # col_fer[doc][col] e col_fes[doc][col] = apparizioni per display
+    col_fer: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    col_fes: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    all_docs: Set[str] = set()
+
+    for s in slots:
+        doc = assignment.get(s.slot_id)
+        if not doc:
+            continue
+        all_docs.add(doc)
+        for col in s.columns:
+            if col in SKIP_COLS:
+                continue
+            day_cols[doc][s.day.date].add(col)
+            if _is_fes(s.day.date):
+                col_fes[doc][col] += 1
+            else:
+                col_fer[doc][col] += 1
+
+    # ----------------------------------------------------------------
+    # Peso per giorno (tutti i medici): J=2, C-only=0, altro=1
+    # ----------------------------------------------------------------
+    def _day_weight(cols: Set[str]) -> int:
+        if "J" in cols:
+            return 2
+        if cols - {"C"}:   # ha almeno una colonna che non è C
+            return 1
+        return 0           # solo C, o nessuna colonna
+
+    # ----------------------------------------------------------------
+    # Peso per giorno universitari: J=2 se night_double, C sempre=0
+    # ----------------------------------------------------------------
+    gc = cfg.get("global_constraints") or {}
+    gc_uni = gc.get("university_doctors") or {}
+    uni_ratio = float(gc.get("university_ratio", 0.6))
+    working_days_n = sum(1 for d in days if d.dow in ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat"))
+    uni_target = round(working_days_n * uni_ratio)
+    uni_docs = {norm_name(k) for k in gc_uni}
+    uni_night_double = {
+        norm_name(k): bool((v or {}).get("night_counts_double", False))
+        for k, v in gc_uni.items()
+    }
+
+    def _day_weight_uni(doc_n: str, cols: Set[str]) -> int:
+        nd = uni_night_double.get(doc_n, False)
+        if "J" in cols:
+            return 2 if nd else 1
+        if cols - {"C"}:
+            return 1
+        return 0
+
+    # ----------------------------------------------------------------
+    # Calcola totali pesati per medico (feriali e festivi separati)
+    # ----------------------------------------------------------------
+    w_fer: Dict[str, int] = defaultdict(int)
+    w_fes: Dict[str, int] = defaultdict(int)
+    w_uni_fer: Dict[str, int] = defaultdict(int)
+
+    for doc, dates in day_cols.items():
+        doc_n = norm_name(doc)
+        is_uni = doc_n in uni_docs
+        for date_, cols in dates.items():
+            dw = _day_weight(cols)
+            if _is_fes(date_):
+                w_fes[doc] += dw
+            else:
+                w_fer[doc] += dw
+                if is_uni:
+                    w_uni_fer[doc] += _day_weight_uni(doc_n, cols)
+
+    # Crea/ricrea foglio
+    sname = "Riepilogo"
+    if sname in wb.sheetnames:
+        del wb[sname]
+    ws = wb.create_sheet(sname)
+
+    # Stili
+    bold = openpyxl.styles.Font(bold=True)
+    title_font = openpyxl.styles.Font(bold=True, size=13)
+    hdr_fill = PatternFill(fill_type="solid", start_color="FFD9E1F2", end_color="FFD9E1F2")
+    uni_fill = PatternFill(fill_type="solid", start_color="FFFFE2CC", end_color="FFFFE2CC")
+    center = openpyxl.styles.Alignment(horizontal="center", wrap_text=True)
+
+    mese_label = days[0].date.strftime("%B %Y") if days else ""
+
+    # Riga 1 – titolo
+    n_hdr_cols = len(op_cols) + 5
+    ws.cell(1, 1, f"Riepilogo Turni – {mese_label}").font = title_font
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=n_hdr_cols)
+
+    # Riga 2 – intestazioni
+    hdr = (["Medico"]
+           + [col_map.get(c, c) for c in op_cols]
+           + ["Feriali (peso)", "Festivi (peso)", "Totale (peso)", "Obiettivo *"])
+    for ci, val in enumerate(hdr, 1):
+        cell = ws.cell(2, ci, val)
+        cell.font = bold
+        cell.fill = hdr_fill
+        cell.alignment = center
+
+    # Righe medici
+    for doc in sorted(all_docs):
+        doc_n = norm_name(doc)
+        is_uni = doc_n in uni_docs
+
+        tot_fer = w_fer[doc]
+        tot_fes = w_fes[doc]
+        tot = tot_fer + tot_fes
+
+        if is_uni:
+            obiettivo = f"{w_uni_fer[doc]} / {uni_target} ({int(uni_ratio * 100)}%)"
+        else:
+            obiettivo = ""
+
+        row: List = [doc]
+        for col in op_cols:
+            n_fer = col_fer[doc].get(col, 0)
+            n_fes = col_fes[doc].get(col, 0)
+            if n_fer == 0 and n_fes == 0:
+                row.append("")
+            elif n_fes == 0:
+                row.append(n_fer)
+            else:
+                row.append(f"{n_fer}+{n_fes}f")  # es. "2+1f" → 2 feriali + 1 festivo
+
+        row += [tot_fer or "", tot_fes or "", tot or "", obiettivo]
+        r = ws.max_row + 1
+        ws.append(row)
+        if is_uni:
+            for ci in range(1, len(row) + 1):
+                ws.cell(r, ci).fill = uni_fill
+
+    # Note a piè di foglio
+    ws.append([])
+    note_row = ws.max_row + 1
+    ws.cell(note_row, 1, "Note:").font = bold
+    ws.append(["  • Peso per giorno: J (notte) = 2 | C (reperibilità) senza altri turni = 0 | qualsiasi altro caso = 1"])
+    ws.append(["  • Se un medico compare in più colonne lo stesso giorno (es. K+T), conta come 1 solo turno"])
+    ws.append(["  • Festivi = domeniche + festivi nazionali italiani"])
+    ws.append(["  • Formato celle colonne: N = feriali  |  N+Mf = N feriali + M festivi"])
+    ws.append([f"  • Giorni lavorativi lun-sab del mese: {working_days_n}"])
+    ws.append([f"  • Obiettivo universitari (arancione): {uni_target} turni-peso "
+               f"= {working_days_n} × {int(uni_ratio * 100)}%  (J=2 se night_counts_double, C esclusa)"])
+    ws.append([f"  • Universitari: {', '.join(sorted(uni_docs))}"])
+
+    # Larghezze colonne
+    ws.column_dimensions["A"].width = 18
+    for i in range(2, n_hdr_cols + 1):
+        ws.column_dimensions[get_column_letter(i)].width = 13
+
+
 def write_solver_log(out_path: Path, stats: Dict) -> Optional[Path]:
     """
     Writes a human-readable solver log next to the output Excel.
