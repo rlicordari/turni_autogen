@@ -974,8 +974,7 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
             _j_override_date = None
             if _j_override_raw:
                 try:
-                    import datetime as _dt2
-                    _j_override_date = _dt2.date.fromisoformat(str(_j_override_raw))
+                    _j_override_date = dt.date.fromisoformat(str(_j_override_raw))
                 except Exception:
                     pass
             # Salta questo giorno in J se:
@@ -1066,7 +1065,7 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
         # ---- S (Wed, optional if can be absorbed in R)
         if "S" in rules:
             r = rules["S"]
-            if dayspec_contains(day.dow, r.get("day")):
+            if dayspec_contains(day.dow, r.get("days") or r.get("day")):
                 pool = mk_allowed(r.get("pool") or [])
                 pool = apply_unavailability(pool, day, "Mattina", unav)
                 required = not bool(r.get("if_not_dedicated_put_in_R", False))
@@ -1147,7 +1146,7 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
         #  - PLUS: on exactly 2 Mondays: also 'Recupero' (appended in the same cell)
         if "Y" in rules:
             r = rules["Y"]
-            if dayspec_contains(day.dow, r.get("day")):
+            if dayspec_contains(day.dow, r.get("days") or r.get("day")):
                 # Main doctor (always required)
                 pool_main = [d for d in mk_allowed(r.get("other_pool") or []) if d != "Recupero"]
                 pool_main = apply_unavailability(pool_main, day, "Mattina", unav)
@@ -1601,6 +1600,7 @@ def solve_with_ortools(
         doc1 = norm_name(r_df.get("pattern_doc1") or "")
         doc2 = norm_name(r_df.get("pattern_doc2") or "")
         if doc1 in doctors and doc2 in doctors:
+            _day_idx_map = {d.date: i for i, d in enumerate(days)}
             for day in days:
                 if day.dow not in ["Mon","Tue","Wed","Thu","Fri","Sat"]:
                     continue
@@ -1624,7 +1624,6 @@ def solve_with_ortools(
                     if v is not None:
                         conds.append(v)
                 # J del giorno precedente
-                _day_idx_map = {d.date: i for i, d in enumerate(days)}
                 _i_today = _day_idx_map.get(day.date)
                 if _i_today is not None and _i_today > 0:
                     _prev_date = days[_i_today - 1].date
