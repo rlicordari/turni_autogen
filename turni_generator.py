@@ -462,6 +462,16 @@ def assign_reperibilita_C(cfg: dict, days: List[DayRow], slots: List[Slot],
             prev = date_ - dt.timedelta(days=1)
             if assignment.get(f"{prev}-{night_col}") == doc:
                 return False
+        if "not_night_prev_2_days" in constraints:
+            for delta in [1, 2]:
+                prev = date_ - dt.timedelta(days=delta)
+                if assignment.get(f"{prev}-{night_col}") == doc:
+                    return False
+        if "not_night_next_2_days" in constraints:
+            for delta in [1, 2]:
+                nxt = date_ + dt.timedelta(days=delta)
+                if assignment.get(f"{nxt}-{night_col}") == doc:
+                    return False
         if "not_working_same_day_on_sundays_and_holidays" in constraints:
             drow = dayrow_by_date.get(date_)
             if drow is not None and is_festivo(drow, cfg):
@@ -1734,29 +1744,8 @@ def solve_with_ortools(
     if "rules" in cfg and "C_reperibilita" in cfg["rules"]:
         rC = cfg["rules"]["C_reperibilita"]
         constraints = set(rC.get("constraints") or [])
-        if "not_night_same_day" in constraints or "not_night_next_2_days" in constraints:
-            for day in days:
-                # find C slot
-                c_slot = next((s for s in slots_by_day[day.date] if s.columns == ["C"]), None)
-                if not c_slot:
-                    continue
-                for doc in doctors:
-                    if (c_slot.slot_id, doc) not in x:
-                        continue
-                    cvar = x[(c_slot.slot_id, doc)]
-                    # same day
-                    if "not_night_same_day" in constraints:
-                        nvar = night_var_by_day_doc.get((day.date, doc))
-                        if nvar is not None:
-                            model.Add(nvar == 0).OnlyEnforceIf(cvar)
-                    # next 2 days
-                    if "not_night_next_2_days" in constraints:
-                        for off in [1,2]:
-                            idx = days.index(day) + off if day in days else None  # not used
-                        # safer with index mapping
-                        # map date->pos once
-            # Implement with date->pos mapping
-            pos = {d.date:i for i,d in enumerate(days)}
+        if any(c in constraints for c in ("not_night_same_day", "not_night_next_2_days", "not_night_prev_2_days")):
+            pos = {d.date: i for i, d in enumerate(days)}
             for day in days:
                 c_slot = next((s for s in slots_by_day[day.date] if s.columns == ["C"]), None)
                 if not c_slot:
@@ -1766,9 +1755,10 @@ def solve_with_ortools(
                         continue
                     cvar = x[(c_slot.slot_id, doc)]
                     i = pos[day.date]
-                    for off in [0,1,2]:
+                    # enforce no-night within ±2 days of a Reperibilità assignment
+                    for off in [-2, -1, 0, 1, 2]:
                         j = i + off
-                        if j >= len(days):
+                        if j < 0 or j >= len(days):
                             continue
                         nvar = night_var_by_day_doc.get((days[j].date, doc))
                         if nvar is not None:

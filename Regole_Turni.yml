@@ -77,6 +77,8 @@ rules:
     constraints:
     - not_night_same_day
     - not_night_prev_day
+    - not_night_prev_2_days
+    - not_night_next_2_days
     - not_working_same_day_on_sundays_and_holidays
     excluded:
     - Zito
