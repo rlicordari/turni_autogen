@@ -3132,17 +3132,37 @@ def _write_riepilogo_sheet(
 
     def weighted_formula(r: int, j_coeff: int, fes_flag: Optional[int]) -> str:
         """Numeric weighted-turni formula. C always excluded.
+        Usa SUMPRODUCT+ISNUMBER(SEARCH()) per riga per evitare il doppio conteggio
+        dei medici che coprono più colonne nello stesso giorno (D+F share, slot EG,
+        DE/HI festivi, K+AA copia). Ogni giornata lavorativa conta 1, J conta j_coeff.
         j_coeff: coefficient for J (2 = standard, 1 = university without night_double).
         fes_flag: 0=feriali only, 1=festivi only, None=all."""
         dc = f"$A{r}"
-        terms = []
-        for col in op_cols:
-            if col == "C":
-                continue
-            coeff = j_coeff if col == "J" else 1
-            cf = _cif(col, dc) if fes_flag is None else _cifs(col, dc, fes_flag)
-            terms.append(f"{cf}*{coeff}" if coeff != 1 else cf)
-        return ("=" + "+".join(terms)) if terms else "=0"
+        non_j_cols = [c for c in op_cols if c != "C" and c != "J"]
+        has_j = "J" in op_cols
+
+        # Filtro festivo/feriale (la colonna helper contiene 0=feriale, 1=festivo)
+        if fes_flag is None:
+            filt = ""
+        else:
+            filt = f"*({hlp_range}={fes_flag})"
+
+        parts = []
+
+        # Colonne non-J: presenza per riga → 1 per giornata lavorativa
+        # (deduplica slot multi-colonna: D+F share, EG, DE festivo, HI festivo, K+AA, ecc.)
+        if non_j_cols:
+            search_terms = "+".join(
+                f"ISNUMBER(SEARCH({dc},{_main_range(c)}))"
+                for c in non_j_cols
+            )
+            parts.append(f"SUMPRODUCT((({search_terms})>0)*1{filt})")
+
+        # Colonna J: presenza per riga × j_coeff
+        if has_j:
+            parts.append(f"SUMPRODUCT(ISNUMBER(SEARCH({dc},{_main_range('J')}))*{j_coeff}{filt})")
+
+        return ("=" + "+".join(parts)) if parts else "=0"
 
     # ── Row 1: title ───────────────────────────────────────────────────────
     write_row = 1
@@ -3205,7 +3225,8 @@ def _write_riepilogo_sheet(
     write_row += 2
     ws.cell(write_row, 1, "Note:").font = bold
     notes = [
-        "  • Peso per giorno: J (notte) = 2 | C (reperibilità) non conta | qualsiasi altro turno = 1",
+        "  • Peso per giorno: J (notte) = 2 | C (reperibilità) non conta | altro = 1 per giornata lavorativa",
+        "  • Turni multipli nella stessa giornata (es. D+F share, slot EG, festivi DE/HI, K+AA) contano 1",
         "  • Formato celle colonne: N = feriali  |  N+Mf = N feriali + M festivi  |  Mf = solo festivo",
         "  • Festivi = domeniche + festivi nazionali italiani",
         f"  • Giorni lavorativi lun-sab del mese: {working_days_n}",
