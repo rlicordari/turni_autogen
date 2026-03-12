@@ -291,6 +291,7 @@ def _github_cfg() -> dict:
         "sessions_dir": _get_secret(("GITHUB_UNAV_SESSIONS_DIR",), "data/unavailability_sessions"),
         "doctor_auth_dir": _get_secret(("GITHUB_DOCTOR_AUTH_DIR",), "data/doctor_auth"),
         "contacts_path": _get_secret(("GITHUB_DOCTOR_CONTACTS_PATH",), "data/doctor_contacts.yml"),
+        "availability_path": _get_secret(("GITHUB_AVAIL_PATH",), "data/availability_store.csv"),
     }
 
 # ---------------- Rules / doctors ----------------
@@ -344,6 +345,80 @@ def save_store_to_github(rows: list[dict], sha: str | None, message: str) -> str
     except Exception:
         pass
     return None
+
+
+def load_avail_store_from_github() -> tuple[list[dict], str | None]:
+    """Carica il CSV delle preferenze di disponibilità da GitHub."""
+    g = _github_cfg()
+    path = g.get("availability_path", "data/availability_store.csv")
+    if not (g.get("token") and g.get("owner") and g.get("repo")):
+        raise RuntimeError("GitHub non configurato (availability store).")
+    gf = github_utils.get_file(
+        owner=g["owner"], repo=g["repo"], path=path,
+        token=g["token"], branch=g.get("branch", "main"),
+    )
+    if gf is None:
+        return [], None
+    return ustore.load_store(gf.text), gf.sha
+
+
+def save_avail_store_to_github(rows: list[dict], sha: str | None, message: str) -> str | None:
+    """Salva il CSV delle preferenze di disponibilità su GitHub."""
+    g = _github_cfg()
+    path = g.get("availability_path", "data/availability_store.csv")
+    text = ustore.to_csv(rows)
+    resp = github_utils.put_file(
+        owner=g["owner"], repo=g["repo"], path=path,
+        token=g["token"], branch=g.get("branch", "main"),
+        sha=sha, message=message, text=text,
+    )
+    try:
+        content = resp.get("content") if isinstance(resp, dict) else None
+        if isinstance(content, dict) and content.get("sha"):
+            return str(content.get("sha"))
+    except Exception:
+        pass
+    return None
+
+
+def save_doctor_availability_with_retry(
+    *,
+    doctor: str,
+    entries_by_month: dict,
+    updated_at: str,
+    message: str,
+    initial_rows: list[dict] | None = None,
+    initial_sha: str | None = None,
+    max_retries: int = 6,
+) -> str | None:
+    """Salvataggio concurrency-safe del CSV preferenze su GitHub."""
+    last_err: Exception | None = None
+    months = sorted(entries_by_month.items())
+    for attempt in range(max_retries):
+        if attempt == 0 and initial_rows is not None:
+            store_rows = list(initial_rows)
+            store_sha = initial_sha
+        else:
+            store_rows, store_sha = load_avail_store_from_github()
+        new_rows = list(store_rows)
+        for (yy, mm), entries in months:
+            new_rows = ustore.replace_doctor_month(
+                new_rows, doctor, int(yy), int(mm), entries, updated_at=updated_at
+            )
+        try:
+            _new_sha = save_avail_store_to_github(new_rows, store_sha, message=message)
+            latest_rows, latest_sha = load_avail_store_from_github()
+            return latest_sha or _new_sha
+        except Exception as e:
+            last_err = e
+            if _is_sha_conflict_error(e):
+                sleep_s = min(3.0, 0.35 * (2 ** attempt) + random.random() * 0.25)
+                time.sleep(sleep_s)
+                continue
+            raise
+    if last_err:
+        raise last_err
+    raise RuntimeError("Errore salvataggio preferenze: tentativi esauriti.")
 
 
 def _is_sha_conflict_error(err: Exception) -> bool:
@@ -1832,6 +1907,10 @@ if mode == "Indisponibilità (Medico)":
             for _k in list(st.session_state.keys()):
                 if str(_k).startswith(_rows_prefix):
                     st.session_state.pop(_k, None)
+        # Reset anche avail store baseline e editor avail
+        st.session_state.pop(f"avail_store_baseline_{doctor}", None)
+        for (yy, mm) in selected:
+            st.session_state.pop(f"avail_rows_{doctor}_{yy}_{mm}", None)
         st.rerun()
 
     try:
@@ -1842,6 +1921,17 @@ if mode == "Indisponibilità (Medico)":
     except Exception as e:
         st.error(f"Errore accesso archivio indisponibilità: {e}")
         st.stop()
+
+    # Carica archivio preferenze (availability) da GitHub — cachato in sessione
+    _avail_base_key = f"avail_store_baseline_{doctor}"
+    if _avail_base_key not in st.session_state or refresh_baseline:
+        try:
+            _avail_rows, _avail_sha = load_avail_store_from_github()
+            st.session_state[_avail_base_key] = {"rows": _avail_rows, "sha": _avail_sha}
+        except Exception:
+            st.session_state[_avail_base_key] = {"rows": [], "sha": None}
+    avail_store_rows: list[dict] = list((st.session_state.get(_avail_base_key) or {}).get("rows") or [])
+    avail_store_sha: str | None = (st.session_state.get(_avail_base_key) or {}).get("sha")
 
     # Load app settings (open/closed + limits)
     try:
@@ -2105,11 +2195,22 @@ if mode == "Indisponibilità (Medico)":
                     f"Limite: max **{max_avail}** per fascia al mese."
                 )
                 avail_key = f"avail_rows_{doctor}_{yy}_{mm}"
-                # Carica disponibilità esistenti dalla sessione (non persiste su GitHub per ora)
                 if avail_key not in st.session_state:
-                    st.session_state[avail_key] = [
-                        {"id": str(uuid.uuid4()), "Data": date(yy, mm, 1), "Fascia": "Mattina", "Note": ""}
-                    ]
+                    _existing_avail = ustore.filter_doctor_month(avail_store_rows, doctor, yy, mm)
+                    if _existing_avail:
+                        st.session_state[avail_key] = [
+                            {
+                                "id": str(uuid.uuid4()),
+                                "Data": date.fromisoformat(r["date"]) if r.get("date") else date(yy, mm, 1),
+                                "Fascia": r.get("shift", "Mattina"),
+                                "Note": r.get("note", ""),
+                            }
+                            for r in _existing_avail
+                        ]
+                    else:
+                        st.session_state[avail_key] = [
+                            {"id": str(uuid.uuid4()), "Data": date(yy, mm, 1), "Fascia": "Mattina", "Note": ""}
+                        ]
 
                 if unav_open:
                     cAv1, cAv2, _ = st.columns([1, 1, 6])
@@ -2162,6 +2263,32 @@ if mode == "Indisponibilità (Medico)":
                         st.error(f"Limite disponibilità superato: {av_over}. Rimuovi alcune righe.")
                     else:
                         st.caption("Conteggi: " + ", ".join([f"{sh} {av_counts.get(sh,0)}/{max_avail}" for sh in FASCIA_OPTIONS if av_counts.get(sh,0)>0]))
+
+                    st.divider()
+                    _save_avail_disabled = bool(av_over)
+                    if st.button("Salva preferenze", key=f"save_avail_{doctor}_{yy}_{mm}", type="primary", disabled=_save_avail_disabled):
+                        _avail_entries = [
+                            (r["Data"], r.get("Fascia", "Mattina"), r.get("Note", ""))
+                            for r in (st.session_state.get(avail_key) or [])
+                            if r.get("Data") and r.get("Fascia")
+                        ]
+                        _avail_upd = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+                        try:
+                            _new_avail_sha = save_doctor_availability_with_retry(
+                                doctor=doctor,
+                                entries_by_month={(yy, mm): _avail_entries},
+                                updated_at=_avail_upd,
+                                message=f"Update availability: {doctor} ({_avail_upd})",
+                                initial_rows=avail_store_rows,
+                                initial_sha=avail_store_sha,
+                            )
+                            st.session_state[f"avail_store_baseline_{doctor}"] = {
+                                "rows": load_avail_store_from_github()[0],
+                                "sha": _new_avail_sha,
+                            }
+                            st.success(f"Preferenze salvate ({len(_avail_entries)} voci).")
+                        except Exception as _e:
+                            st.error(f"Errore salvataggio preferenze: {_e}")
 
                     # Salva in sessione per trasmetterle al generate (chiave globale con medico)
                     avail_rows_by_month[(yy, mm)] = [
@@ -2774,12 +2901,17 @@ else:
                 status.update(label="Generazione turni…", state="running")
                 out_path = td / f"output_{mk}.xlsx"
 
-                # Raccoglie availability_preferences da tutti i medici (salvate in sessione)
-                all_avail_prefs = []
-                for sk, sv in st.session_state.items():
-                    if sk.startswith("avail_global_") and f"_{int(year)}_{int(month)}" in sk:
-                        if isinstance(sv, list):
-                            all_avail_prefs.extend(sv)
+                # Carica preferenze di disponibilità da GitHub
+                try:
+                    _avail_all, _ = load_avail_store_from_github()
+                    _avail_month = ustore.filter_month(_avail_all, int(year), int(month))
+                    all_avail_prefs = [
+                        {"doctor": r["doctor"], "date": r["date"], "shift": r["shift"]}
+                        for r in _avail_month
+                    ]
+                except Exception as _e:
+                    all_avail_prefs = []
+                    st.warning(f"Impossibile caricare preferenze da GitHub: {_e}")
 
                 stats, log_path = tg.generate_schedule(
                     template_xlsx=template_path,
