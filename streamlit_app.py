@@ -1812,7 +1812,6 @@ if mode == "Indisponibilità (Medico)":
     doctor = st.session_state.doctor_name
 
 
-    render_unav_flash(doctor)
     # Single active session per doctor: this prevents silent overwrites when the
     # same doctor uses multiple devices/browsers.
     try:
@@ -2316,6 +2315,8 @@ if mode == "Indisponibilità (Medico)":
         save = st.button("Salva indisponibilità", type="primary", disabled=not can_save)
     with c2:
         pass
+
+    render_unav_flash(doctor)
 
     if save:
         if not unav_open:
