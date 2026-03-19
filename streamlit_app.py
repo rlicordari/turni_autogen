@@ -2102,6 +2102,7 @@ if mode == "Indisponibilità (Medico)":
                             min_value=first_day,
                             max_value=last_day,
                             label_visibility="collapsed",
+                            format="DD/MM/YYYY",
                         )
                     with c2:
                         sh_val = st.selectbox(
@@ -2239,7 +2240,8 @@ if mode == "Indisponibilità (Medico)":
                             av_date = st.date_input("Data", value=av_r.get("Data") or date(yy, mm, 1),
                                                     min_value=date(yy, mm, 1),
                                                     max_value=date(yy, mm, 1) if mm == 12 else date(yy, mm + 1, 1) - timedelta(days=1),
-                                                    key=f"{avail_key}_{av_r['id']}_d")
+                                                    key=f"{avail_key}_{av_r['id']}_d",
+                                                    format="DD/MM/YYYY")
                         with av_c2:
                             av_shift = st.selectbox("Fascia", FASCIA_OPTIONS,
                                                     index=FASCIA_OPTIONS.index(av_r.get("Fascia","Mattina")) if av_r.get("Fascia","Mattina") in FASCIA_OPTIONS else 0,
@@ -2783,7 +2785,8 @@ else:
                                     value=fa_r.get("date") or date(int(year), int(month), 1),
                                     min_value=date(int(year), int(month), 1),
                                     max_value=date(int(year), int(month), last_day_month),
-                                    key=f"fa_date_{fa_r['id']}")
+                                    key=f"fa_date_{fa_r['id']}",
+                                    format="DD/MM/YYYY")
         with fa_cols[2]:
             fa_col_label = st.selectbox("Turno/Colonna",
                                         list(SHIFT_LABELS_ADMIN.keys()),
