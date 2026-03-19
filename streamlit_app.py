@@ -1123,6 +1123,7 @@ DEFAULT_SETTINGS = {
     "unavailability_open": True,
     "max_unavailability_per_shift": 6,
     "max_availability_per_shift": 6,  # max preferenze disponibilità per fascia per mese
+    "doctor_caps": {},  # cap personalizzato per medico: {"Dattilo": 10, "De Gregorio": 10, "Zito": 10}
 }
 
 AUDIT_FIELDS = [
@@ -1188,6 +1189,13 @@ def load_app_settings_from_github() -> tuple[dict, str | None]:
         )
     except Exception:
         out["max_availability_per_shift"] = DEFAULT_SETTINGS["max_availability_per_shift"]
+
+    # cap personalizzati per medico
+    try:
+        dc = data.get("doctor_caps", {})
+        out["doctor_caps"] = {str(k): int(v) for k, v in (dc or {}).items()} if isinstance(dc, dict) else {}
+    except Exception:
+        out["doctor_caps"] = {}
 
     # optional metadata
     out["updated_at"] = str(data.get("updated_at") or "")
@@ -1939,12 +1947,27 @@ if mode == "Indisponibilità (Medico)":
     if max_per_shift < 0:
         max_per_shift = 0
 
+    # Cap personalizzato per questo medico (se impostato dall'admin)
+    _doctor_caps = app_settings.get("doctor_caps") or {}
+    try:
+        max_per_shift_for_doctor = int(_doctor_caps.get(doctor, max_per_shift))
+    except Exception:
+        max_per_shift_for_doctor = max_per_shift
+    if max_per_shift_for_doctor < 0:
+        max_per_shift_for_doctor = 0
+
     if not unav_open:
         st.warning("🔒 Inserimento indisponibilità temporaneamente **chiuso** dall'amministratore. Puoi solo visualizzare (non puoi salvare).")
-    st.caption(
-        f"Limite per medico: **max {max_per_shift}** inserimenti per ogni fascia "
-        "(Mattina/Pomeriggio/Notte/Diurno/Tutto il giorno) per ogni mese."
-    )
+    if max_per_shift_for_doctor != max_per_shift:
+        st.caption(
+            f"Limite per fascia al mese: **max {max_per_shift_for_doctor}** "
+            "(limite personalizzato per il tuo profilo)."
+        )
+    else:
+        st.caption(
+            f"Limite per medico: **max {max_per_shift}** inserimenti per ogni fascia "
+            "(Mattina/Pomeriggio/Notte/Diurno/Tutto il giorno) per ogni mese."
+        )
 
     st.divider()
 
@@ -2158,7 +2181,7 @@ if mode == "Indisponibilità (Medico)":
             info_by_month[(yy, mm)] = info
 
             counts = info.get("counts", {}) or {}
-            over = {sh: n for sh, n in counts.items() if n > max_per_shift}
+            over = {sh: n for sh, n in counts.items() if n > max_per_shift_for_doctor}
             violations_by_month[(yy, mm)] = over
 
             if info.get("out_of_month"):
@@ -2171,11 +2194,11 @@ if mode == "Indisponibilità (Medico)":
 
             st.caption(
                 "Conteggi mese (per fascia): "
-                + ", ".join([f"{sh} {counts.get(sh, 0)}/{max_per_shift}" for sh in FASCIA_OPTIONS])
+                + ", ".join([f"{sh} {counts.get(sh, 0)}/{max_per_shift_for_doctor}" for sh in FASCIA_OPTIONS])
             )
 
             if over:
-                pretty = ", ".join([f"{sh}: {n}/{max_per_shift}" for sh, n in over.items()])
+                pretty = ", ".join([f"{sh}: {n}/{max_per_shift_for_doctor}" for sh, n in over.items()])
                 st.error(f"Limite superato in questo mese → {pretty}. Rimuovi alcune righe prima di salvare.")
 
             # ── Sub-tab Disponibilità ──────────────────────────────────────────
@@ -2340,10 +2363,10 @@ if mode == "Indisponibilità (Medico)":
             counts = {}
             for _d, sh, _n in entries_norm:
                 counts[sh] = counts.get(sh, 0) + 1
-            over = {sh: n for sh, n in counts.items() if n > max_per_shift}
+            over = {sh: n for sh, n in counts.items() if n > max_per_shift_for_doctor}
             if over:
                 hard_viol.append(
-                    f"{yy}-{mm:02d}: " + ", ".join([f"{sh} {n}/{max_per_shift}" for sh, n in over.items()])
+                    f"{yy}-{mm:02d}: " + ", ".join([f"{sh} {n}/{max_per_shift_for_doctor}" for sh, n in over.items()])
                 )
 
         if hard_viol:
@@ -2499,11 +2522,32 @@ else:
             if meta:
                 st.caption(meta)
 
+        # Cap personalizzati per universitari
+        st.markdown("**Cap personalizzati per universitari** *(sovrascrivono il limite globale per i medici selezionati)*")
+        gc_uni = (cfg_default.get("global_constraints") or {}).get("university_doctors") or {}
+        uni_doctors = sorted(gc_uni.keys()) if gc_uni else ["Dattilo", "De Gregorio", "Zito"]
+        cur_doctor_caps = app_settings.get("doctor_caps") or {}
+        new_doctor_caps = {}
+        uni_cols = st.columns(len(uni_doctors))
+        for col, doc in zip(uni_cols, uni_doctors):
+            with col:
+                cur_cap = cur_doctor_caps.get(doc, int(new_max))
+                new_doctor_caps[doc] = st.number_input(
+                    doc,
+                    min_value=0,
+                    max_value=31,
+                    value=int(cur_cap),
+                    step=1,
+                    key=f"doctor_cap_{doc}",
+                    help=f"Cap massimo di indisponibilità per fascia al mese per {doc}. Usa il limite globale ({int(new_max)}) se non vuoi differenziare.",
+                )
+
         if st.button("Salva impostazioni indisponibilità", type="primary"):
             settings_to_save = {
                 "unavailability_open": bool(new_open),
                 "max_unavailability_per_shift": int(new_max),
                 "max_availability_per_shift": int(new_max_avail),
+                "doctor_caps": {doc: int(v) for doc, v in new_doctor_caps.items()},
                 "updated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
                 "updated_by": "admin",
             }
