@@ -1551,10 +1551,6 @@ def release_doctor_session(doctor: str):
 
 # ---------------- UI: Header ----------------
 st.title("UOC Cardiologia con UTIC - Turni")
-st.markdown(
-    'I medici possono inserire solo le <b>proprie</b> indisponibilità (privacy).</div>',
-    unsafe_allow_html=True,
-)
 
 mode = st.sidebar.radio(
     "Sezione",
@@ -1571,10 +1567,6 @@ doctors_default = doctors_from_cfg(cfg_default)
 # =====================================================================
 if mode == "Indisponibilità (Medico)":
     st.subheader("Indisponibilità (Medico)")
-    st.write(
-        "Compila le tue indisponibilità per uno o più mesi. "
-        "Le indisponibilità degli altri non sono visibili."
-    )
 
     # GitHub is required for both indisponibilità storage and PIN self-service.
     try:
@@ -1852,7 +1844,7 @@ if mode == "Indisponibilità (Medico)":
     sel_default = st.session_state.get("doctor_selected_months") or [(default_year, default_month)]
     sel_set = set(sel_default)
 
-    st.subheader("3) Seleziona mese/i da compilare")
+    st.subheader("Seleziona mese/i da compilare")
     c1, c2, c3, c4 = st.columns([1, 1.4, 1, 1])
     with c1:
         yy_sel = st.selectbox("Anno", year_options, key="doctor_year_sel")
