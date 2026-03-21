@@ -1873,6 +1873,7 @@ if mode == "Indisponibilità (Medico)":
     cur = (int(yy_sel), int(mm_sel))
     if add_month:
         sel_set.add(cur)
+        st.session_state.doctor_active_month = cur  # passa automaticamente al mese appena aggiunto
     if remove_month:
         sel_set.discard(cur)
 
@@ -1883,7 +1884,28 @@ if mode == "Indisponibilità (Medico)":
         st.info("Seleziona anno e mese qui sopra e premi **Aggiungi mese ▶** per iniziare.")
         st.stop()
 
-    st.caption("Mesi selezionati: " + ", ".join([f"{month_names.get(mm, str(mm))} {yy}" for (yy, mm) in selected]))
+    # Gestione mese attivo (uno solo visualizzato per volta)
+    st.session_state.setdefault("doctor_active_month", selected[0])
+    if st.session_state.doctor_active_month not in selected:
+        st.session_state.doctor_active_month = selected[0]
+    active_month = st.session_state.doctor_active_month
+
+    # Barra di navigazione tra i mesi aggiunti
+    if len(selected) > 1:
+        st.caption("Passa da un mese all'altro:")
+        nav_cols = st.columns(min(len(selected), 6))
+        for _ni, (_syy, _smm) in enumerate(selected):
+            with nav_cols[_ni % 6]:
+                _is_active = (_syy, _smm) == active_month
+                if st.button(
+                    f"{month_names.get(_smm, str(_smm))} {_syy}",
+                    key=f"nav_{_syy}_{_smm}",
+                    type="primary" if _is_active else "secondary",
+                    use_container_width=True,
+                ):
+                    st.session_state.doctor_active_month = (_syy, _smm)
+                    st.rerun()
+        active_month = st.session_state.doctor_active_month
 
     # Stable baseline (snapshot) for this editing session.
     # This is what we compare against at save-time to detect a stale editor.
@@ -1976,10 +1998,10 @@ if mode == "Indisponibilità (Medico)":
     normalized_entries_by_month = {}
     violations_by_month = {}
     info_by_month = {}
-    # Disponibilità (preferenze): stesso pattern ma salvato separatamente
-    avail_rows_by_month = {}  # (yy,mm) -> list of {date, shift}
+    avail_rows_by_month = {}
+    save = False  # inizializzato prima del loop per sicurezza
 
-    for (yy, mm) in selected:
+    for (yy, mm) in [active_month]:  # mostra solo il mese attivo
         st.markdown("---")
         st.subheader(f"{month_names.get(mm, str(mm))} {yy}")
         with st.container():
@@ -2200,6 +2222,18 @@ if mode == "Indisponibilità (Medico)":
                 pretty = ", ".join([f"{sh}: {n}/{max_per_shift_for_doctor}" for sh, n in over.items()])
                 st.error(f"Limite superato in questo mese → {pretty}. Rimuovi alcune righe prima di salvare.")
 
+            # ── Pulsante salva indisponibilità (tra le due sezioni) ──────────────
+            _can_save = bool(unav_open) and not bool(over)
+            render_unav_flash(doctor)
+            _sc1, _sc2 = st.columns([1, 2])
+            with _sc1:
+                save = st.button(
+                    "Salva indisponibilità",
+                    key=f"save_unav_{yy}_{mm}",
+                    type="primary",
+                    disabled=not _can_save,
+                )
+
             # ── Disponibilità (preferenze) ──────────────────────────────────────────
             st.divider()
             st.markdown("#### Disponibilità (preferenze)")
@@ -2322,17 +2356,6 @@ if mode == "Indisponibilità (Medico)":
                     ]
                 else:
                     st.info("Inserimento chiuso dall'amministratore.")
-
-    any_over = any(bool(v) for v in (violations_by_month or {}).values())
-    can_save = bool(unav_open) and (not any_over)
-
-    st.markdown("---")
-    c1, c2 = st.columns([1, 2])
-    with c1:
-        save = st.button("Salva indisponibilità", type="primary", disabled=not can_save)
-    with c2:
-        pass
-    render_unav_flash(doctor)
 
     if save:
         if not unav_open:
