@@ -765,6 +765,7 @@ def request_pin_otp(doctor: str, channel: str) -> str:
             "attempts": 0,
             "max_attempts": OTP_MAX_ATTEMPTS,
             "app_build": APP_BUILD,
+            "used_at": None,
         })
         try:
             save_doctor_otp_record(doctor, rec, sha, message=f"OTP request {doctor} ({channel})")
