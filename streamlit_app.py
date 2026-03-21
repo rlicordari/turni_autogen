@@ -1647,7 +1647,7 @@ if mode == "Indisponibilità (Medico)":
     if not st.session_state.doctor_auth_ok:
         st.markdown("### Accesso medico")
 
-        doctor = st.selectbox("1) Seleziona il tuo nome", doctors_default, index=0, key="login_doctor")
+        doctor = st.selectbox("Seleziona il tuo nome", doctors_default, index=0, key="login_doctor")
         has_pin = doctor_has_pin(doctor)
 
         otp_state_key = f"otp_state::{doctor}"
@@ -1662,7 +1662,7 @@ if mode == "Indisponibilità (Medico)":
 
         def _do_login():
             with st.form("medico_login", clear_on_submit=False):
-                pin = st.text_input("2) PIN", type="password", key="login_pin", help="Il tuo PIN personale (consigliato 4 cifre)")
+                pin = st.text_input("PIN", type="password", key="login_pin", help="Il tuo PIN personale (consigliato 4 cifre)")
                 go = st.form_submit_button("Accedi", type="primary")
             if go:
                 if verify_doctor_pin(doctor, pin):
@@ -1755,7 +1755,7 @@ if mode == "Indisponibilità (Medico)":
                 labels = [f"{lab} ({masked})" for (lab, _ch, masked) in available_channels]
                 channels = [ch for (_lab, ch, _masked) in available_channels]
                 idx = 0
-                choice = st.selectbox("2) Dove vuoi ricevere il codice?", list(range(len(channels))), format_func=lambda i: labels[i])
+                choice = st.selectbox("Dove vuoi ricevere il codice?", list(range(len(channels))), format_func=lambda i: labels[i])
                 send_btn = st.form_submit_button("Invia codice", type="primary")
             if send_btn:
                 try:
@@ -1771,9 +1771,9 @@ if mode == "Indisponibilità (Medico)":
             if otp_state.get("dest"):
                 st.info(f"Codice inviato a {otp_state.get('dest')}. Inseriscilo qui sotto per continuare.")
                 with st.form(f"otp_verify_{mode_label}", clear_on_submit=False):
-                    code = st.text_input("3) Codice (6 cifre)", key=f"otp_code_{mode_label}")
-                    new_pin = st.text_input("4) Nuovo PIN (4 cifre)", type="password", key=f"new_pin_{mode_label}")
-                    new_pin2 = st.text_input("5) Conferma nuovo PIN", type="password", key=f"new_pin2_{mode_label}")
+                    code = st.text_input("Codice (6 cifre)", key=f"otp_code_{mode_label}")
+                    new_pin = st.text_input("Nuovo PIN (4 cifre)", type="password", key=f"new_pin_{mode_label}")
+                    new_pin2 = st.text_input("Conferma nuovo PIN", type="password", key=f"new_pin2_{mode_label}")
                     ok = st.form_submit_button("Imposta PIN", type="primary")
                 if ok:
                     if not re.fullmatch(r"\d{4}", str(new_pin or "")):
@@ -1853,8 +1853,9 @@ if mode == "Indisponibilità (Medico)":
     sel_default = st.session_state.get("doctor_selected_months") or [(default_year, default_month)]
     sel_set = set(sel_default)
 
-    st.subheader("Seleziona mese/i da compilare")
-    c1, c2, c3, c4 = st.columns([1, 1.4, 1, 1])
+    st.subheader("Mese da compilare")
+    st.caption("Seleziona anno e mese, poi premi **Aggiungi mese** per visualizzare il modulo di inserimento. Puoi aggiungere più mesi.")
+    c1, c2, c3, c4 = st.columns([1, 1.4, 1.3, 1])
     with c1:
         yy_sel = st.selectbox("Anno", year_options, key="doctor_year_sel")
     with c2:
@@ -1865,9 +1866,9 @@ if mode == "Indisponibilità (Medico)":
             key="doctor_month_sel",
         )
     with c3:
-        add_month = st.button("Aggiungi", use_container_width=True, help="Aggiunge l’anno/mese selezionato all’elenco.")
+        add_month = st.button("Aggiungi mese ▶", use_container_width=True, help="Aggiunge l’anno/mese selezionato all’elenco.", type="primary")
     with c4:
-        remove_month = st.button("Rimuovi", use_container_width=True, help="Rimuove l’anno/mese selezionato dall’elenco.")
+        remove_month = st.button("Rimuovi mese", use_container_width=True, help="Rimuove l’anno/mese selezionato dall’elenco.")
 
     cur = (int(yy_sel), int(mm_sel))
     if add_month:
@@ -1878,12 +1879,11 @@ if mode == "Indisponibilità (Medico)":
     selected = sorted(sel_set)
     st.session_state.doctor_selected_months = selected
 
-    st.caption("Mesi selezionati: " + ", ".join([f"{yy}-{mm:02d}" for (yy, mm) in selected]))
     if not selected:
-        st.info("Aggiungi almeno un mese per iniziare.")
+        st.info("Seleziona anno e mese qui sopra e premi **Aggiungi mese ▶** per iniziare.")
         st.stop()
 
-    label_map = {(yy, mm): f"{yy}-{mm:02d}" for (yy, mm) in selected}
+    st.caption("Mesi selezionati: " + ", ".join([f"{month_names.get(mm, str(mm))} {yy}" for (yy, mm) in selected]))
 
     # Stable baseline (snapshot) for this editing session.
     # This is what we compare against at save-time to detect a stale editor.
@@ -1972,7 +1972,6 @@ if mode == "Indisponibilità (Medico)":
 
     st.divider()
 
-    tabs = st.tabs([label_map[x] for x in selected])
     edited_by_month = {}
     normalized_entries_by_month = {}
     violations_by_month = {}
@@ -1980,14 +1979,13 @@ if mode == "Indisponibilità (Medico)":
     # Disponibilità (preferenze): stesso pattern ma salvato separatamente
     avail_rows_by_month = {}  # (yy,mm) -> list of {date, shift}
 
-    for (yy, mm), tab in zip(selected, tabs):
-        with tab:
-            # Sub-tab: Indisponibilità | Disponibilità
-            sub_inav, sub_avail = st.tabs(["🚫 Indisponibilità", "✅ Disponibilità (preferenze)"])
-
-            with sub_inav:
-                st.caption("Inserisci i giorni in cui NON vuoi/puoi lavorare. Le righe vuote verranno ignorate.")
-                existing = ustore.filter_doctor_month(store_rows, doctor, yy, mm)
+    for (yy, mm) in selected:
+        st.markdown("---")
+        st.subheader(f"{month_names.get(mm, str(mm))} {yy}")
+        with st.container():
+            st.markdown("#### Indisponibilità")
+            st.caption("Inserisci i giorni in cui NON puoi lavorare. Le righe vuote verranno ignorate.")
+            existing = ustore.filter_doctor_month(store_rows, doctor, yy, mm)
             init = []
             conversions = []
             for r in existing:
@@ -2202,8 +2200,10 @@ if mode == "Indisponibilità (Medico)":
                 pretty = ", ".join([f"{sh}: {n}/{max_per_shift_for_doctor}" for sh, n in over.items()])
                 st.error(f"Limite superato in questo mese → {pretty}. Rimuovi alcune righe prima di salvare.")
 
-            # ── Sub-tab Disponibilità ──────────────────────────────────────────
-            with sub_avail:
+            # ── Disponibilità (preferenze) ──────────────────────────────────────────
+            st.divider()
+            st.markdown("#### Disponibilità (preferenze)")
+            with st.container():
                 max_avail = int(app_settings.get("max_availability_per_shift", 6))
                 st.caption(
                     f"Inserisci i giorni/fasce in cui **preferiresti** lavorare. "
@@ -2326,12 +2326,12 @@ if mode == "Indisponibilità (Medico)":
     any_over = any(bool(v) for v in (violations_by_month or {}).values())
     can_save = bool(unav_open) and (not any_over)
 
+    st.markdown("---")
     c1, c2 = st.columns([1, 2])
     with c1:
         save = st.button("Salva indisponibilità", type="primary", disabled=not can_save)
     with c2:
         pass
-
     render_unav_flash(doctor)
 
     if save:
