@@ -3132,12 +3132,55 @@ def write_output(
             if nd:
                 night_by_date[s.day.date] = nd
 
+    def _free_label(doc: str, unav_shifts: Set[str]) -> Optional[str]:
+        """Restituisce la stringa da scrivere in Medici liberi, o None se non disponibile.
+        - Nessuna indisponibilità → solo il nome
+        - Indisponibilità totale (Any / Tutto il giorno) → None (escluso)
+        - Indisponibilità parziale → "Nome (fasce_libere)" es. "Licordari (P, N)"
+        """
+        if not unav_shifts:
+            return doc
+        if "Any" in unav_shifts or "Tutto il giorno" in unav_shifts:
+            return None
+        # Espandi Diurno in Mattina+Pomeriggio
+        unav_exp: Set[str] = set()
+        for sh in unav_shifts:
+            if sh in ("Mattina",):
+                unav_exp.add("Mattina")
+            elif sh in ("Pomeriggio",):
+                unav_exp.add("Pomeriggio")
+            elif sh in ("Notte",):
+                unav_exp.add("Notte")
+            elif sh in ("Diurno",):
+                unav_exp.update({"Mattina", "Pomeriggio"})
+        avail_abbr = []
+        for sh, abbr in [("Mattina", "M"), ("Pomeriggio", "P"), ("Notte", "N")]:
+            if sh not in unav_exp:
+                avail_abbr.append(abbr)
+        if not avail_abbr:
+            return None  # di fatto tutto occupato
+        if len(avail_abbr) == 3:
+            return doc  # nessuna fascia rilevante bloccata
+        return f"{doc} ({', '.join(avail_abbr)})"
+
     for drow in days:
         assigned_today = assigned_by_day.get(drow.date, set())
-        unavailable_today = {d for d in all_docs if unav_map.get(d, {}).get(drow.date)}
         smontante = night_by_date.get(drow.date - dt.timedelta(days=1))
         smontanti = {smontante} if smontante else set()
-        free = sorted(list(all_docs - assigned_today - unavailable_today - smontanti), key=lambda s: s.lower())
+        free_full: List[str] = []   # completamente disponibili
+        free_partial: List[str] = []  # parzialmente disponibili (con suffisso)
+        for doc in sorted(all_docs, key=lambda s: s.lower()):
+            if doc in assigned_today or doc in smontanti:
+                continue
+            unav_shifts = unav_map.get(doc, {}).get(drow.date, set())
+            label = _free_label(doc, unav_shifts)
+            if label is None:
+                continue
+            if "(" in label:
+                free_partial.append(label)
+            else:
+                free_full.append(label)
+        free = free_full + free_partial
         ws[f"AD{drow.row_idx}"].value = free[0] if len(free) > 0 else None
         ws[f"AE{drow.row_idx}"].value = free[1] if len(free) > 1 else None
         ws[f"AF{drow.row_idx}"].value = free[2] if len(free) > 2 else None
