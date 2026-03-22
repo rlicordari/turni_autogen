@@ -2948,6 +2948,74 @@ else:
 
     st.divider()
 
+    # ── Step 6: Giorno vuoto Notte (J) — eccezioni settimanali ───────────────
+    _rJ_admin = (cfg_admin.get("rules") or {}).get("J") or {}
+    if _rJ_admin.get("thursday_blank"):
+        st.markdown("### 6) Giorno vuoto Notte (J) — eccezioni settimanali")
+        st.info(
+            "Di default ogni **giovedì** la colonna J (Notte) è vuota. "
+            "Puoi spostare il giorno vuoto in un altro giorno della settimana, "
+            "oppure non avere nessun giorno vuoto per settimane parziali.",
+            icon="🌙",
+        )
+
+        _DOW_NAMES = {0: "Lunedì", 1: "Martedì", 2: "Mercoledì", 3: "Giovedì", 4: "Venerdì", 5: "Sabato", 6: "Domenica"}
+        # Raccoglie tutte le settimane del mese con almeno un giovedì o un giorno alternativo
+        _weeks_j: dict = {}  # iso_week -> {dow_int: date}
+        for _d in range(1, _n_days_v + 1):
+            _dd = date(_yy_v, _mm_v, _d)
+            _wd = _dd.weekday()
+            _iso_w = _dd.isocalendar()[:2]
+            _weeks_j.setdefault(_iso_w, {})[_wd] = _dd
+
+        _j_blank_key = f"j_blank_{mk}"
+        if _j_blank_key not in st.session_state:
+            st.session_state[_j_blank_key] = {}  # str(iso_week) -> date string or ""
+
+        _j_blank_week_overrides = {}  # "YYYY-WNN" -> date ISO or None
+        _any_j_override = False
+        for _iso_w in sorted(_weeks_j.keys()):
+            _wdays = _weeks_j[_iso_w]
+            _thu = _wdays.get(3)  # giovedì
+            if _thu is None and not any(d in _wdays for d in range(0, 3)):
+                # Nessun giovedì e nessun giorno Mon-Wed in questo mese → salta
+                continue
+            # Opzioni: giovedì (default se presente), altri giorni, nessun vuoto
+            _label_default = f"Giovedì {_thu.strftime('%d/%m') if _thu else '(fuori mese)'} — vuoto (default)"
+            _opts: dict = {_label_default: str(_thu) if _thu else None}
+            for _wd_alt in sorted([w for w in _wdays if w != 3]):
+                _dt_alt = _wdays[_wd_alt]
+                _opts[f"{_DOW_NAMES[_wd_alt]} {_dt_alt.strftime('%d/%m')} — vuoto"] = str(_dt_alt)
+            _opts["Nessun giorno vuoto questa settimana"] = ""
+
+            _prev_val = st.session_state[_j_blank_key].get(str(_iso_w), str(_thu) if _thu else None)
+            _prev_label = next((lb for lb, val in _opts.items() if val == _prev_val), _label_default)
+
+            _week_label = f"Settimana {_iso_w[1]} ({min(_wdays.values()).strftime('%d/%m')}–{max(_wdays.values()).strftime('%d/%m')})"
+            _sel_label = st.selectbox(_week_label, list(_opts.keys()),
+                                      index=list(_opts.keys()).index(_prev_label),
+                                      key=f"j_blank_sel_{_iso_w[0]}_{_iso_w[1]}")
+            _sel_val = _opts[_sel_label]
+            st.session_state[_j_blank_key][str(_iso_w)] = _sel_val
+
+            # Costruisci chiave "YYYY-WNN" e valore per il solver
+            _wk_str = f"{_iso_w[0]}-W{_iso_w[1]:02d}"
+            # Solo se diverso dal default (giovedì presente e selezionato)
+            _is_default = (_thu is not None and _sel_val == str(_thu))
+            if not _is_default:
+                _j_blank_week_overrides[_wk_str] = _sel_val if _sel_val else None
+                _any_j_override = True
+
+        if _any_j_override:
+            _desc = []
+            for _wk, _bd in _j_blank_week_overrides.items():
+                _desc.append(f"{_wk}: {'nessun vuoto' if _bd is None else _bd}")
+            st.caption("Eccezioni J attive: " + ", ".join(_desc))
+    else:
+        _j_blank_week_overrides = {}
+
+    st.divider()
+
     # ── Contatore universitari ────────────────────────────────────────────────
     with st.expander("🎓 Contatore turni universitari", expanded=False):
         try:
@@ -3064,6 +3132,7 @@ else:
                     fixed_assignments=fixed_assignments_list if fixed_assignments_list else None,
                     availability_preferences=all_avail_prefs if all_avail_prefs else None,
                     v_double_overrides=_v_double_overrides_list if _v_double_overrides_list else None,
+                    j_blank_week_overrides=_j_blank_week_overrides if _j_blank_week_overrides else None,
                 )
 
                 status.update(label="Completato ✅", state="complete")

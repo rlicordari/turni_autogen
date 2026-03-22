@@ -917,7 +917,7 @@ def apply_unavailability(allowed: List[str], day: DayRow, shift: str, unav: Dict
             continue
         out.append(doc)
     return out
-def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date, Set[str]]], fixed_assignments: Optional[List[dict]] = None, v_double_overrides: Optional[List[str]] = None) -> List[Slot]:
+def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date, Set[str]]], fixed_assignments: Optional[List[dict]] = None, v_double_overrides: Optional[List[str]] = None, j_blank_week_overrides: Optional[Dict[str, Optional[str]]] = None) -> List[Slot]:
     """
     Converts YAML column rules into per-day slots.
     Handles exception days (festivi) by merging D+E and H+I, and merging E+G always.
@@ -970,6 +970,18 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                 forced_de_by_date[fa_date] = fa_doc
             elif fa_col == "H" and fa_doc in doctors_set:
                 forced_hi_by_date[fa_date] = fa_doc
+        except Exception:
+            pass
+
+    # PRE-PROCESSA j_blank_week_overrides: per settimana, qual è il giorno in cui J è vuota
+    # Formato chiave: "YYYY-WNN" (es. "2026-W16"), valore: data ISO o None (= nessun vuoto)
+    _j_week_ov: Dict[tuple, Optional[dt.date]] = {}
+    for _wk_str, _bd_str in (j_blank_week_overrides or {}).items():
+        try:
+            _parts = str(_wk_str).split("-W")
+            _iso_key = (int(_parts[0]), int(_parts[1]))
+            _blank_d = dt.date.fromisoformat(str(_bd_str).strip()) if _bd_str else None
+            _j_week_ov[_iso_key] = _blank_d
         except Exception:
             pass
 
@@ -1102,32 +1114,30 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
         if "J" in rules:
             rJ = rules["J"]
             # Data di override (es. "2026-03-04" per mercoledì 4 marzo al posto di giovedì 5)
-            _j_override_raw = (cfg.get("global_constraints") or {}).get("j_blank_override_date")
-            _j_override_date = None
-            if _j_override_raw:
-                try:
-                    _j_override_date = dt.date.fromisoformat(str(_j_override_raw))
-                except Exception:
-                    pass
-            # Salta questo giorno in J se:
-            # a) è il giovedì normale (thursday_blank=true) E non c'è un override attivo per questa settimana
-            # b) è esattamente la data di override (es. mercoledì 4 marzo)
-            _is_normal_thu_blank = rJ.get("thursday_blank", False) and day.dow == "Thu"
-            _is_override_blank = (_j_override_date is not None and day.date == _j_override_date)
-            # Se è il giovedì nella stessa settimana dell'override, NON saltarlo (perché lo fa la data di override)
-            _thu_suppressed_by_override = False
-            if _j_override_date is not None and day.dow == "Thu":
-                # Sopprime il giovedì blank se l'override è nella stessa settimana (lun-dom)
-                import datetime as _dt3
-                # Numero di giorni dal lunedì per il giovedì corrente
-                _thu_weekday = day.date.weekday()  # 3 = Thu
-                _thu_week_mon = day.date - _dt3.timedelta(days=_thu_weekday)
-                # Numero di giorni dal lunedì per la data di override
-                _ov_weekday = _j_override_date.weekday()
-                _ov_week_mon = _j_override_date - _dt3.timedelta(days=_ov_weekday)
-                if _thu_week_mon == _ov_week_mon:
-                    _thu_suppressed_by_override = True
-            _skip_j = (_is_normal_thu_blank and not _thu_suppressed_by_override) or _is_override_blank
+            _week_key_j = day.date.isocalendar()[:2]
+            if _week_key_j in _j_week_ov:
+                # Override UI: questa settimana ha un'impostazione specifica
+                _ui_blank_d = _j_week_ov[_week_key_j]
+                _skip_j = (_ui_blank_d is not None and day.date == _ui_blank_d)
+            else:
+                # Comportamento default: giovedì vuoto + eventuale override YAML
+                _j_override_raw = (cfg.get("global_constraints") or {}).get("j_blank_override_date")
+                _j_override_date = None
+                if _j_override_raw:
+                    try:
+                        _j_override_date = dt.date.fromisoformat(str(_j_override_raw))
+                    except Exception:
+                        pass
+                _is_normal_thu_blank = rJ.get("thursday_blank", False) and day.dow == "Thu"
+                _is_override_blank = (_j_override_date is not None and day.date == _j_override_date)
+                _thu_suppressed_by_override = False
+                if _j_override_date is not None and day.dow == "Thu":
+                    import datetime as _dt3
+                    _thu_week_mon = day.date - _dt3.timedelta(days=day.date.weekday())
+                    _ov_week_mon = _j_override_date - _dt3.timedelta(days=_j_override_date.weekday())
+                    if _thu_week_mon == _ov_week_mon:
+                        _thu_suppressed_by_override = True
+                _skip_j = (_is_normal_thu_blank and not _thu_suppressed_by_override) or _is_override_blank
             if not _skip_j:
                 # Se esiste un fixed_assignment in J per questo giorno,
                 # lo slot usa SOLO quel medico — l'indisponibilità viene ignorata
@@ -3495,6 +3505,7 @@ def solve_across_months(
     fixed_assignments: Optional[List[dict]] = None,
     availability_preferences: Optional[List[dict]] = None,
     v_double_overrides: Optional[List[str]] = None,
+    j_blank_week_overrides: Optional[Dict[str, Optional[str]]] = None,
 ) -> Tuple[List[Slot], Dict[str, Optional[str]], Dict]:
     """Solve schedules month-by-month and merge.
 
@@ -3568,7 +3579,7 @@ def solve_across_months(
             if d is not None and d.year == yy and d.month == mm:
                 fixed_m.append(f)
 
-        slots_m = slots_for_month(cfg, days_m, local_unav, fixed_assignments=fixed_m, v_double_overrides=v_double_overrides)
+        slots_m = slots_for_month(cfg, days_m, local_unav, fixed_assignments=fixed_m, v_double_overrides=v_double_overrides, j_blank_week_overrides=j_blank_week_overrides)
         avail_m = []
         for a in (availability_preferences or []):
             d = _parse_iso_date(str(a.get("date", "")))
@@ -3703,6 +3714,7 @@ def generate_schedule(
     fixed_assignments: Optional[List[dict]] = None,
     availability_preferences: Optional[List[dict]] = None,
     v_double_overrides: Optional[List[str]] = None,
+    j_blank_week_overrides: Optional[Dict[str, Optional[str]]] = None,
 ):
     """Generate schedules without Tkinter.
 
@@ -3735,6 +3747,7 @@ def generate_schedule(
         cfg, days, unav_map,
         carryover_by_month=carryover_by_month,
         v_double_overrides=v_double_overrides,
+        j_blank_week_overrides=j_blank_week_overrides,
         fixed_assignments=fixed_assignments,
         availability_preferences=availability_preferences,
     )
