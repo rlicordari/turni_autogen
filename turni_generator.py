@@ -917,7 +917,7 @@ def apply_unavailability(allowed: List[str], day: DayRow, shift: str, unav: Dict
             continue
         out.append(doc)
     return out
-def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date, Set[str]]], fixed_assignments: Optional[List[dict]] = None) -> List[Slot]:
+def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date, Set[str]]], fixed_assignments: Optional[List[dict]] = None, v_double_overrides: Optional[List[str]] = None) -> List[Slot]:
     """
     Converts YAML column rules into per-day slots.
     Handles exception days (festivi) by merging D+E and H+I, and merging E+G always.
@@ -972,6 +972,18 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                 forced_hi_by_date[fa_date] = fa_doc
         except Exception:
             pass
+
+    # PRE-PROCESSA v_double_overrides: date esatte in cui V è in doppio (al posto del venerdì)
+    # Se quella settimana ha un override, il venerdì di quella settimana diventa turno singolo.
+    _v_override_dates: Set[dt.date] = set()
+    if v_double_overrides:
+        for _ds in v_double_overrides:
+            try:
+                _v_override_dates.add(dt.date.fromisoformat(str(_ds).strip()))
+            except Exception:
+                pass
+    # ISO week keys delle settimane che hanno un override
+    _v_override_weeks: Set[tuple] = {d.isocalendar()[:2] for d in _v_override_dates}
 
     slots: List[Slot] = []
     def mk_allowed(pool: List[str]) -> List[str]:
@@ -1157,7 +1169,7 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
             allowed = apply_unavailability(allowed, day, "Mattina", unav)
             slots.append(Slot(day, f"{day.date}-K", ["K"], allowed, required=True, shift="Mattina", rule_tag="K"))
         # ---- L Padiglioni (Mon-Wed)
-        if "L" in rules:
+        if "L" in rules and not festivo:
             rL = rules["L"]
             if dayspec_contains(day.dow, rL.get("days")):
                 pool = mk_allowed(rL.get("pool_other") or [])
@@ -1168,14 +1180,14 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                 req, bp = req_and_blank("L")
                 slots.append(Slot(day, f"{day.date}-L", ["L"], pool, required=req, blank_penalty=bp, shift="Mattina", rule_tag="L"))
         # ---- Q Eco base (Mon-Sat)
-        if "Q" in rules:
+        if "Q" in rules and not festivo:
             r = rules["Q"]
             if dayspec_contains(day.dow, r.get("days")):
                 pool = mk_allowed(r.get("pool") or [])
                 pool = apply_unavailability(pool, day, "Mattina", unav)
                 slots.append(Slot(day, f"{day.date}-Q", ["Q"], pool, required=True, shift="Mattina", rule_tag="Q"))
         # ---- R (Mon-Fri)
-        if "R" in rules:
+        if "R" in rules and not festivo:
             r = rules["R"]
             if dayspec_contains(day.dow, r.get("days")):
                 pool = mk_allowed(r.get("pool") or [])
@@ -1183,7 +1195,7 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                 req, bp = req_and_blank("R")
                 slots.append(Slot(day, f"{day.date}-R", ["R"], pool, required=req, blank_penalty=bp, shift="Mattina", rule_tag="R"))
         # ---- S (Wed, optional if can be absorbed in R)
-        if "S" in rules:
+        if "S" in rules and not festivo:
             r = rules["S"]
             if dayspec_contains(day.dow, r.get("days") or r.get("day")):
                 pool = mk_allowed(r.get("pool") or [])
@@ -1191,14 +1203,14 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                 required = not bool(r.get("if_not_dedicated_put_in_R", False))
                 slots.append(Slot(day, f"{day.date}-S", ["S"], pool, required=required, shift="Mattina", rule_tag="S"))
         # ---- T Interni (Mon-Sat)
-        if "T" in rules and not merge_KT_sat:
+        if "T" in rules and not merge_KT_sat and not festivo:
             r = rules["T"]
             if dayspec_contains(day.dow, r.get("days")):
                 pool = mk_allowed(r.get("pool") or [])
                 pool = apply_unavailability(pool, day, "Mattina", unav)
                 slots.append(Slot(day, f"{day.date}-T", ["T"], pool, required=True, shift="Mattina", rule_tag="T"))
         # ---- U Contr.PM (Mon-Tue)
-        if "U" in rules:
+        if "U" in rules and not festivo:
             r = rules["U"]
             if dayspec_contains(day.dow, r.get("days")):
                 pool = mk_allowed(r.get("pool") or [])
@@ -1219,21 +1231,26 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                         if restricted:  # applica solo se almeno uno è disponibile
                             pool = restricted
                 slots.append(Slot(day, f"{day.date}-U", ["U"], pool, required=True, shift="Mattina", rule_tag="U"))
-        # ---- V Sala PM (Mon,Wed,Fri) – il Venerdì: 2 medici (CREA + (DATTILO|ALLEGRA))
-        if "V" in rules:
+        # ---- V Sala PM (Mon,Wed,Fri)
+        # Default: venerdì = turno doppio (Crea + Dattilo|Allegra), lun/mer = singolo.
+        # Override admin: se un lunedì o mercoledì è in _v_override_dates, quella settimana
+        # il doppio è su quel giorno e il venerdì diventa singolo.
+        if "V" in rules and not festivo:
             r = rules["V"]
             if dayspec_contains(day.dow, r.get("days")):
                 pool_base = mk_allowed(r.get("pool") or [])
                 pool_base = apply_unavailability(pool_base, day, "Mattina", unav)
-                if day.dow == "Fri":
+                # Determina se questo giorno è il "turno doppio" della settimana
+                _week_key = day.date.isocalendar()[:2]
+                _is_override_double = day.date in _v_override_dates
+                _is_default_double = (day.dow == "Fri") and (_week_key not in _v_override_weeks)
+                _is_double_day = _is_override_double or _is_default_double
+                if _is_double_day:
                     crea = norm_name(r.get("friday_required_doctor") or "Crea")
                     pool_crea = [crea] if crea in pool_base else []
                     other_allowed = {norm_name("Dattilo"), norm_name("Allegra")}
                     pool_other = [d for d in pool_base if norm_name(d) in other_allowed and norm_name(d) != crea]
-                    # Venerdì: devono esserci SEMPRE 2 medici e le sole combinazioni ammesse sono:
-                    #   CREA + DATTILO  oppure  CREA + ALLEGRA
-                    # Se CREA (o il secondo medico) non è disponibile, lasciamo l'intera colonna V vuota
-                    # (entrambi gli slot) e lo segnaliamo nel log come "blank V".
+                    # Turno doppio: solo se entrambi i pool sono non vuoti
                     if (not pool_crea) or (not pool_other):
                         pool_crea = []
                         pool_other = []
@@ -1242,7 +1259,7 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                 else:
                     slots.append(Slot(day, f"{day.date}-V", ["V"], pool_base, required=True, shift="Mattina", rule_tag="V"))
         # ---- Z Vascolare (Wed,Fri)
-        if "Z" in rules:
+        if "Z" in rules and not festivo:
             r = rules["Z"]
             if dayspec_contains(day.dow, r.get("days")):
                 pool = mk_allowed(r.get("pool") or [])
@@ -1272,7 +1289,7 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
         # Requirement:
         #  - Every Monday: 1 doctor among other_pool
         #  - PLUS: on exactly 2 Mondays: also 'Recupero' (appended in the same cell)
-        if "Y" in rules:
+        if "Y" in rules and not festivo:
             r = rules["Y"]
             if dayspec_contains(day.dow, r.get("days") or r.get("day")):
                 # Main doctor (always required)
@@ -1280,7 +1297,7 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                 pool_main = apply_unavailability(pool_main, day, "Mattina", unav)
                 slots.append(Slot(day, f"{day.date}-Y", ["Y"], pool_main, required=True, shift="Mattina", rule_tag="Y_MAIN"))
         # ---- AB Holter/Brugada/FA (Thu)
-        if "AB" in rules:
+        if "AB" in rules and not festivo:
             r = rules["AB"]
             if r.get("weekly", False) and dayspec_contains(day.dow, r.get("fixed_day")):
                 # MODIFICA 5: nessuna preferenza per Crea il giovedì — pool bilanciato
@@ -1301,7 +1318,7 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                 pool_sat = apply_unavailability(pool_sat, day, "Mattina", unav)
                 slots.append(Slot(day, f"{day.date}-AB_SAT", ["AB"], pool_sat, required=False, shift="Mattina", rule_tag="AB_SAT"))
         # ---- AC Scintigrafia (Tue/Wed fixed)
-        if "AC" in rules:
+        if "AC" in rules and not festivo:
             r = rules["AC"]
             if dayspec_contains(day.dow, r.get("days")):
                 fixed = norm_name(r.get("fixed") or "")
@@ -1557,17 +1574,26 @@ def solve_with_ortools(
         "notte": "Notte", "night": "Notte",
         "diurno": "Diurno", "day": "Diurno",
     }
-    AVAIL_PENALTY = 3000  # penalità per non rispettare la preferenza
+    # Penalità per disponibilità non rispettata.
+    # Calibrata sopra le penalità strutturali (df_share=8000, outside_pair=6000,
+    # missing_pair_doc=12000, prefer_df_share=15000) ma sotto BLANK_REQUIRED (5M).
+    # La priorità "alta" vale 2x, "bassa" vale 0.4x.
+    AVAIL_PENALTY_BASE = 25_000
+    AVAIL_PRIORITY_MULT = {"alta": 2.0, "alta priority": 2.0, "media": 1.0, "bassa": 0.4}
+    pref_skipped_log: list = []
     for ap in (availability_preferences or []):
         try:
             ap_date = dt.date.fromisoformat(str(ap.get("date","")).strip())
             ap_doc = norm_name(str(ap.get("doctor","")).strip())
             ap_shift_raw = str(ap.get("shift","")).strip().lower()
             ap_shift = SHIFT_MAP_AVAIL.get(ap_shift_raw, ap_shift_raw.capitalize())
+            ap_priority = str(ap.get("priority", "media")).strip().lower()
         except Exception:
             continue
         if ap_doc not in doc_to_idx:
             continue
+        mult = AVAIL_PRIORITY_MULT.get(ap_priority, 1.0)
+        penalty = int(AVAIL_PENALTY_BASE * mult)
         # Raccoglie tutti i vars dello slot per quella fascia in quel giorno
         ap_vars = []
         for s in slots_by_day.get(ap_date, []):
@@ -1582,7 +1608,14 @@ def solve_with_ortools(
             model.AddMaxEquality(b_avail, ap_vars)
             not_avail = model.NewBoolVar(f"notavail_{ap_date}_{hash(ap_doc)%10**6}_{ap_shift}")
             model.Add(not_avail + b_avail == 1)
-            extra_obj.append(AVAIL_PENALTY * not_avail)
+            extra_obj.append(penalty * not_avail)
+        else:
+            pref_skipped_log.append(
+                f"  AVAIL SKIP {ap_doc} {ap_date} {ap_shift}: non in nessuno slot ammesso"
+            )
+    if pref_skipped_log:
+        logger.warning("Preferenze disponibilità non applicabili (medico fuori pool):\n%s",
+                       "\n".join(pref_skipped_log))
 
 
     # Uniqueness per day: one doctor max 1 slot/day (exceptions already handled by merged columns)
@@ -3461,6 +3494,7 @@ def solve_across_months(
     carryover_by_month: Optional[dict] = None,
     fixed_assignments: Optional[List[dict]] = None,
     availability_preferences: Optional[List[dict]] = None,
+    v_double_overrides: Optional[List[str]] = None,
 ) -> Tuple[List[Slot], Dict[str, Optional[str]], Dict]:
     """Solve schedules month-by-month and merge.
 
@@ -3534,7 +3568,7 @@ def solve_across_months(
             if d is not None and d.year == yy and d.month == mm:
                 fixed_m.append(f)
 
-        slots_m = slots_for_month(cfg, days_m, local_unav, fixed_assignments=fixed_m)
+        slots_m = slots_for_month(cfg, days_m, local_unav, fixed_assignments=fixed_m, v_double_overrides=v_double_overrides)
         avail_m = []
         for a in (availability_preferences or []):
             d = _parse_iso_date(str(a.get("date", "")))
@@ -3668,6 +3702,7 @@ def generate_schedule(
     carryover_by_month: Optional[dict] = None,
     fixed_assignments: Optional[List[dict]] = None,
     availability_preferences: Optional[List[dict]] = None,
+    v_double_overrides: Optional[List[str]] = None,
 ):
     """Generate schedules without Tkinter.
 
@@ -3699,6 +3734,7 @@ def generate_schedule(
     slots, assignment, stats = solve_across_months(
         cfg, days, unav_map,
         carryover_by_month=carryover_by_month,
+        v_double_overrides=v_double_overrides,
         fixed_assignments=fixed_assignments,
         availability_preferences=availability_preferences,
     )

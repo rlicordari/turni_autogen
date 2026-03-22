@@ -2355,7 +2355,21 @@ if mode == "Indisponibilità (Medico)":
                         if r.get("Data") and r.get("Fascia")
                     ]
                 else:
-                    st.info("Inserimento chiuso dall'amministratore.")
+                    # Read-only view when the admin closes submissions
+                    _existing_ro = ustore.filter_doctor_month(avail_store_rows, doctor, yy, mm)
+                    if _existing_ro:
+                        _ro_df = [
+                            {
+                                "Data": r.get("date", ""),
+                                "Fascia": r.get("shift", ""),
+                                "Note": r.get("note", ""),
+                            }
+                            for r in _existing_ro
+                        ]
+                        st.info("🔒 Inserimento chiuso dall'amministratore. Visualizzazione in sola lettura.")
+                        st.dataframe(_ro_df, use_container_width=True, hide_index=True)
+                    else:
+                        st.info("🔒 Inserimento chiuso dall'amministratore. Nessuna preferenza salvata per questo mese.")
 
     if save:
         if not unav_open:
@@ -2871,6 +2885,69 @@ else:
 
     st.divider()
 
+    # ── Step 5: Turno doppio Sala PM (V) ──────────────────────────────────────
+    st.markdown("### 5) Turno doppio Sala PM (V) — eccezioni settimanali")
+    st.info(
+        "Di default ogni **venerdì** ha il turno doppio in V (Crea + Dattilo o Allegra). "
+        "Se una settimana gli interventi richiedono il doppio in un altro giorno, "
+        "seleziona quel giorno: il venerdì di quella settimana diventerà turno singolo.",
+        icon="🔬",
+    )
+
+    import calendar as _calendar
+    _yy_v, _mm_v = int(year), int(month)
+    _n_days_v = _calendar.monthrange(_yy_v, _mm_v)[1]
+    # Raccogli tutti i giorni del mese per V (lun=0, mer=2, ven=4)
+    _V_WEEKDAYS = {0: "Lunedì", 2: "Mercoledì", 4: "Venerdì"}
+    # Raggruppa per settimana ISO
+    _weeks_v: dict = {}  # iso_week -> {dow_int: date}
+    for _d in range(1, _n_days_v + 1):
+        _dd = date(_yy_v, _mm_v, _d)
+        _wd = _dd.weekday()
+        if _wd in _V_WEEKDAYS:
+            _iso_w = _dd.isocalendar()[:2]
+            _weeks_v.setdefault(_iso_w, {})[_wd] = _dd
+
+    _v_double_key = f"v_double_{mk}"
+    if _v_double_key not in st.session_state:
+        st.session_state[_v_double_key] = {}  # iso_week -> selected date (or None = venerdì default)
+
+    _v_double_overrides_list = []  # date ISO strings
+    _any_v_override = False
+    for _iso_w in sorted(_weeks_v.keys()):
+        _wdays = _weeks_v[_iso_w]
+        # Venerdì di questa settimana (potrebbe non essere nel mese)
+        _fri = _wdays.get(4)
+        # Giorni alternativi (lun, mer) presenti nel mese
+        _alt_days = {_wd: _dt for _wd, _dt in _wdays.items() if _wd != 4}
+        if not _alt_days:
+            # Solo venerdì in questo mese per questa settimana → niente da scegliere
+            continue
+        # Opzioni: venerdì (default) + giorni alternativi
+        _label_default = f"Venerdì {_fri.strftime('%d/%m') if _fri else '(fuori mese)'} — doppio (default)"
+        _options = {_label_default: None}
+        for _wd_alt, _dt_alt in sorted(_alt_days.items()):
+            _options[f"{_V_WEEKDAYS[_wd_alt]} {_dt_alt.strftime('%d/%m')} — doppio (invece del venerdì)"] = _dt_alt
+
+        _prev = st.session_state[_v_double_key].get(str(_iso_w))
+        _prev_label = next((lb for lb, val in _options.items() if val == _prev), _label_default)
+        _sel_label = st.selectbox(
+            f"Settimana {_iso_w[1]} ({min(_wdays.values()).strftime('%d/%m')}–{max(_wdays.values()).strftime('%d/%m')})",
+            list(_options.keys()),
+            index=list(_options.keys()).index(_prev_label),
+            key=f"v_double_sel_{_iso_w[0]}_{_iso_w[1]}",
+        )
+        _sel_date = _options[_sel_label]
+        st.session_state[_v_double_key][str(_iso_w)] = _sel_date
+        if _sel_date is not None:
+            _v_double_overrides_list.append(str(_sel_date))
+            _any_v_override = True
+
+    if _any_v_override:
+        st.caption("Eccezioni attive: " + ", ".join(_v_double_overrides_list))
+
+    st.divider()
+
     # ── Contatore universitari ────────────────────────────────────────────────
     with st.expander("🎓 Contatore turni universitari", expanded=False):
         try:
@@ -2986,6 +3063,7 @@ else:
                     carryover_by_month=carryover_by_month if carryover_by_month else None,
                     fixed_assignments=fixed_assignments_list if fixed_assignments_list else None,
                     availability_preferences=all_avail_prefs if all_avail_prefs else None,
+                    v_double_overrides=_v_double_overrides_list if _v_double_overrides_list else None,
                 )
 
                 status.update(label="Completato ✅", state="complete")
