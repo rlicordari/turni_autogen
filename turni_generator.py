@@ -954,14 +954,24 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
     # lo stesso giorno (night_off same_day). Li trattiamo come indisponibilità temporanee
     # per la costruzione dell'allowed D/F.
     forced_j_by_date: Dict[dt.date, Set[str]] = {}
+    forced_de_by_date: Dict[dt.date, str] = {}  # sorteggio DE (Mattina) festivi
+    forced_hi_by_date: Dict[dt.date, str] = {}  # sorteggio HI (Pomeriggio) festivi
     for fa in (fixed_assignments or []):
-        if str(fa.get("column","")).strip().upper() == "J":
-            try:
-                fa_date = dt.date.fromisoformat(str(fa.get("date","")).strip())
-                fa_doc = norm_name(str(fa.get("doctor","")).strip())
+        fa_col = str(fa.get("column","")).strip().upper()
+        try:
+            fa_date = dt.date.fromisoformat(str(fa.get("date","")).strip())
+            fa_doc = norm_name(str(fa.get("doctor","")).strip())
+            if fa_col == "J":
                 forced_j_by_date.setdefault(fa_date, set()).add(fa_doc)
-            except Exception:
-                pass
+            elif fa_col == "D" and fa_doc in doctors_set:
+                # Il medico sorteggiato potrebbe non essere nel pool Festivi (es. Grimaldi, Calabrò)
+                # → lo registriamo qui per usarlo come unico allowed nel slot DE,
+                #   evitando il conflitto sum(allowed)==0 == 1 nel CP-SAT.
+                forced_de_by_date[fa_date] = fa_doc
+            elif fa_col == "H" and fa_doc in doctors_set:
+                forced_hi_by_date[fa_date] = fa_doc
+        except Exception:
+            pass
 
     slots: List[Slot] = []
     def mk_allowed(pool: List[str]) -> List[str]:
@@ -982,28 +992,37 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
             slots.append(Slot(day, f"{day.date}-C", ["C"], pool, required=True, shift="Any", rule_tag="C_reperibilita"))
         # ---- Morning D/F and E/G and Afternoon H/I depend on festivo
         if festivo:
-            # DE unified (D+E) – required
-            # IMPORTANT: per le domeniche/festivi NON usare le regole D/F (Grimaldi/Calabrò)
-            # ma un pool dedicato (se disponibile) coerente con la sezione "Domeniche e festivi".
             rFest = rules.get("Festivi", {}) if isinstance(rules.get("Festivi", {}), dict) else {}
             fest_excl = {norm_name(x) for x in (rFest.get("excluded") or [])}
-            fest_pool_m = rFest.get("pool_mattina") or rFest.get("pool") or []
-            allowed_de = mk_allowed(fest_pool_m)
-            if not allowed_de:
-                # fallback conservativo: tutti tranne Recupero
-                allowed_de = [d for d in doctors_all if d != "Recupero" and d not in fest_excl]
+
+            # DE unified (D+E) – required
+            # Se c'è un medico sorteggiato (anche escluso dal pool Festivi, es. Grimaldi/Calabrò),
+            # lo mettiamo come UNICO allowed per evitare sum(allowed)==0==1 nel CP-SAT.
+            _forced_de = forced_de_by_date.get(day.date)
+            if _forced_de:
+                allowed_de = [_forced_de]
             else:
-                allowed_de = [d for d in allowed_de if d not in fest_excl]
-            allowed_de = apply_unavailability(allowed_de, day, "Mattina", unav)
+                fest_pool_m = rFest.get("pool_mattina") or rFest.get("pool") or []
+                allowed_de = mk_allowed(fest_pool_m)
+                if not allowed_de:
+                    allowed_de = [d for d in doctors_all if d != "Recupero" and d not in fest_excl]
+                else:
+                    allowed_de = [d for d in allowed_de if d not in fest_excl]
+                allowed_de = apply_unavailability(allowed_de, day, "Mattina", unav)
             slots.append(Slot(day, f"{day.date}-DE", ["D","E"], allowed_de, required=True, shift="Mattina", rule_tag="Festivo_DE"))
+
             # HI unified (H+I) – required
-            fest_pool_p = rFest.get("pool_pomeriggio") or rFest.get("pool") or []
-            allowed_hi = mk_allowed(fest_pool_p)
-            if not allowed_hi:
-                allowed_hi = [d for d in doctors_all if d != "Recupero" and d not in fest_excl]
+            _forced_hi = forced_hi_by_date.get(day.date)
+            if _forced_hi:
+                allowed_hi = [_forced_hi]
             else:
-                allowed_hi = [d for d in allowed_hi if d not in fest_excl]
-            allowed_hi = apply_unavailability(allowed_hi, day, "Pomeriggio", unav)
+                fest_pool_p = rFest.get("pool_pomeriggio") or rFest.get("pool") or []
+                allowed_hi = mk_allowed(fest_pool_p)
+                if not allowed_hi:
+                    allowed_hi = [d for d in doctors_all if d != "Recupero" and d not in fest_excl]
+                else:
+                    allowed_hi = [d for d in allowed_hi if d not in fest_excl]
+                allowed_hi = apply_unavailability(allowed_hi, day, "Pomeriggio", unav)
             slots.append(Slot(day, f"{day.date}-HI", ["H","I"], allowed_hi, required=True, shift="Pomeriggio", rule_tag="Festivo_HI"))
         else:
             # D / F (Mon-Sat)
@@ -1461,14 +1480,23 @@ def solve_with_ortools(
             if d not in doc_to_idx:
                 continue
             x[(s.slot_id, d)] = model.NewBoolVar(f"x_{hash(s.slot_id)%10**8}_{hash(d)%10**8}")
-    # Slot assignment constraints
+    # Slot assignment constraints.
+    # Required slots use a "soft-required" approach: sum(vars) + b_blank == 1.
+    # b_blank == 1 means the slot is left empty (penalized at 5_000_000).
+    # This makes the model ALWAYS feasible and lets the solver identify
+    # which slots genuinely cannot be filled (they show up blank in the output).
+    BLANK_REQUIRED_PENALTY = 5_000_000
+    blank_required_vars: Dict[str, object] = {}  # slot_id -> b_blank var (for diagnostics)
     for s in slots:
         vars_ = [x[(s.slot_id, d)] for d in s.allowed if (s.slot_id, d) in x]
         if not vars_:
-            # optional slot can be blank
+            # No eligible doctors at all → slot will be blank (no variable to add penalty to)
             continue
         if s.required:
-            model.Add(sum(vars_) == 1)
+            b_blank = model.NewBoolVar(f"blank_req_{hash(s.slot_id)%10**8}")
+            model.Add(sum(vars_) + b_blank == 1)
+            extra_obj.append(BLANK_REQUIRED_PENALTY * b_blank)
+            blank_required_vars[s.slot_id] = b_blank
         else:
             # Optional slot: can be left blank. If blank_penalty>0, we penalize blanks so it is used only as a last resort.
             if getattr(s, "blank_penalty", 0) and int(getattr(s, "blank_penalty", 0)) > 0:
@@ -2707,7 +2735,21 @@ def solve_with_ortools(
     solver.parameters.num_search_workers = 8
     status = solver.Solve(model)
     if status not in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
-        raise RuntimeError("No feasible schedule found with given rules/unavailability.")
+        # Model is truly infeasible even with soft-required slack variables.
+        # This should not happen in normal operation; raise with diagnostics.
+        raise RuntimeError(
+            "No feasible schedule found even with relaxed constraints. "
+            "Controlla vincoli hard (quotas J, pattern D/F, uniqueness) e fixed_assignments."
+        )
+    # Identify required slots left blank (b_blank == 1) for diagnostics
+    forced_blank_slots: List[str] = []
+    for sid, bv in blank_required_vars.items():
+        try:
+            if solver.Value(bv) == 1:
+                forced_blank_slots.append(sid)
+        except Exception:
+            pass
+
     assignment: Dict[str, Optional[str]] = {s.slot_id: None for s in slots}
     for s in slots:
         chosen = None
@@ -2717,11 +2759,19 @@ def solve_with_ortools(
                 chosen = d
                 break
         assignment[s.slot_id] = chosen
+    has_forced_blanks = bool(forced_blank_slots)
     stats = {
         "status": "OPTIMAL" if status == cp_model.OPTIMAL else "FEASIBLE",
         "objective": solver.ObjectiveValue(),
         "warnings": pre_solve_warnings,
     }
+    if has_forced_blanks:
+        stats["status"] = "PARTIAL"
+        stats["forced_blank_slots"] = sorted(forced_blank_slots)
+        stats.setdefault("warnings", []).append(
+            f"{len(forced_blank_slots)} slot obbligatori lasciati vuoti (infeasible): "
+            + ", ".join(sorted(forced_blank_slots))
+        )
 
     # Diagnostics for the "2 lunedì" rule (do not affect feasibility).
     MonT_used_rec = 0
@@ -3377,6 +3427,12 @@ def write_solver_log(out_path: Path, stats: Dict) -> Optional[Path]:
                 lines.append(f"autorelax: {sm.get('autorelax')}")
             if sm.get("solver_error"):
                 lines.append(f"solver_error: {sm.get('solver_error')}")
+            # Slot obbligatori lasciati bianchi (PARTIAL)
+            fbs = sm.get("forced_blank_slots") or []
+            if fbs:
+                lines.append(f"ATTENZIONE: {len(fbs)} slot obbligatori NON coperti (infeasible parziale):")
+                for sid in fbs:
+                    lines.append(f"  - {sid}")
             # Relief used
             ru = sm.get("relief_used") or {}
             if ru.get("kt_share_days") or ru.get("blank_columns"):
@@ -3517,6 +3573,8 @@ def solve_across_months(
         st = str(stats_m.get("status", "")).upper()
         if "INFEAS" in st:
             stats_all["status"] = "INFEASIBLE"
+        elif "PARTIAL" in st:
+            stats_all["status"] = "PARTIAL"
         elif stats_all.get("status") == "OK" and "FEAS" in st:
             stats_all["status"] = "FEASIBLE"
 
