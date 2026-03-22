@@ -1614,8 +1614,8 @@ def solve_with_ortools(
                 f"  AVAIL SKIP {ap_doc} {ap_date} {ap_shift}: non in nessuno slot ammesso"
             )
     if pref_skipped_log:
-        logger.warning("Preferenze disponibilità non applicabili (medico fuori pool):\n%s",
-                       "\n".join(pref_skipped_log))
+        print("WARNING: Preferenze disponibilità non applicabili (medico fuori pool):\n" +
+              "\n".join(pref_skipped_log))
 
 
     # Uniqueness per day: one doctor max 1 slot/day (exceptions already handled by merged columns)
