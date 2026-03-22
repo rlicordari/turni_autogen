@@ -1248,8 +1248,8 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                 pool = mk_allowed(r.get("pool") or [])
                 pool = apply_unavailability(pool, day, "Mattina", unav)
                 slots.append(Slot(day, f"{day.date}-Z", ["Z"], pool, required=True, shift="Mattina", rule_tag="Z"))
-        # ---- W Ergometria/CPET (Mon-Fri; Tue fixed)
-        if "W" in rules:
+        # ---- W Ergometria/CPET (Mon-Fri; Tue fixed) — escluso nei festivi
+        if "W" in rules and not festivo:
             r = rules["W"]
             if day.dow in ["Mon","Tue","Wed","Thu","Fri"]:
                 if day.dow == "Tue" and r.get("tuesday_fixed"):
