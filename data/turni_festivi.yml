@@ -1,0 +1,316 @@
+# ============================================================
+# Turni festivi pre-assegnati per SORTEGGIO
+# Fonte: "SORTEGGI FESTIVI 2026 fino e compresa Pasquetta 2027"
+# Aggiornato: 2026-03-22
+# ============================================================
+#
+# Per aggiornare con il prossimo estratto:
+#   1. Sostituire le voci in 'entries' con i nuovi dati
+#   2. Aggiornare 'festivi_extra' se emergono nuovi festivi locali
+#   3. Il campo 'shift' accetta: Mattina | Pomeriggio | Notte
+#      Mapping colonne → Mattina=D (slot DE sui festivi), Pomeriggio=H (slot HI), Notte=J
+#
+# Nota: i prefestivi (Pre-Pasqua, Pre-Liberazione, ecc.) sono giorni
+# normali nel solver — solo la Notte (J) viene pre-assegnata.
+# ============================================================
+
+# Festivi locali/extra da trattare come festivo (slot DE+HI invece di D/F/E/G/H/I)
+festivi_extra:
+  - "2026-06-03"  # Madonna della Lettera (festivo locale Messina)
+  - "2026-12-31"  # S. Silvestro (trattato come festivo)
+
+entries:
+
+  # ── Aprile 2026 ────────────────────────────────────────────
+  - date: "2026-04-04"
+    doctor: "Zito"
+    shift: "Notte"
+    note: "Pre-Pasqua (sabato normale)"
+
+  - date: "2026-04-05"
+    doctor: "Migliorato"
+    shift: "Mattina"
+    note: "Pasqua"
+
+  - date: "2026-04-05"
+    doctor: "Grimaldi"
+    shift: "Pomeriggio"
+    note: "Pasqua"
+
+  - date: "2026-04-05"
+    doctor: "Cimino"
+    shift: "Notte"
+    note: "Pasqua"
+
+  - date: "2026-04-06"
+    doctor: "De Gregorio"
+    shift: "Mattina"
+    note: "Pasquetta"
+
+  - date: "2026-04-06"
+    doctor: "Calabrò"
+    shift: "Pomeriggio"
+    note: "Pasquetta"
+
+  - date: "2026-04-06"
+    doctor: "Dattilo"
+    shift: "Notte"
+    note: "Pasquetta"
+
+  - date: "2026-04-24"
+    doctor: "Cimino"
+    shift: "Notte"
+    note: "Pre-Liberazione (venerdì normale)"
+
+  - date: "2026-04-25"
+    doctor: "Crea"
+    shift: "Mattina"
+    note: "Festa della Liberazione"
+
+  - date: "2026-04-25"
+    doctor: "Manganaro"
+    shift: "Pomeriggio"
+    note: "Festa della Liberazione"
+
+  - date: "2026-04-25"
+    doctor: "Zito"
+    shift: "Notte"
+    note: "Festa della Liberazione"
+
+  - date: "2026-04-30"
+    doctor: "Allegra"
+    shift: "Notte"
+    note: "Pre-Festa del Lavoro (giovedì normale)"
+
+  # ── Maggio 2026 ────────────────────────────────────────────
+  - date: "2026-05-01"
+    doctor: "Licordari"
+    shift: "Mattina"
+    note: "Festa del Lavoro"
+
+  - date: "2026-05-01"
+    doctor: "Colarusso"
+    shift: "Pomeriggio"
+    note: "Festa del Lavoro"
+
+  - date: "2026-05-01"
+    doctor: "Grimaldi"
+    shift: "Notte"
+    note: "Festa del Lavoro"
+
+  # ── Giugno 2026 ────────────────────────────────────────────
+  - date: "2026-06-01"
+    doctor: "Migliorato"
+    shift: "Notte"
+    note: "Pre-Festa della Repubblica (lunedì normale)"
+
+  - date: "2026-06-02"
+    doctor: "Manganaro"
+    shift: "Mattina"
+    note: "Festa della Repubblica"
+
+  - date: "2026-06-02"
+    doctor: "Zito"
+    shift: "Pomeriggio"
+    note: "Festa della Repubblica"
+
+  - date: "2026-06-02"
+    doctor: "Dattilo"
+    shift: "Notte"
+    note: "Festa della Repubblica"
+
+  - date: "2026-06-03"
+    doctor: "Cusmà"
+    shift: "Mattina"
+    note: "Madonna della Lettera (festivo locale)"
+
+  - date: "2026-06-03"
+    doctor: "De Gregorio"
+    shift: "Pomeriggio"
+    note: "Madonna della Lettera (festivo locale)"
+
+  - date: "2026-06-03"
+    doctor: "Licordari"
+    shift: "Notte"
+    note: "Madonna della Lettera (festivo locale)"
+
+  # ── Agosto 2026 ────────────────────────────────────────────
+  - date: "2026-08-14"
+    doctor: "Colarusso"
+    shift: "Notte"
+    note: "Pre-Ferragosto (venerdì normale)"
+
+  - date: "2026-08-15"
+    doctor: "Dattilo"
+    shift: "Mattina"
+    note: "Ferragosto"
+
+  - date: "2026-08-15"
+    doctor: "Allegra"
+    shift: "Pomeriggio"
+    note: "Ferragosto"
+
+  - date: "2026-08-15"
+    doctor: "Migliorato"
+    shift: "Notte"
+    note: "Ferragosto"
+
+  # ── Ottobre 2026 ───────────────────────────────────────────
+  - date: "2026-10-31"
+    doctor: "Licordari"
+    shift: "Notte"
+    note: "Pre-Ognissanti (sabato normale)"
+
+  # ── Novembre 2026 ──────────────────────────────────────────
+  - date: "2026-11-01"
+    doctor: "Migliorato"
+    shift: "Mattina"
+    note: "Ognissanti"
+
+  - date: "2026-11-01"
+    doctor: "Trio"
+    shift: "Pomeriggio"
+    note: "Ognissanti"
+
+  - date: "2026-11-01"
+    doctor: "Pugliatti"
+    shift: "Notte"
+    note: "Ognissanti"
+
+  # ── Dicembre 2026 ──────────────────────────────────────────
+  - date: "2026-12-07"
+    doctor: "Pugliatti"
+    shift: "Notte"
+    note: "Pre-Immacolata (lunedì normale)"
+
+  - date: "2026-12-08"
+    doctor: "Dattilo"
+    shift: "Mattina"
+    note: "Immacolata"
+
+  - date: "2026-12-08"
+    doctor: "Allegra"
+    shift: "Pomeriggio"
+    note: "Immacolata"
+
+  - date: "2026-12-08"
+    doctor: "Cusmà"
+    shift: "Notte"
+    note: "Immacolata"
+
+  - date: "2026-12-24"
+    doctor: "Cusmà"
+    shift: "Notte"
+    note: "Vigilia di Natale (giovedì normale)"
+
+  - date: "2026-12-25"
+    doctor: "Pugliatti"
+    shift: "Mattina"
+    note: "Natale"
+
+  - date: "2026-12-25"
+    doctor: "Colarusso"
+    shift: "Pomeriggio"
+    note: "Natale"
+
+  - date: "2026-12-25"
+    doctor: "Calabrò"
+    shift: "Notte"
+    note: "Natale"
+
+  - date: "2026-12-26"
+    doctor: "Manganaro"
+    shift: "Mattina"
+    note: "Santo Stefano"
+
+  - date: "2026-12-26"
+    doctor: "De Gregorio"
+    shift: "Pomeriggio"
+    note: "Santo Stefano"
+
+  - date: "2026-12-26"
+    doctor: "Grimaldi"
+    shift: "Notte"
+    note: "Santo Stefano"
+
+  - date: "2026-12-31"
+    doctor: "Cimino"
+    shift: "Pomeriggio"
+    note: "S. Silvestro (festivo)"
+
+  - date: "2026-12-31"
+    doctor: "Trio"
+    shift: "Notte"
+    note: "S. Silvestro (festivo)"
+
+  # ── Gennaio 2027 ───────────────────────────────────────────
+  - date: "2027-01-01"
+    doctor: "Licordari"
+    shift: "Mattina"
+    note: "Capodanno"
+
+  - date: "2027-01-01"
+    doctor: "Zito"
+    shift: "Pomeriggio"
+    note: "Capodanno"
+
+  - date: "2027-01-01"
+    doctor: "Crea"
+    shift: "Notte"
+    note: "Capodanno"
+
+  - date: "2027-01-05"
+    doctor: "Allegra"
+    shift: "Notte"
+    note: "Pre-Epifania (martedì normale)"
+
+  - date: "2027-01-06"
+    doctor: "De Gregorio"
+    shift: "Mattina"
+    note: "Epifania"
+
+  - date: "2027-01-06"
+    doctor: "Trio"
+    shift: "Pomeriggio"
+    note: "Epifania"
+
+  - date: "2027-01-06"
+    doctor: "Crea"
+    shift: "Notte"
+    note: "Epifania"
+
+  # ── Marzo 2027 ─────────────────────────────────────────────
+  - date: "2027-03-27"
+    doctor: "Trio"
+    shift: "Notte"
+    note: "Pre-Pasqua 2027 (sabato normale)"
+
+  - date: "2027-03-28"
+    doctor: "Manganaro"
+    shift: "Mattina"
+    note: "Pasqua 2027"
+
+  - date: "2027-03-28"
+    doctor: "Crea"
+    shift: "Pomeriggio"
+    note: "Pasqua 2027"
+
+  - date: "2027-03-28"
+    doctor: "Calabrò"
+    shift: "Notte"
+    note: "Pasqua 2027"
+
+  - date: "2027-03-29"
+    doctor: "Pugliatti"
+    shift: "Mattina"
+    note: "Pasquetta 2027"
+
+  - date: "2027-03-29"
+    doctor: "Grimaldi"
+    shift: "Pomeriggio"
+    note: "Pasquetta 2027"
+
+  - date: "2027-03-29"
+    doctor: "Colarusso"
+    shift: "Notte"
+    note: "Pasquetta 2027"

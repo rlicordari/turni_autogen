@@ -394,6 +394,12 @@ def assign_reperibilita_C(cfg: dict, days: List[DayRow], slots: List[Slot],
     constraints = set(rC.get("constraints") or [])
     excluded = {norm_name(x) for x in (rC.get("excluded") or [])}
     spacing_min = int(rC.get("spacing_min_days", 0) or 0)
+
+    # Festivi pool: doctors preferred for C on festivo days (excluding those already
+    # excluded from C, e.g. De Gregorio, Manganaro).
+    # Doctors doing Notte that day are already blocked by the not_night_same_day constraint.
+    rFest = rules.get("Festivi") if isinstance(rules.get("Festivi"), dict) else {}
+    festivi_pool_norm = {norm_name(d) for d in (rFest.get("pool") or [])} - excluded
     min_per = int(rC.get("min_per_doctor", rC.get("target_per_doctor", 0) or 0) or 0)
     max_per = int(rC.get("max_per_doctor", 0) or 0)
     target = int(rC.get("target_per_doctor", 0) or 0)
@@ -542,9 +548,13 @@ def assign_reperibilita_C(cfg: dict, days: List[DayRow], slots: List[Slot],
 
     def pick_docs_for_day(d: dt.date) -> List[str]:
         cands = candidates_by_date[d]
-        # prioritize those with more remaining quota
+        drow = dayrow_by_date.get(d)
+        day_is_festivo = drow is not None and is_festivo(drow, cfg)
         def key(doc):
-            return (desired[doc] - cnt[doc], -cnt[doc], doc.lower())
+            # On festivo days prefer doctors from the Festivi sorteggio pool;
+            # doctors doing Notte are already excluded upstream by ok_candidate().
+            festivo_pref = 1 if (day_is_festivo and doc in festivi_pool_norm) else 0
+            return (festivo_pref, desired[doc] - cnt[doc], -cnt[doc], doc.lower())
         return sorted(cands, key=key, reverse=True)
 
     def dfs(i: int) -> bool:
@@ -608,6 +618,97 @@ def load_rules(path: Path) -> dict:
     if not isinstance(cfg, dict):
         raise ValueError("Rules YAML must be a mapping.")
     return cfg
+
+
+def _strip_festivi_unavailability(
+    unav_map: Dict[str, Dict[dt.date, Set[str]]],
+    tf_fixed: List[dict],
+) -> None:
+    """Remove unavailability entries that would block pre-assigned festivo shifts.
+
+    If a doctor declares unavailability on a day/shift where they've been assigned
+    via sorteggio (turni_festivi.yml), the sorteggio takes precedence and the
+    conflicting unavailability entry is silently ignored.
+    Modifies unav_map in place.
+    """
+    # Shifts blocked by each column assignment
+    COL_TO_SHIFTS: Dict[str, Set[str]] = {
+        "D": {"Mattina", "Diurno", "Tutto il giorno", "Any"},
+        "H": {"Pomeriggio", "Diurno", "Tutto il giorno", "Any"},
+        "J": {"Notte", "Tutto il giorno", "Any"},
+    }
+    for fa in tf_fixed:
+        doc = norm_name(str(fa.get("doctor", "")).strip())
+        col = str(fa.get("column", "")).strip().upper()
+        date_str = str(fa.get("date", "")).strip()
+        try:
+            date = dt.date.fromisoformat(date_str)
+        except Exception:
+            continue
+        blocked_shifts = COL_TO_SHIFTS.get(col, set())
+        if not blocked_shifts:
+            continue
+        doc_unav = unav_map.get(doc)
+        if doc_unav and date in doc_unav:
+            doc_unav[date] -= blocked_shifts
+            if not doc_unav[date]:
+                del doc_unav[date]
+
+
+# Mapping shift name → Excel column letter for fixed-assignment injection
+_FESTIVI_SHIFT_TO_COL = {
+    "mattina": "D",    # festivo → slot DE (columns D+E); regular → slot D
+    "pomeriggio": "H", # festivo → slot HI (columns H+I); regular → slot H
+    "notte": "J",      # always → slot J
+}
+
+
+def load_turni_festivi(base_dir: Optional[Path] = None) -> dict:
+    """Load pre-assigned holiday shifts from data/turni_festivi.yml.
+
+    Returns a dict:
+      'festivi_extra'     : list of ISO date strings to merge into cfg['festivi_extra']
+      'fixed_assignments' : list of {doctor, date, column} ready for the solver
+    """
+    if base_dir is None:
+        base_dir = Path(__file__).resolve().parent
+    path = base_dir / "data" / "turni_festivi.yml"
+    if not path.exists():
+        return {"festivi_extra": [], "fixed_assignments": []}
+
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+    except Exception:
+        return {"festivi_extra": [], "fixed_assignments": []}
+
+    if not isinstance(data, dict):
+        return {"festivi_extra": [], "fixed_assignments": []}
+
+    festivi_extra = [str(x).strip() for x in (data.get("festivi_extra") or []) if x]
+
+    fixed: List[dict] = []
+    for entry in (data.get("entries") or []):
+        if not isinstance(entry, dict):
+            continue
+        try:
+            date_str = str(entry.get("date", "")).strip()
+            doctor = str(entry.get("doctor", "")).strip()
+            shift_raw = str(entry.get("shift", "")).strip().lower()
+            # explicit 'column' field overrides shift-to-column mapping
+            col = entry.get("column") or _FESTIVI_SHIFT_TO_COL.get(shift_raw)
+            if not date_str or not doctor or not col:
+                continue
+            dt.date.fromisoformat(date_str)  # validate format
+            fixed.append({
+                "doctor": doctor,
+                "date": date_str,
+                "column": str(col).strip().upper(),
+            })
+        except Exception:
+            continue
+
+    return {"festivi_extra": festivi_extra, "fixed_assignments": fixed}
 
 
 def create_month_template_xlsx(
@@ -3522,8 +3623,21 @@ def generate_schedule(
     unav = Path(unavailability_path) if unavailability_path else None
 
     cfg = load_rules(rules)
+
+    # Merge pre-assigned holiday shifts from data/turni_festivi.yml
+    tf = load_turni_festivi()
+    if tf["festivi_extra"]:
+        existing_fe = list(cfg.get("festivi_extra") or [])
+        existing_fe_set = set(str(x).strip() for x in existing_fe)
+        cfg["festivi_extra"] = existing_fe + [x for x in tf["festivi_extra"] if x not in existing_fe_set]
+    if tf["fixed_assignments"]:
+        fixed_assignments = list(fixed_assignments or []) + tf["fixed_assignments"]
+
     wb, ws, days = load_template_days(template, sheet_name=sheet_name)
     unav_map = load_unavailability(unav)
+    # Strip unavailability entries that conflict with pre-assigned festivo sorteggio shifts
+    if tf["fixed_assignments"]:
+        _strip_festivi_unavailability(unav_map, tf["fixed_assignments"])
     slots, assignment, stats = solve_across_months(
         cfg, days, unav_map,
         carryover_by_month=carryover_by_month,
