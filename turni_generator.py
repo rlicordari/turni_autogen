@@ -2542,7 +2542,7 @@ def solve_with_ortools(
     gc_uni = gc.get("university_doctors") or {}
     uni_ratio = float(gc.get("university_ratio", 0.6))
     if gc_uni and uni_ratio > 0:
-        working_days = sum(1 for d in days if d.dow in ["Mon","Tue","Wed","Thu","Fri","Sat"])
+        working_days = sum(1 for d in days if d.dow in ["Mon","Tue","Wed","Thu","Fri","Sat"] and not is_festivo(d, cfg))
         target = round(working_days * uni_ratio)
         for doc_raw, doc_cfg in gc_uni.items():
             doc = norm_name(doc_raw)
@@ -3351,7 +3351,7 @@ def _write_riepilogo_sheet(
     gc_uni = gc.get("university_doctors") or {}
     uni_ratio = float(gc.get("university_ratio", 0.6))
     pct = int(uni_ratio * 100)
-    working_days_n = sum(1 for d in days if d.dow in ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat"))
+    working_days_n = sum(1 for d in days if d.dow in ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat") and not is_festivo(d, cfg))
     uni_target = round(working_days_n * uni_ratio)
     uni_docs = {norm_name(k) for k in gc_uni}
     uni_night_double = {
