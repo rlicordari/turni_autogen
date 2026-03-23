@@ -1259,8 +1259,10 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
         if "V" in rules and not festivo:
             r = rules["V"]
             if dayspec_contains(day.dow, r.get("days")):
+                # Lunedì la Sala PM è di pomeriggio; mercoledì e venerdì è di mattina
+                v_shift = "Pomeriggio" if day.dow == "Mon" else "Mattina"
                 pool_base = mk_allowed(r.get("pool") or [])
-                pool_base = apply_unavailability(pool_base, day, "Mattina", unav)
+                pool_base = apply_unavailability(pool_base, day, v_shift, unav)
                 # Determina se questo giorno è il "turno doppio" della settimana
                 _week_key = day.date.isocalendar()[:2]
                 _is_override_double = day.date in _v_override_dates
@@ -1275,10 +1277,10 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                     if (not pool_crea) or (not pool_other):
                         pool_crea = []
                         pool_other = []
-                    slots.append(Slot(day, f"{day.date}-V1", ["V"], pool_crea, required=True, shift="Mattina", rule_tag="V"))
-                    slots.append(Slot(day, f"{day.date}-V2", ["V"], pool_other, required=True, shift="Mattina", rule_tag="V"))
+                    slots.append(Slot(day, f"{day.date}-V1", ["V"], pool_crea, required=True, shift=v_shift, rule_tag="V"))
+                    slots.append(Slot(day, f"{day.date}-V2", ["V"], pool_other, required=True, shift=v_shift, rule_tag="V"))
                 else:
-                    slots.append(Slot(day, f"{day.date}-V", ["V"], pool_base, required=True, shift="Mattina", rule_tag="V"))
+                    slots.append(Slot(day, f"{day.date}-V", ["V"], pool_base, required=True, shift=v_shift, rule_tag="V"))
         # ---- Z Vascolare (Wed,Fri)
         if "Z" in rules and not festivo:
             r = rules["Z"]
