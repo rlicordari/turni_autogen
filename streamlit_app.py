@@ -3056,11 +3056,20 @@ else:
                 import calendar as _cal
                 y_u, m_u = int(year), int(month)
                 _, n_days = _cal.monthrange(y_u, m_u)
+                _holidays = tg.italy_public_holidays(y_u)
+                _extra_hol = set()
+                for _x in (cfg_u.get("festivi_extra") or []):
+                    try:
+                        _extra_hol.add(tg.parse_date(_x))
+                    except Exception:
+                        pass
                 working = sum(
                     1 for d in range(1, n_days + 1)
-                    if date(y_u, m_u, d).weekday() < 6  # lun=0..sab=5
+                    if (dt_date := date(y_u, m_u, d)).weekday() < 6  # lun=0..sab=5
+                    and dt_date not in _holidays
+                    and dt_date not in _extra_hol
                 )
-                st.markdown(f"**{mk}** — giorni lavorativi lun-sab: **{working}**")
+                st.markdown(f"**{mk}** — giorni lavorativi lun-sab (esclusi festivi): **{working}**")
                 st.markdown(f"Rapporto universitari: **{int(uni_ratio*100)}%** → target = round({working} × {uni_ratio}) = **{round(working * uni_ratio)}**")
                 rows_u = []
                 for doc_raw, dcfg in uni_docs.items():
