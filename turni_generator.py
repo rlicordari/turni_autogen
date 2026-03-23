@@ -1198,8 +1198,10 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                 if "Recupero" in doctors_set and "Recupero" not in pool:
                     pool.append("Recupero")
                 pool = apply_unavailability(pool, day, "Mattina", unav)
-                req, bp = req_and_blank("L")
-                slots.append(Slot(day, f"{day.date}-L", ["L"], pool, required=req, blank_penalty=bp, shift="Mattina", rule_tag="L"))
+                # Se il pool ha medici disponibili → obbligatorio; se vuoto → opzionale con penalità
+                _, bp = req_and_blank("L")
+                req = bool(pool)
+                slots.append(Slot(day, f"{day.date}-L", ["L"], pool, required=req, blank_penalty=(0 if req else bp), shift="Mattina", rule_tag="L"))
         # ---- Q Eco base (Mon-Sat)
         if "Q" in rules and not festivo:
             r = rules["Q"]
@@ -1213,8 +1215,10 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
             if dayspec_contains(day.dow, r.get("days")):
                 pool = mk_allowed(r.get("pool") or [])
                 pool = apply_unavailability(pool, day, "Mattina", unav)
-                req, bp = req_and_blank("R")
-                slots.append(Slot(day, f"{day.date}-R", ["R"], pool, required=req, blank_penalty=bp, shift="Mattina", rule_tag="R"))
+                # Se il pool ha medici disponibili → obbligatorio; se vuoto → opzionale con penalità
+                _, bp = req_and_blank("R")
+                req = bool(pool)
+                slots.append(Slot(day, f"{day.date}-R", ["R"], pool, required=req, blank_penalty=(0 if req else bp), shift="Mattina", rule_tag="R"))
         # ---- S (Wed, optional if can be absorbed in R)
         if "S" in rules and not festivo:
             r = rules["S"]
@@ -1234,13 +1238,15 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
         if "U" in rules and not festivo:
             r = rules["U"]
             if dayspec_contains(day.dow, r.get("days")):
+                # Lunedì Contr.PM è pomeridiano; martedì è mattutino
+                u_shift = "Pomeriggio" if day.dow == "Mon" else "Mattina"
                 pool = mk_allowed(r.get("pool") or [])
-                pool = apply_unavailability(pool, day, "Mattina", unav)
+                pool = apply_unavailability(pool, day, u_shift, unav)
                 # MODIFICA 3: se lunedì e V ha solo Allegra disponibile (o è assegnato ad Allegra),
                 # U deve essere SOLO Crea o Dattilo.
                 if day.dow == "Mon" and r.get("v_allegra_monday_constraint", False):
                     rV = rules.get("V", {})
-                    v_pool_avail = apply_unavailability(mk_allowed(rV.get("pool") or []), day, "Mattina", unav)
+                    v_pool_avail = apply_unavailability(mk_allowed(rV.get("pool") or []), day, "Pomeriggio", unav)
                     _allegra = norm_name("Allegra")
                     _crea = norm_name("Crea")
                     _dattilo = norm_name("Dattilo")
@@ -1251,7 +1257,7 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                         restricted = [d for d in pool if norm_name(d) in {_crea, _dattilo}]
                         if restricted:  # applica solo se almeno uno è disponibile
                             pool = restricted
-                slots.append(Slot(day, f"{day.date}-U", ["U"], pool, required=True, shift="Mattina", rule_tag="U"))
+                slots.append(Slot(day, f"{day.date}-U", ["U"], pool, required=True, shift=u_shift, rule_tag="U"))
         # ---- V Sala PM (Mon,Wed,Fri)
         # Default: venerdì = turno doppio (Crea + Dattilo|Allegra), lun/mer = singolo.
         # Override admin: se un lunedì o mercoledì è in _v_override_dates, quella settimana

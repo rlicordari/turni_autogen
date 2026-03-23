@@ -258,6 +258,7 @@ rules:
     - Cusmà
     - Licordari
     - Trio
+    - Recupero
     balance: true
     balance_weight: 400
     max_per_doctor: 5
