@@ -1585,11 +1585,14 @@ def solve_with_ortools(
         "diurno": "Diurno", "day": "Diurno",
     }
     # Penalità per disponibilità non rispettata.
-    # Calibrata sopra le penalità strutturali (df_share=8000, outside_pair=6000,
-    # missing_pair_doc=12000, prefer_df_share=15000) ma sotto BLANK_REQUIRED (5M).
-    # La priorità "alta" vale 2x, "bassa" vale 0.4x.
-    AVAIL_PENALTY_BASE = 25_000
-    AVAIL_PRIORITY_MULT = {"alta": 2.0, "alta priority": 2.0, "media": 1.0, "bassa": 0.4}
+    # Calibrazione rispetto alle penalità strutturali D/F:
+    #   missing_pair_doc=12000, df_share=8000, prefer_df_share=15000
+    #   → stack peggiore ~35000
+    # "media" (40000) supera ogni singola penalità strutturale e lo stack comune.
+    # "alta"  (80000) supera anche gli stack peggiori.
+    # "bassa" (15000) può essere superata da singole penalità strutturali (intenzionale).
+    AVAIL_PENALTY_BASE = 40_000
+    AVAIL_PRIORITY_MULT = {"alta": 2.0, "alta priority": 2.0, "media": 1.0, "bassa": 0.375}
     pref_skipped_log: list = []
     for ap in (availability_preferences or []):
         try:

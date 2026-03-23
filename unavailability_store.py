@@ -6,6 +6,10 @@ Storage format (CSV, UTF-8):
 where:
   - date is ISO YYYY-MM-DD
   - shift is one of: Mattina, Pomeriggio, Notte, Diurno, Tutto il giorno
+
+Availability store (preferenze disponibilità) — stesso formato + campo priority:
+  doctor,date,shift,note,updated_at,priority
+  priority: alta | media | bassa  (default: media)
 """
 
 from __future__ import annotations
@@ -37,6 +41,12 @@ def norm_shift(s: str) -> str:
 def parse_iso_date(s: str) -> dt.date:
     return dt.date.fromisoformat(str(s).strip()[:10])
 
+VALID_PRIORITIES = {"alta", "media", "bassa"}
+
+def norm_priority(p: str) -> str:
+    p0 = (p or "media").strip().lower()
+    return p0 if p0 in VALID_PRIORITIES else "media"
+
 def load_store(csv_text: str) -> List[Dict[str, str]]:
     if not csv_text.strip():
         return []
@@ -57,12 +67,13 @@ def load_store(csv_text: str) -> List[Dict[str, str]]:
             "shift": norm_shift(shift),
             "note": (row.get("note") or "").strip(),
             "updated_at": (row.get("updated_at") or "").strip(),
+            "priority": norm_priority(row.get("priority", "media")),
         })
     return out
 
 def to_csv(rows: List[Dict[str, str]]) -> str:
     buf = io.StringIO()
-    fieldnames = ["doctor", "date", "shift", "note", "updated_at"]
+    fieldnames = ["doctor", "date", "shift", "note", "updated_at", "priority"]
     wr = csv.DictWriter(buf, fieldnames=fieldnames)
     wr.writeheader()
     for r in rows:
@@ -72,6 +83,7 @@ def to_csv(rows: List[Dict[str, str]]) -> str:
             "shift": norm_shift(r.get("shift","")),
             "note": r.get("note",""),
             "updated_at": r.get("updated_at",""),
+            "priority": norm_priority(r.get("priority","media")),
         })
     return buf.getvalue()
 
@@ -122,7 +134,13 @@ def replace_doctor_month(
             continue  # drop
         kept.append(r)
 
-    for d, shift, note in new_entries:
+    for entry in new_entries:
+        # entry can be (date, shift, note) or (date, shift, note, priority)
+        if len(entry) == 3:
+            d, shift, note = entry
+            priority = "media"
+        else:
+            d, shift, note, priority = entry[:4]
         if not isinstance(d, dt.date):
             continue
         sh = norm_shift(shift)
@@ -134,6 +152,7 @@ def replace_doctor_month(
             "shift": sh,
             "note": (note or "").strip(),
             "updated_at": updated_at,
+            "priority": norm_priority(priority),
         })
 
     # de-duplicate by (doctor,date,shift) keep latest

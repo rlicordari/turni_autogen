@@ -2253,13 +2253,15 @@ if mode == "Indisponibilità (Medico)":
                                 "id": str(uuid.uuid4()),
                                 "Data": date.fromisoformat(r["date"]) if r.get("date") else date(yy, mm, 1),
                                 "Fascia": r.get("shift", "Mattina"),
+                                "Priorita": r.get("priority", "media"),
                                 "Note": r.get("note", ""),
                             }
                             for r in _existing_avail
                         ]
                     else:
                         st.session_state[avail_key] = [
-                            {"id": str(uuid.uuid4()), "Data": date(yy, mm, 1), "Fascia": "Mattina", "Note": ""}
+                            {"id": str(uuid.uuid4()), "Data": date(yy, mm, 1), "Fascia": "Mattina",
+                             "Priorita": "media", "Note": ""}
                         ]
 
                 if unav_open:
@@ -2281,10 +2283,12 @@ if mode == "Indisponibilità (Medico)":
                             ] or [{"id": str(uuid.uuid4()), "Data": date(yy, mm, 1), "Fascia": "Mattina", "Note": ""}]
                             st.rerun()
 
+                    _PRIORITY_OPTIONS = ["media", "alta", "bassa"]
+                    _PRIORITY_LABELS = {"alta": "⬆ Alta", "media": "● Media", "bassa": "⬇ Bassa"}
                     av_rows = list(st.session_state.get(avail_key) or [])
                     updated_av = []
                     for av_r in av_rows:
-                        av_c1, av_c2, av_c3, av_c4 = st.columns([2, 2, 3, 0.5])
+                        av_c1, av_c2, av_c3, av_c4, av_c5 = st.columns([2, 2, 1.5, 2.5, 0.5])
                         with av_c1:
                             av_date = st.date_input("Data", value=av_r.get("Data") or date(yy, mm, 1),
                                                     min_value=date(yy, mm, 1),
@@ -2296,12 +2300,21 @@ if mode == "Indisponibilità (Medico)":
                                                     index=FASCIA_OPTIONS.index(av_r.get("Fascia","Mattina")) if av_r.get("Fascia","Mattina") in FASCIA_OPTIONS else 0,
                                                     key=f"{avail_key}_{av_r['id']}_s")
                         with av_c3:
+                            _prev_pri = av_r.get("Priorita", "media")
+                            _pri_idx = _PRIORITY_OPTIONS.index(_prev_pri) if _prev_pri in _PRIORITY_OPTIONS else 0
+                            av_priority = st.selectbox("Priorità",
+                                                       [_PRIORITY_LABELS[p] for p in _PRIORITY_OPTIONS],
+                                                       index=_pri_idx,
+                                                       key=f"{avail_key}_{av_r['id']}_p")
+                            av_priority_val = _PRIORITY_OPTIONS[[_PRIORITY_LABELS[p] for p in _PRIORITY_OPTIONS].index(av_priority)]
+                        with av_c4:
                             av_note = st.text_input("Note", value=av_r.get("Note",""),
                                                     key=f"{avail_key}_{av_r['id']}_n")
-                        with av_c4:
+                        with av_c5:
                             del_av = st.button("🗑", key=f"{avail_key}_{av_r['id']}_del")
                         if not del_av:
-                            updated_av.append({"id": av_r["id"], "Data": av_date, "Fascia": av_shift, "Note": av_note})
+                            updated_av.append({"id": av_r["id"], "Data": av_date, "Fascia": av_shift,
+                                               "Priorita": av_priority_val, "Note": av_note})
                     st.session_state[avail_key] = updated_av
 
                     # Conta per fascia
@@ -2319,7 +2332,7 @@ if mode == "Indisponibilità (Medico)":
                     _save_avail_disabled = bool(av_over)
                     if st.button("Salva preferenze", key=f"save_avail_{doctor}_{yy}_{mm}", type="primary", disabled=_save_avail_disabled):
                         _avail_entries = [
-                            (r["Data"], r.get("Fascia", "Mattina"), r.get("Note", ""))
+                            (r["Data"], r.get("Fascia", "Mattina"), r.get("Note", ""), r.get("Priorita", "media"))
                             for r in (st.session_state.get(avail_key) or [])
                             if r.get("Data") and r.get("Fascia")
                         ]
@@ -2343,14 +2356,15 @@ if mode == "Indisponibilità (Medico)":
 
                     # Salva in sessione per trasmetterle al generate (chiave globale con medico)
                     avail_rows_by_month[(yy, mm)] = [
-                        {"date": str(r["Data"]), "shift": r["Fascia"]}
+                        {"date": str(r["Data"]), "shift": r["Fascia"], "priority": r.get("Priorita", "media")}
                         for r in (st.session_state.get(avail_key) or [])
                         if r.get("Data") and r.get("Fascia")
                     ]
                     # Persiste nella sessione globale per l'admin
                     global_avail_key = f"avail_global_{doctor}_{yy}_{mm}"
                     st.session_state[global_avail_key] = [
-                        {"doctor": doctor, "date": str(r["Data"]), "shift": r["Fascia"]}
+                        {"doctor": doctor, "date": str(r["Data"]), "shift": r["Fascia"],
+                         "priority": r.get("Priorita", "media")}
                         for r in (st.session_state.get(avail_key) or [])
                         if r.get("Data") and r.get("Fascia")
                     ]
@@ -3115,7 +3129,8 @@ else:
                     _avail_all, _ = load_avail_store_from_github()
                     _avail_month = ustore.filter_month(_avail_all, int(year), int(month))
                     all_avail_prefs = [
-                        {"doctor": r["doctor"], "date": r["date"], "shift": r["shift"]}
+                        {"doctor": r["doctor"], "date": r["date"], "shift": r["shift"],
+                         "priority": r.get("priority", "media")}
                         for r in _avail_month
                     ]
                 except Exception as _e:
