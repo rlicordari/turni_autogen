@@ -987,15 +987,26 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
 
     # PRE-PROCESSA v_double_overrides: date esatte in cui V è in doppio (al posto del venerdì)
     # Se quella settimana ha un override, il venerdì di quella settimana diventa turno singolo.
+    # Sentinel "NODOUBLE:{year}:{week}" → quella settimana non ha nessun turno doppio.
     _v_override_dates: Set[dt.date] = set()
+    _v_no_double_weeks: Set[tuple] = set()
     if v_double_overrides:
         for _ds in v_double_overrides:
-            try:
-                _v_override_dates.add(dt.date.fromisoformat(str(_ds).strip()))
-            except Exception:
-                pass
-    # ISO week keys delle settimane che hanno un override
-    _v_override_weeks: Set[tuple] = {d.isocalendar()[:2] for d in _v_override_dates}
+            _ds = str(_ds).strip()
+            if _ds.startswith("NODOUBLE:"):
+                try:
+                    _, _yr_wk = _ds.split(":", 1)
+                    _yr_s, _wk_s = _yr_wk.split(":")
+                    _v_no_double_weeks.add((int(_yr_s), int(_wk_s)))
+                except Exception:
+                    pass
+            else:
+                try:
+                    _v_override_dates.add(dt.date.fromisoformat(_ds))
+                except Exception:
+                    pass
+    # ISO week keys delle settimane che hanno un override (doppio spostato O nessun doppio)
+    _v_override_weeks: Set[tuple] = {d.isocalendar()[:2] for d in _v_override_dates} | _v_no_double_weeks
 
     slots: List[Slot] = []
     def mk_allowed(pool: List[str]) -> List[str]:

@@ -2903,8 +2903,8 @@ else:
     st.markdown("### 5) Turno doppio Sala PM (V) — eccezioni settimanali")
     st.info(
         "Di default ogni **venerdì** ha il turno doppio in V (Crea + Dattilo o Allegra). "
-        "Se una settimana gli interventi richiedono il doppio in un altro giorno, "
-        "seleziona quel giorno: il venerdì di quella settimana diventerà turno singolo.",
+        "Puoi spostare il doppio su lunedì o mercoledì, oppure scegliere **nessun doppio**: "
+        "in quel caso tutti e tre i giorni (lun/mer/ven) avranno un singolo medico tra Dattilo, Crea e Allegra.",
         icon="🔬",
     )
 
@@ -2937,11 +2937,14 @@ else:
         if not _alt_days:
             # Solo venerdì in questo mese per questa settimana → niente da scegliere
             continue
-        # Opzioni: venerdì (default) + giorni alternativi
+        # Opzioni: venerdì (default) + giorni alternativi + nessun doppio
         _label_default = f"Venerdì {_fri.strftime('%d/%m') if _fri else '(fuori mese)'} — doppio (default)"
+        _label_no_double = "Nessun doppio questa settimana — tutti singoli"
+        _SENTINEL_NO_DOUBLE = "NO_DOUBLE"
         _options = {_label_default: None}
         for _wd_alt, _dt_alt in sorted(_alt_days.items()):
             _options[f"{_V_WEEKDAYS[_wd_alt]} {_dt_alt.strftime('%d/%m')} — doppio (invece del venerdì)"] = _dt_alt
+        _options[_label_no_double] = _SENTINEL_NO_DOUBLE
 
         _prev = st.session_state[_v_double_key].get(str(_iso_w))
         _prev_label = next((lb for lb, val in _options.items() if val == _prev), _label_default)
@@ -2953,12 +2956,23 @@ else:
         )
         _sel_date = _options[_sel_label]
         st.session_state[_v_double_key][str(_iso_w)] = _sel_date
-        if _sel_date is not None:
+        if _sel_date == _SENTINEL_NO_DOUBLE:
+            _v_double_overrides_list.append(f"NODOUBLE:{_iso_w[0]}:{_iso_w[1]}")
+            _any_v_override = True
+        elif _sel_date is not None:
             _v_double_overrides_list.append(str(_sel_date))
             _any_v_override = True
 
     if _any_v_override:
-        st.caption("Eccezioni attive: " + ", ".join(_v_double_overrides_list))
+        _caption_parts = []
+        for _ov in _v_double_overrides_list:
+            if _ov.startswith("NODOUBLE:"):
+                _, _yr_wk = _ov.split(":", 1)
+                _yr_c, _wk_c = _yr_wk.split(":")
+                _caption_parts.append(f"settimana {_wk_c}/{_yr_c} — nessun doppio")
+            else:
+                _caption_parts.append(f"{_ov} — doppio spostato")
+        st.caption("Eccezioni attive: " + ", ".join(_caption_parts))
 
     st.divider()
 
