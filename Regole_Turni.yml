@@ -231,7 +231,7 @@ rules:
     - Manganaro
     avoid_close_repeats: true
     balance: true
-    balance_weight: 150
+    balance_weight: 50
   Q:
     days: Mon-Sat
     pool:
@@ -260,7 +260,7 @@ rules:
     - Trio
     - Recupero
     balance: true
-    balance_weight: 400
+    balance_weight: 150
     max_per_doctor: 5
     max_per_doctor_penalty: 2000
   S:
