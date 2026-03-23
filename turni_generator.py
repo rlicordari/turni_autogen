@@ -3135,48 +3135,85 @@ def write_output(
             if nd:
                 night_by_date[s.day.date] = nd
 
-    def _free_label(doc: str, unav_shifts: Set[str]) -> Optional[str]:
+    # Pre-calcola, per ogni giorno, quali fasce (M/P/N) ogni medico può effettivamente
+    # coprire in base ai pool degli slot — esclude chi non è mai in un pool di notte, ecc.
+    _SHIFT_TO_KEY = {"Mattina": "M", "Pomeriggio": "P", "Notte": "N",
+                     "Diurno": None}  # Diurno → M e P
+    doc_eligible_by_date: Dict[dt.date, Dict[str, Set[str]]] = {}
+    for s in slots:
+        s_date = s.day.date
+        s_shift = getattr(s, "shift", "") or ""
+        if s_shift == "Any":
+            continue  # C reperibilità — ignora per il label
+        keys: List[str] = []
+        if s_shift == "Diurno":
+            keys = ["M", "P"]
+        elif s_shift in _SHIFT_TO_KEY and _SHIFT_TO_KEY[s_shift]:
+            keys = [_SHIFT_TO_KEY[s_shift]]
+        else:
+            continue
+        if s_date not in doc_eligible_by_date:
+            doc_eligible_by_date[s_date] = {}
+        for doc in (s.allowed or []):
+            if doc not in doc_eligible_by_date[s_date]:
+                doc_eligible_by_date[s_date][doc] = set()
+            doc_eligible_by_date[s_date][doc].update(keys)
+
+    def _free_label(doc: str, unav_shifts: Set[str], eligible: Set[str]) -> Optional[str]:
         """Restituisce la stringa da scrivere in Medici liberi, o None se non disponibile.
-        - Nessuna indisponibilità → solo il nome
-        - Indisponibilità totale (Any / Tutto il giorno) → None (escluso)
-        - Indisponibilità parziale → "Nome (fasce_libere)" es. "Licordari (P, N)"
+        - eligible: fasce (M/P/N) per cui il medico è in almeno un pool in quel giorno
+        - Nessuna indisponibilità e tutto eligible → solo il nome
+        - Indisponibilità totale (Any / Tutto il giorno) → None
+        - Indisponibilità parziale o pool parziale → "Nome (fasce_libere)"
         """
-        if not unav_shifts:
-            return doc
         if "Any" in unav_shifts or "Tutto il giorno" in unav_shifts:
             return None
-        # Espandi Diurno in Mattina+Pomeriggio
+        # Espandi fasce indisponibili
         unav_exp: Set[str] = set()
         for sh in unav_shifts:
-            if sh in ("Mattina",):
-                unav_exp.add("Mattina")
-            elif sh in ("Pomeriggio",):
-                unav_exp.add("Pomeriggio")
-            elif sh in ("Notte",):
-                unav_exp.add("Notte")
-            elif sh in ("Diurno",):
-                unav_exp.update({"Mattina", "Pomeriggio"})
-        avail_abbr = []
-        for sh, abbr in [("Mattina", "M"), ("Pomeriggio", "P"), ("Notte", "N")]:
-            if sh not in unav_exp:
-                avail_abbr.append(abbr)
-        if not avail_abbr:
-            return None  # di fatto tutto occupato
-        if len(avail_abbr) == 3:
-            return doc  # nessuna fascia rilevante bloccata
-        return f"{doc} ({', '.join(avail_abbr)})"
+            if sh == "Mattina":
+                unav_exp.add("M")
+            elif sh == "Pomeriggio":
+                unav_exp.add("P")
+            elif sh == "Notte":
+                unav_exp.add("N")
+            elif sh == "Diurno":
+                unav_exp.update({"M", "P"})
+        # Fasce effettivamente disponibili = eligible - indisponibili
+        avail = [k for k in ["M", "P", "N"] if k in eligible and k not in unav_exp]
+        if not avail:
+            return None
+        if avail == [k for k in ["M", "P", "N"] if k in eligible]:
+            # Tutte le fasce eligibili sono disponibili
+            if not unav_shifts:
+                return doc  # nessuna indisponibilità → no suffisso
+            # Ha indisponibilità ma non nelle fasce del suo pool → mostra comunque
+            if eligible == {"M", "P", "N"}:
+                return doc
+        abbr_str = ", ".join(avail)
+        # Mostra suffisso solo se non ha tutte e 3 le fasce o ha indisponibilità
+        all_three = {"M", "P", "N"}
+        if eligible >= all_three and not unav_shifts:
+            return doc
+        if set(avail) == eligible and not unav_shifts:
+            return doc
+        return f"{doc} ({abbr_str})"
 
     for drow in days:
         assigned_today = assigned_by_day.get(drow.date, set())
         smontante = night_by_date.get(drow.date - dt.timedelta(days=1))
         smontanti = {smontante} if smontante else set()
+        _eligible_today = doc_eligible_by_date.get(drow.date, {})
         free_full: List[str] = []   # completamente disponibili
         free_partial: List[str] = []  # parzialmente disponibili (con suffisso)
         for doc in sorted(all_docs, key=lambda s: s.lower()):
             if doc in assigned_today or doc in smontanti:
                 continue
             unav_shifts = unav_map.get(doc, {}).get(drow.date, set())
-            label = _free_label(doc, unav_shifts)
+            eligible = _eligible_today.get(doc, set())
+            if not eligible:
+                continue  # medico senza pool attivo quel giorno → non compare
+            label = _free_label(doc, unav_shifts, eligible)
             if label is None:
                 continue
             if "(" in label:
