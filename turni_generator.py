@@ -1257,6 +1257,10 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                         restricted = [d for d in pool if norm_name(d) in {_crea, _dattilo}]
                         if restricted:  # applica solo se almeno uno è disponibile
                             pool = restricted
+                        else:
+                            # Crea/Dattilo assenti: Allegra è dedicata a V → rimuovila da U
+                            # così U va al prossimo disponibile (es. D'Angelo) senza competere con V
+                            pool = [d for d in pool if norm_name(d) != _allegra]
                 slots.append(Slot(day, f"{day.date}-U", ["U"], pool, required=True, shift=u_shift, rule_tag="U"))
         # ---- V Sala PM (Mon,Wed,Fri)
         # Default: venerdì = turno doppio (Crea + Dattilo|Allegra), lun/mer = singolo.
