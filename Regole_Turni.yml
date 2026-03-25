@@ -104,8 +104,8 @@ rules:
     - Grimaldi
     - Calabrò
     - Zito
-    de_quotas:
-      Manganaro: 2
+   # de_quotas:
+   #   Manganaro: 2
     notes: 'Per domeniche/festivi: D+E unificati e H+I unificati; usare questo pool.'
   D_F:
     allowed:
