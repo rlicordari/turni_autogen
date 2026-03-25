@@ -2214,6 +2214,17 @@ def solve_with_ortools(
             vars_ = [v for v in vars_ if v is not None]
             if vars_:
                 model.Add(sum(vars_) == int(q))
+    # Festivi DE quotas: per-doctor hard quota on DE (Mattina festivo) slots
+    if "rules" in cfg and "Festivi" in cfg["rules"]:
+        dq = (cfg["rules"]["Festivi"] or {}).get("de_quotas") or {}
+        de_slot_ids = [s.slot_id for s in slots if getattr(s, "rule_tag", "") == "Festivo_DE"]
+        for doc_raw, q in dq.items():
+            doc = norm_name(doc_raw)
+            if doc not in doctors:
+                continue
+            vars_ = [x[(sid, doc)] for sid in de_slot_ids if (sid, doc) in x]
+            if vars_:
+                model.Add(sum(vars_) == int(q))
     # Soft: alcuni medici devono preferibilmente avere almeno N notti weekend (sab/dom)
     if "rules" in cfg and "J" in cfg["rules"]:
         rJ_wn = cfg["rules"]["J"]
@@ -2815,8 +2826,9 @@ def solve_with_ortools(
     # Weekend night concentration: già gestito nel blocco J sopra con hard max=2 e strong soft
     model.Minimize(sum(objective_terms + extra_obj))
     solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = 100.0
+    solver.parameters.max_time_in_seconds = 300.0
     solver.parameters.num_search_workers = 8
+    solver.parameters.relative_gap_limit = 0.0   # continua a cercare fino all'ottimo o al timeout
     status = solver.Solve(model)
     if status not in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
         # Model is truly infeasible even with soft-required slack variables.
