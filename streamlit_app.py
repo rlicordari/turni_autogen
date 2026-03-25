@@ -2836,6 +2836,7 @@ else:
         "Ergometria (W)": "W",
         "Vascolare (Z)": "Z",
         "Holter/AB (AB)": "AB",
+        "Scintigrafia (AC)": "AC",
         "Reperibilità (C)": "C",
     }
 
