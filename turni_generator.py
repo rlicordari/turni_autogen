@@ -1291,7 +1291,9 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
             if dayspec_contains(day.dow, r.get("days")):
                 pool = mk_allowed(r.get("pool") or [])
                 pool = apply_unavailability(pool, day, "Mattina", unav)
-                slots.append(Slot(day, f"{day.date}-Z", ["Z"], pool, required=True, shift="Mattina", rule_tag="Z"))
+                # Z usa il relief valve (30K) — si sacrifica prima di R (40K)
+                req_relief_z, bp_z = req_and_blank("Z")
+                slots.append(Slot(day, f"{day.date}-Z", ["Z"], pool, required=req_relief_z, blank_penalty=bp_z, shift="Mattina", rule_tag="Z"))
         # ---- W Ergometria/CPET (Mon-Fri; Tue fixed) — escluso nei festivi
         if "W" in rules and not festivo:
             r = rules["W"]

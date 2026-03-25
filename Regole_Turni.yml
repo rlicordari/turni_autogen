@@ -53,6 +53,7 @@ global_constraints:
     kt_share_penalty: 5000
     allow_blank_columns:
       L: 20000
+      Z: 30000
       R: 40000
   j_blank_override_date: '2026-03-04'
   university_doctors:
