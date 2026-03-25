@@ -1962,6 +1962,16 @@ def solve_with_ortools(
                 v2 = night_var_by_day_doc.get((d2, doc))
                 if v1 is not None and v2 is not None:
                     model.Add(v1 + v2 <= 1)
+    # Protezione AC: se AC il giorno d ha un solo medico disponibile,
+    # quel medico NON può fare notte (J) il giorno d-1.
+    # Senza questo vincolo, la night_off del giorno successivo blocca il medico da AC.
+    import datetime as _dt_ac
+    for ac_date, ac_s in _ac_slots_by_date.items():
+        sole_doc = ac_s.allowed[0]
+        prev_date = ac_date - _dt_ac.timedelta(days=1)
+        j_prev = night_var_by_day_doc.get((prev_date, sole_doc))
+        if j_prev is not None:
+            model.Add(j_prev == 0)  # hard: non può fare notte la sera prima di AC
     # Reperibilità constraints: not night same day + next 2 days
     if "rules" in cfg and "C_reperibilita" in cfg["rules"]:
         rC = cfg["rules"]["C_reperibilita"]
@@ -2215,16 +2225,17 @@ def solve_with_ortools(
             if vars_:
                 model.Add(sum(vars_) == int(q))
     # Festivi DE quotas: per-doctor hard quota on DE (Mattina festivo) slots
-    #if "rules" in cfg and "Festivi" in cfg["rules"]:
-     #   dq = (cfg["rules"]["Festivi"] or {}).get("de_quotas") or {}
-      #  de_slot_ids = [s.slot_id for s in slots if getattr(s, "rule_tag", "") == "Festivo_DE"]
-       # for doc_raw, q in dq.items():
-        #    doc = norm_name(doc_raw)
-         #   if doc not in doctors:
-          #      continue
-           # vars_ = [x[(sid, doc)] for sid in de_slot_ids if (sid, doc) in x]
-            #if vars_:
-             #   model.Add(sum(vars_) == int(q))
+    # de_quotas per Festivi disabilitato (commentato anche in Regole_Turni.yml)
+    # if "rules" in cfg and "Festivi" in cfg["rules"]:
+    #     dq = (cfg["rules"]["Festivi"] or {}).get("de_quotas") or {}
+    #     de_slot_ids = [s.slot_id for s in slots if getattr(s, "rule_tag", "") == "Festivo_DE"]
+    #     for doc_raw, q in dq.items():
+    #         doc = norm_name(doc_raw)
+    #         if doc not in doctors:
+    #             continue
+    #         vars_ = [x[(sid, doc)] for sid in de_slot_ids if (sid, doc) in x]
+    #         if vars_:
+    #             model.Add(sum(vars_) == int(q))
     # Soft: alcuni medici devono preferibilmente avere almeno N notti weekend (sab/dom)
     if "rules" in cfg and "J" in cfg["rules"]:
         rJ_wn = cfg["rules"]["J"]
@@ -2460,6 +2471,14 @@ def solve_with_ortools(
                     continue
                 v_allegra = x.get((sV.slot_id, _allegra))
                 if v_allegra is None:
+                    continue
+                # Sicurezza: salta il vincolo se né Crea né Dattilo sono disponibili in U quel giorno.
+                # Senza questa guardia, il vincolo renderebbe U genuinamente infeasible
+                # (V forzata ad Allegra, e gli unici ammessi in U sarebbero Crea/Dattilo → impossibile).
+                u_has_crea_or_dattilo = any(
+                    x.get((sU.slot_id, d)) is not None for d in [_crea, _dattilo]
+                )
+                if not u_has_crea_or_dattilo:
                     continue
                 # Se V=Allegra il lunedì → U deve essere Crea o Dattilo
                 for forb in _forbidden_in_u_if_v_allegra:
@@ -2826,9 +2845,9 @@ def solve_with_ortools(
     # Weekend night concentration: già gestito nel blocco J sopra con hard max=2 e strong soft
     model.Minimize(sum(objective_terms + extra_obj))
     solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = 120.0
+    solver.parameters.max_time_in_seconds = 300.0
     solver.parameters.num_search_workers = 8
-    # solver.parameters.relative_gap_limit = 0.0   # continua a cercare fino all'ottimo o al timeout
+    solver.parameters.relative_gap_limit = 0.0   # continua a cercare fino all'ottimo o al timeout
     status = solver.Solve(model)
     if status not in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
         # Model is truly infeasible even with soft-required slack variables.
