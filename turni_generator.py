@@ -2826,9 +2826,9 @@ def solve_with_ortools(
     # Weekend night concentration: già gestito nel blocco J sopra con hard max=2 e strong soft
     model.Minimize(sum(objective_terms + extra_obj))
     solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = 180.0
+    solver.parameters.max_time_in_seconds = 120.0
     solver.parameters.num_search_workers = 8
-    solver.parameters.relative_gap_limit = 0.0   # continua a cercare fino all'ottimo o al timeout
+    # solver.parameters.relative_gap_limit = 0.0   # continua a cercare fino all'ottimo o al timeout
     status = solver.Solve(model)
     if status not in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
         # Model is truly infeasible even with soft-required slack variables.
