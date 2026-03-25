@@ -1529,7 +1529,11 @@ def solve_with_ortools(
     # b_blank == 1 means the slot is left empty (penalized at 5_000_000).
     # This makes the model ALWAYS feasible and lets the solver identify
     # which slots genuinely cannot be filled (they show up blank in the output).
+    # Gerarchia sacrifici (crescente = si sacrifica per primo):
+    #   K=T share: 5K  →  L blank: 20K  →  R blank: 40K  →  altri required: 5M  →  H/I/J: 50M (MAI)
     BLANK_REQUIRED_PENALTY = 5_000_000
+    BLANK_CRITICAL_PENALTY = 50_000_000  # H, I, J: praticamente mai vuoti
+    _CRITICAL_TAGS = {"H", "I", "J", "Festivo_HI"}
     blank_required_vars: Dict[str, object] = {}  # slot_id -> b_blank var (for diagnostics)
     for s in slots:
         vars_ = [x[(s.slot_id, d)] for d in s.allowed if (s.slot_id, d) in x]
@@ -1539,7 +1543,8 @@ def solve_with_ortools(
         if s.required:
             b_blank = model.NewBoolVar(f"blank_req_{hash(s.slot_id)%10**8}")
             model.Add(sum(vars_) + b_blank == 1)
-            extra_obj.append(BLANK_REQUIRED_PENALTY * b_blank)
+            penalty = BLANK_CRITICAL_PENALTY if s.rule_tag in _CRITICAL_TAGS else BLANK_REQUIRED_PENALTY
+            extra_obj.append(penalty * b_blank)
             blank_required_vars[s.slot_id] = b_blank
         else:
             # Optional slot: can be left blank. If blank_penalty>0, we penalize blanks so it is used only as a last resort.
