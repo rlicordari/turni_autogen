@@ -1257,10 +1257,6 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                         restricted = [d for d in pool if norm_name(d) in {_crea, _dattilo}]
                         if restricted:  # applica solo se almeno uno è disponibile
                             pool = restricted
-                        else:
-                            # Crea/Dattilo assenti: Allegra è dedicata a V → rimuovila da U
-                            # così U va al prossimo disponibile (es. D'Angelo) senza competere con V
-                            pool = [d for d in pool if norm_name(d) != _allegra]
                 slots.append(Slot(day, f"{day.date}-U", ["U"], pool, required=True, shift=u_shift, rule_tag="U"))
         # ---- V Sala PM (Mon,Wed,Fri)
         # Default: venerdì = turno doppio (Crea + Dattilo|Allegra), lun/mer = singolo.
@@ -2466,14 +2462,6 @@ def solve_with_ortools(
                 v_allegra = x.get((sV.slot_id, _allegra))
                 if v_allegra is None:
                     continue
-                # Sicurezza: salta il vincolo se né Crea né Dattilo sono disponibili in U quel giorno.
-                # Senza questa guardia, il vincolo renderebbe U genuinamente infeasible
-                # (V forzata ad Allegra, e gli unici ammessi in U sarebbero Crea/Dattilo → impossibile).
-                u_has_crea_or_dattilo = any(
-                    x.get((sU.slot_id, d)) is not None for d in [_crea, _dattilo]
-                )
-                if not u_has_crea_or_dattilo:
-                    continue
                 # Se V=Allegra il lunedì → U deve essere Crea o Dattilo
                 for forb in _forbidden_in_u_if_v_allegra:
                     u_forb = x.get((sU.slot_id, forb))
@@ -2839,9 +2827,8 @@ def solve_with_ortools(
     # Weekend night concentration: già gestito nel blocco J sopra con hard max=2 e strong soft
     model.Minimize(sum(objective_terms + extra_obj))
     solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = 300.0
+    solver.parameters.max_time_in_seconds = 30.0
     solver.parameters.num_search_workers = 8
-    solver.parameters.relative_gap_limit = 0.0   # continua a cercare fino all'ottimo o al timeout
     status = solver.Solve(model)
     if status not in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
         # Model is truly infeasible even with soft-required slack variables.
