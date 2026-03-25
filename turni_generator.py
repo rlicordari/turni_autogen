@@ -1554,25 +1554,6 @@ def solve_with_ortools(
                 extra_obj.append(b * int(getattr(s, "blank_penalty", 0)))
             else:
                 model.Add(sum(vars_) <= 1)
-    # AC (Scintigrafia) priority: se il pool di AC quel giorno ha un solo medico,
-    # nessun altro slot dello stesso giorno può usare quel medico.
-    # Questo garantisce che Migliorato vada in AC prima di qualsiasi altro turno.
-    _ac_slots_by_date: Dict[dt.date, Slot] = {}
-    for s in slots:
-        if s.rule_tag == "AC" and len(s.allowed) == 1:
-            _ac_slots_by_date[s.day.date] = s
-    for s in slots:
-        if s.rule_tag == "AC":
-            continue
-        d = s.day.date
-        ac_s = _ac_slots_by_date.get(d)
-        if ac_s is None:
-            continue
-        sole_doc = ac_s.allowed[0]
-        xv = x.get((s.slot_id, sole_doc))
-        if xv is not None:
-            model.Add(xv == 0)  # nessun altro slot può usare il medico riservato ad AC
-
     # Helper: slots per day
     slots_by_day: Dict[dt.date, List[Slot]] = defaultdict(list)
     for s in slots:
