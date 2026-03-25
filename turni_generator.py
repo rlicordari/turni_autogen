@@ -1198,10 +1198,9 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                 if "Recupero" in doctors_set and "Recupero" not in pool:
                     pool.append("Recupero")
                 pool = apply_unavailability(pool, day, "Mattina", unav)
-                # Se il pool ha medici disponibili → obbligatorio; se vuoto → opzionale con penalità
-                _, bp = req_and_blank("L")
-                req = bool(pool)
-                slots.append(Slot(day, f"{day.date}-L", ["L"], pool, required=req, blank_penalty=(0 if req else bp), shift="Mattina", rule_tag="L"))
+                # L usa sempre il relief valve (20K) — priorità inferiore a H (5M obbligatorio)
+                req_relief, bp = req_and_blank("L")
+                slots.append(Slot(day, f"{day.date}-L", ["L"], pool, required=req_relief, blank_penalty=bp, shift="Mattina", rule_tag="L"))
         # ---- Q Eco base (Mon-Sat)
         if "Q" in rules and not festivo:
             r = rules["Q"]
@@ -1215,10 +1214,9 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
             if dayspec_contains(day.dow, r.get("days")):
                 pool = mk_allowed(r.get("pool") or [])
                 pool = apply_unavailability(pool, day, "Mattina", unav)
-                # Se il pool ha medici disponibili → obbligatorio; se vuoto → opzionale con penalità
-                _, bp = req_and_blank("R")
-                req = bool(pool)
-                slots.append(Slot(day, f"{day.date}-R", ["R"], pool, required=req, blank_penalty=(0 if req else bp), shift="Mattina", rule_tag="R"))
+                # R usa sempre il relief valve (40K) — priorità inferiore agli slot obbligatori
+                req_relief, bp = req_and_blank("R")
+                slots.append(Slot(day, f"{day.date}-R", ["R"], pool, required=req_relief, blank_penalty=bp, shift="Mattina", rule_tag="R"))
         # ---- S (Wed, optional if can be absorbed in R)
         if "S" in rules and not festivo:
             r = rules["S"]
