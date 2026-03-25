@@ -99,10 +99,14 @@ rules:
     - Migliorato
     - Trio
     - Dattilo
+    - Manganaro
     excluded:
     - Grimaldi
     - Calabrò
     - Zito
+    quotas:
+      Manganaro: 2
+      De Gregorio: 1
     notes: 'Per domeniche/festivi: D+E unificati e H+I unificati; usare questo pool.'
   D_F:
     allowed:

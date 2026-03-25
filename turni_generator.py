@@ -2198,6 +2198,19 @@ def solve_with_ortools(
             vars_ = [v for v in vars_ if v is not None]
             if vars_:
                 model.Add(sum(vars_) == int(q))
+    # Monthly quotas (hard) — Festivi DE+HI
+    if "rules" in cfg and "Festivi" in cfg["rules"]:
+        rFest = cfg["rules"]["Festivi"]
+        fest_quotas = {norm_name(k): int(v) for k, v in (rFest.get("quotas") or {}).items()}
+        if fest_quotas:
+            festivo_slots = [s for s in slots if s.rule_tag in ("Festivo_DE", "Festivo_HI")]
+            for doc, q in fest_quotas.items():
+                if doc not in doctors:
+                    continue
+                vars_ = [x.get((s.slot_id, doc)) for s in festivo_slots]
+                vars_ = [v for v in vars_ if v is not None]
+                if vars_:
+                    model.Add(sum(vars_) == q)
     # Soft: alcuni medici devono preferibilmente avere almeno N notti weekend (sab/dom)
     if "rules" in cfg and "J" in cfg["rules"]:
         rJ_wn = cfg["rules"]["J"]
