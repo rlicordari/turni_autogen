@@ -2215,16 +2215,16 @@ def solve_with_ortools(
             if vars_:
                 model.Add(sum(vars_) == int(q))
     # Festivi DE quotas: per-doctor hard quota on DE (Mattina festivo) slots
-    if "rules" in cfg and "Festivi" in cfg["rules"]:
-        dq = (cfg["rules"]["Festivi"] or {}).get("de_quotas") or {}
-        de_slot_ids = [s.slot_id for s in slots if getattr(s, "rule_tag", "") == "Festivo_DE"]
-        for doc_raw, q in dq.items():
-            doc = norm_name(doc_raw)
-            if doc not in doctors:
-                continue
-            vars_ = [x[(sid, doc)] for sid in de_slot_ids if (sid, doc) in x]
-            if vars_:
-                model.Add(sum(vars_) == int(q))
+    #if "rules" in cfg and "Festivi" in cfg["rules"]:
+     #   dq = (cfg["rules"]["Festivi"] or {}).get("de_quotas") or {}
+      #  de_slot_ids = [s.slot_id for s in slots if getattr(s, "rule_tag", "") == "Festivo_DE"]
+       # for doc_raw, q in dq.items():
+        #    doc = norm_name(doc_raw)
+         #   if doc not in doctors:
+          #      continue
+           # vars_ = [x[(sid, doc)] for sid in de_slot_ids if (sid, doc) in x]
+            #if vars_:
+             #   model.Add(sum(vars_) == int(q))
     # Soft: alcuni medici devono preferibilmente avere almeno N notti weekend (sab/dom)
     if "rules" in cfg and "J" in cfg["rules"]:
         rJ_wn = cfg["rules"]["J"]
