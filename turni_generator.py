@@ -1962,16 +1962,6 @@ def solve_with_ortools(
                 v2 = night_var_by_day_doc.get((d2, doc))
                 if v1 is not None and v2 is not None:
                     model.Add(v1 + v2 <= 1)
-    # Protezione AC: se AC il giorno d ha un solo medico disponibile,
-    # quel medico NON può fare notte (J) il giorno d-1.
-    # Senza questo vincolo, la night_off del giorno successivo blocca il medico da AC.
-    import datetime as _dt_ac
-    for ac_date, ac_s in _ac_slots_by_date.items():
-        sole_doc = ac_s.allowed[0]
-        prev_date = ac_date - _dt_ac.timedelta(days=1)
-        j_prev = night_var_by_day_doc.get((prev_date, sole_doc))
-        if j_prev is not None:
-            model.Add(j_prev == 0)  # hard: non può fare notte la sera prima di AC
     # Reperibilità constraints: not night same day + next 2 days
     if "rules" in cfg and "C_reperibilita" in cfg["rules"]:
         rC = cfg["rules"]["C_reperibilita"]
