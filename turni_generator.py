@@ -3221,6 +3221,24 @@ def write_output(
                 doc_eligible_by_date[s_date][doc] = set()
             doc_eligible_by_date[s_date][doc].update(keys)
 
+    # Per i giorni festivi con assegnazione forzata (sorteggio), s.allowed viene ridotto
+    # a [solo_quel_medico], quindi gli altri medici del pool festivi spariscono da
+    # doc_eligible_by_date → non appaiono in Medici liberi. Aggiungiamo il pool completo.
+    if cfg and isinstance(cfg.get("rules"), dict):
+        rFest = (cfg["rules"].get("Festivi") or {})
+        _fp_m = [norm_name(d) for d in (rFest.get("pool_mattina") or rFest.get("pool") or []) if d]
+        _fp_p = [norm_name(d) for d in (rFest.get("pool_pomeriggio") or rFest.get("pool") or []) if d]
+        for drow in days:
+            if not is_festivo(drow, cfg):
+                continue
+            fdate = drow.date
+            if fdate not in doc_eligible_by_date:
+                doc_eligible_by_date[fdate] = {}
+            for doc in _fp_m:
+                doc_eligible_by_date[fdate].setdefault(doc, set()).add("M")
+            for doc in _fp_p:
+                doc_eligible_by_date[fdate].setdefault(doc, set()).add("P")
+
     def _free_label(doc: str, unav_shifts: Set[str], eligible: Set[str]) -> Optional[str]:
         """Restituisce la stringa da scrivere in Medici liberi, o None se non disponibile.
         - eligible: fasce (M/P/N) per cui il medico è in almeno un pool in quel giorno
