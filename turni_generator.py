@@ -2213,6 +2213,31 @@ def solve_with_ortools(
                 vars_ = [v for v in vars_ if v is not None]
                 if vars_:
                     model.Add(sum(vars_) == q)
+    # Soft balance festivi — minimizza il massimo carico tra i medici del pool
+    # senza quota fissa (evita Crea=3, Trio=0 ecc.)
+    if "rules" in cfg and "Festivi" in cfg["rules"]:
+        try:
+            rFest = cfg["rules"]["Festivi"]
+            fest_pool_raw = [norm_name(d) for d in (rFest.get("pool") or [])
+                             if norm_name(d) in doctors and norm_name(d) != "Recupero"]
+            fest_fixed = {norm_name(k) for k in (rFest.get("quotas") or {}).keys()}
+            balance_pool = [d for d in fest_pool_raw if d not in fest_fixed]
+            festivo_slots_all = [s for s in slots if s.rule_tag in ("Festivo_DE", "Festivo_HI")]
+            fest_bal_w = int(rFest.get("balance_weight") or 500)
+            if balance_pool and festivo_slots_all:
+                max_fest = model.NewIntVar(0, len(festivo_slots_all), "max_fest_load")
+                for d in balance_pool:
+                    vars_d = [x[(s.slot_id, d)] for s in festivo_slots_all
+                              if (s.slot_id, d) in x]
+                    if not vars_d:
+                        continue
+                    load_d = model.NewIntVar(0, len(festivo_slots_all),
+                                            f"fest_load_{hash(d) % 10**6}")
+                    model.Add(load_d == sum(vars_d))
+                    model.Add(load_d <= max_fest)
+                extra_obj.append(fest_bal_w * max_fest)
+        except Exception:
+            pass
     # Soft: alcuni medici devono preferibilmente avere almeno N notti weekend (sab/dom)
     if "rules" in cfg and "J" in cfg["rules"]:
         rJ_wn = cfg["rules"]["J"]
