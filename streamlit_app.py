@@ -2168,7 +2168,7 @@ if mode == "Indisponibilità (Medico)":
             info_by_month[(yy, mm)] = info
 
             counts = info.get("counts", {}) or {}
-            over = {sh: n for sh, n in counts.items() if n > max_per_shift_for_doctor}
+            over = {sh: n for sh, n in counts.items() if sh != "Ferie" and n > max_per_shift_for_doctor}
             violations_by_month[(yy, mm)] = over
 
             if info.get("out_of_month"):
@@ -2181,7 +2181,10 @@ if mode == "Indisponibilità (Medico)":
 
             st.caption(
                 "Conteggi mese (per fascia): "
-                + ", ".join([f"{sh} {counts.get(sh, 0)}/{max_per_shift_for_doctor}" for sh in FASCIA_OPTIONS])
+                + ", ".join([
+                    f"{sh} {counts.get(sh, 0)}/{'∞' if sh == 'Ferie' else max_per_shift_for_doctor}"
+                    for sh in FASCIA_OPTIONS
+                ])
             )
 
             if over:
@@ -2415,7 +2418,7 @@ if mode == "Indisponibilità (Medico)":
             counts = {}
             for _d, sh, _n in entries_norm:
                 counts[sh] = counts.get(sh, 0) + 1
-            over = {sh: n for sh, n in counts.items() if n > max_per_shift_for_doctor}
+            over = {sh: n for sh, n in counts.items() if sh != "Ferie" and n > max_per_shift_for_doctor}
             if over:
                 hard_viol.append(
                     f"{yy}-{mm:02d}: " + ", ".join([f"{sh} {n}/{max_per_shift_for_doctor}" for sh, n in over.items()])
