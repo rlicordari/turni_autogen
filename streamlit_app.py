@@ -2188,7 +2188,10 @@ if mode == "Indisponibilità (Medico)":
             )
 
             if over:
-                pretty = ", ".join([f"{sh}: {n}/{max_per_shift_for_doctor}" for sh, n in over.items()])
+                pretty = ", ".join([
+                    f"{sh}: {n}/{'∞' if sh == 'Ferie' else max_per_shift_for_doctor}"
+                    for sh, n in over.items()
+                ])
                 st.error(f"Limite superato in questo mese → {pretty}. Rimuovi alcune righe prima di salvare.")
 
             # ── Pulsante salva indisponibilità (tra le due sezioni) ──────────────
