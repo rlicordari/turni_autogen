@@ -95,6 +95,15 @@ starttls = true
 - I nomi dei medici in `Regole_Turni.yml` devono corrispondere **esattamente** ai nomi nei file di indisponibilità e in `doctor_contacts.yml`.
 - Valori ammessi per `Fascia`: `Mattina`, `Pomeriggio`, `Notte`, `Diurno` (= Mattina + Pomeriggio), `Tutto il giorno`.
 - Le lettere di colonna (C, D, E, …) nel YAML corrispondono direttamente alle colonne Excel del template.
-- `absolute_exclusions` nel YAML elenca i medici mai assegnati ad alcun turno.
+- `absolute_exclusions` nel YAML elenca i medici mai assegnati ad alcun turno. Attualmente esclusi: De Luca, Carciotto, Virga, Andò, Saporito, D'Angelo.
+- **D'Angelo** è stata esclusa temporaneamente (aprile 2026). Per reinserirla, aggiungere "D'Angelo" nei seguenti pool/liste in `Regole_Turni.yml`:
+  - `E_G.allowed` (Cardiologia mattina / Riabilitazione)
+  - `Q.pool` (ECO base)
+  - `T.pool` (Interni)
+  - `U.pool` (Contr.PM)
+  - `Y.other_pool` (Ambulatori specialistici)
+  - `Z.pool` (Vascolare)
+  - `AB.fallback_pool` (Holter/Brugada/FA)
+  - Rimuoverla da `absolute_exclusions` e da `C_reperibilita.excluded` (se applicabile al mese).
 - I medici universitari (`university_doctors`) possono avere `night_counts_double: true` per dimezzare la quota effettiva di notti.
 - La sezione `relief_valves` definisce fallback ad alta penalità per evitare l'infeasibility (es. permettere una colonna vuota a costo elevato anziché fallire).

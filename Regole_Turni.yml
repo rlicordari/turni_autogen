@@ -84,7 +84,6 @@ rules:
     excluded:
     - Zito
     - Manganaro
-    - D'Angelo
     - Recupero
     - De Gregorio
   Festivi:
@@ -140,7 +139,6 @@ rules:
     - Crea
     - Allegra
     - Cimino
-    - D'Angelo
     - Pugliatti
     - De Gregorio
     - Manganaro
@@ -244,7 +242,6 @@ rules:
     - Colarusso
     - Zito
     - Pugliatti
-    - D'Angelo
     - Manganaro
     - Cusmà
     - Licordari
@@ -284,7 +281,6 @@ rules:
     - Allegra
     - Licordari
     - Manganaro
-    - D'Angelo
     - Recupero
     balance: true
     recupero_min_per_month: 4
@@ -299,7 +295,6 @@ rules:
     - Tue
     pool:
     - Crea
-    - D'Angelo
     - Allegra
     - Dattilo
     - Cimino
@@ -333,7 +328,6 @@ rules:
     other_pool:
     - Licordari
     - Colarusso
-    - D'Angelo
     recupero_affianca_in_T: true
   Z:
     days:
@@ -343,7 +337,6 @@ rules:
     - De Gregorio
     - Manganaro
     - Cusmà
-    - D'Angelo
     - Licordari
     balance: true
     balance_weight: 120
@@ -363,7 +356,6 @@ rules:
     - Dattilo
     - Cimino
     - Allegra
-    - D'Angelo
     saturday_per_month: 2
     saturday_only_doctor: Crea
     saturday_soft: false
@@ -379,3 +371,4 @@ absolute_exclusions:
 - Virga
 - Andò
 - Saporito
+- D'Angelo

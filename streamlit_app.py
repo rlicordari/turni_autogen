@@ -2056,44 +2056,7 @@ if mode == "Indisponibilità (Medico)":
                 last_day = date(yy, mm + 1, 1) - timedelta(days=1)
 
             if unav_open:
-                cA, cB, cC = st.columns([1, 1, 6])
-                with cA:
-                    add_row = st.button("➕ Aggiungi riga", key=f"{rows_key}__add", use_container_width=True)
-                with cB:
-                    clean_rows = st.button("🧹 Pulisci righe vuote", key=f"{rows_key}__clean", use_container_width=True)
-                with cC:
-                    pass
-
                 rows = list(st.session_state.get(rows_key) or [])
-
-                if add_row:
-                    rows.append({
-                        "id": str(uuid.uuid4()),
-                        "Data": first_day,
-                        "Fascia": "Mattina",
-                        "Note": "",
-                    })
-                    st.session_state[rows_key] = rows
-                    st.rerun()
-
-                if clean_rows:
-                    def _is_empty(_x: dict) -> bool:
-                        d = _x.get("Data")
-                        sh = str(_x.get("Fascia") or "").strip()
-                        note = str(_x.get("Note") or "").strip()
-                        return (not d) and (not sh) and (not note)
-
-                    rows = [r for r in rows if not _is_empty(r)]
-                    if not rows:
-                        # keep at least one starter row (precompilata)
-                        rows = [{
-                            "id": str(uuid.uuid4()),
-                            "Data": first_day,
-                            "Fascia": "Mattina",
-                            "Note": "",
-                        }]
-                    st.session_state[rows_key] = rows
-                    st.rerun()
 
                 if not rows:
                     rows = [{
@@ -2225,7 +2188,7 @@ if mode == "Indisponibilità (Medico)":
             # ── Pulsante salva indisponibilità (tra le due sezioni) ──────────────
             _can_save = bool(unav_open) and not bool(over)
             render_unav_flash(doctor)
-            _sc1, _sc2 = st.columns([1, 2])
+            _sc1, _sc2, _sc3, _sc4 = st.columns([2, 1, 1, 2])
             with _sc1:
                 save = st.button(
                     "Salva indisponibilità",
@@ -2233,6 +2196,39 @@ if mode == "Indisponibilità (Medico)":
                     type="primary",
                     disabled=not _can_save,
                 )
+            with _sc2:
+                add_row = st.button("➕ Aggiungi riga", key=f"{rows_key}__add", use_container_width=True, disabled=not unav_open)
+            with _sc3:
+                clean_rows = st.button("🧹 Pulisci vuote", key=f"{rows_key}__clean", use_container_width=True, disabled=not unav_open)
+
+            if add_row:
+                new_rows_state = list(st.session_state.get(rows_key) or [])
+                new_rows_state.append({
+                    "id": str(uuid.uuid4()),
+                    "Data": first_day,
+                    "Fascia": "Mattina",
+                    "Note": "",
+                })
+                st.session_state[rows_key] = new_rows_state
+                st.rerun()
+
+            if clean_rows:
+                def _is_empty(_x: dict) -> bool:
+                    d = _x.get("Data")
+                    sh = str(_x.get("Fascia") or "").strip()
+                    note = str(_x.get("Note") or "").strip()
+                    return (not d) and (not sh) and (not note)
+
+                _cleaned = [r for r in (st.session_state.get(rows_key) or []) if not _is_empty(r)]
+                if not _cleaned:
+                    _cleaned = [{
+                        "id": str(uuid.uuid4()),
+                        "Data": first_day,
+                        "Fascia": "Mattina",
+                        "Note": "",
+                    }]
+                st.session_state[rows_key] = _cleaned
+                st.rerun()
 
             # ── Disponibilità (preferenze) ──────────────────────────────────────────
             st.divider()
@@ -2265,24 +2261,6 @@ if mode == "Indisponibilità (Medico)":
                         ]
 
                 if unav_open:
-                    cAv1, cAv2, _ = st.columns([1, 1, 6])
-                    with cAv1:
-                        if st.button("➕ Aggiungi", key=f"{avail_key}__add", use_container_width=True):
-                            st.session_state[avail_key].append({
-                                "id": str(uuid.uuid4()),
-                                "Data": date(yy, mm, 1),
-                                "Fascia": "Mattina",
-                                "Note": "",
-                            })
-                            st.rerun()
-                    with cAv2:
-                        if st.button("🧹 Pulisci", key=f"{avail_key}__clean", use_container_width=True):
-                            st.session_state[avail_key] = [
-                                r for r in st.session_state[avail_key]
-                                if r.get("Data") or str(r.get("Note","")).strip()
-                            ] or [{"id": str(uuid.uuid4()), "Data": date(yy, mm, 1), "Fascia": "Mattina", "Note": ""}]
-                            st.rerun()
-
                     _PRIORITY_OPTIONS = ["media", "alta", "bassa"]
                     _PRIORITY_LABELS = {"alta": "⬆ Alta", "media": "● Media", "bassa": "⬇ Bassa"}
                     av_rows = list(st.session_state.get(avail_key) or [])
@@ -2330,7 +2308,26 @@ if mode == "Indisponibilità (Medico)":
 
                     st.divider()
                     _save_avail_disabled = bool(av_over)
-                    if st.button("Salva preferenze", key=f"save_avail_{doctor}_{yy}_{mm}", type="primary", disabled=_save_avail_disabled):
+                    _av_sc1, _av_sc2, _av_sc3, _av_sc4 = st.columns([2, 1, 1, 2])
+                    with _av_sc1:
+                        _do_save_avail = st.button("Salva preferenze", key=f"save_avail_{doctor}_{yy}_{mm}", type="primary", disabled=_save_avail_disabled)
+                    with _av_sc2:
+                        if st.button("➕ Aggiungi", key=f"{avail_key}__add", use_container_width=True):
+                            st.session_state[avail_key].append({
+                                "id": str(uuid.uuid4()),
+                                "Data": date(yy, mm, 1),
+                                "Fascia": "Mattina",
+                                "Note": "",
+                            })
+                            st.rerun()
+                    with _av_sc3:
+                        if st.button("🧹 Pulisci", key=f"{avail_key}__clean", use_container_width=True):
+                            st.session_state[avail_key] = [
+                                r for r in st.session_state[avail_key]
+                                if r.get("Data") or str(r.get("Note","")).strip()
+                            ] or [{"id": str(uuid.uuid4()), "Data": date(yy, mm, 1), "Fascia": "Mattina", "Note": ""}]
+                            st.rerun()
+                    if _do_save_avail:
                         _avail_entries = [
                             (r["Data"], r.get("Fascia", "Mattina"), r.get("Note", ""), r.get("Priorita", "media"))
                             for r in (st.session_state.get(avail_key) or [])
