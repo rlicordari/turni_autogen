@@ -87,7 +87,7 @@ def render_unav_flash(doctor: str) -> None:
             st.rerun()
 
 # ---- Indisponibilità: fasce ammesse e normalizzazione (per compatibilità con valori "storici") ----
-FASCIA_OPTIONS = ["Mattina", "Pomeriggio", "Notte", "Diurno", "Tutto il giorno"]
+FASCIA_OPTIONS = ["Mattina", "Pomeriggio", "Notte", "Diurno", "Tutto il giorno", "Ferie"]
 
 def normalize_fascia(val: object) -> tuple[str, bool, bool]:
     """Return (canonical_value, changed, unknown).
@@ -113,6 +113,7 @@ def normalize_fascia(val: object) -> tuple[str, bool, bool]:
         "tutto giorno": "Tutto il giorno",
         "all day": "Tutto il giorno",
         "giornata intera": "Tutto il giorno",
+        "ferie": "Ferie",
     }
     if key in direct:
         canon = direct[key]
@@ -129,6 +130,8 @@ def normalize_fascia(val: object) -> tuple[str, bool, bool]:
         return "Pomeriggio", True, False
     if "nott" in key or "night" in key or key == "n":
         return "Notte", True, False
+    if "ferie" in key or "vacan" in key or "holiday" in key or "leave" in key:
+        return "Ferie", True, False
 
     # unknown
     return "Tutto il giorno", True, True
