@@ -313,7 +313,7 @@ def shifts_from_fascia(x: str) -> Set[str]:
     """
     s = str(x).strip().lower()
     # Full-day first (because it contains 'giorno')
-    if any(k in s for k in ["tutto", "intera", "completa", "allday", "all day", "full day", "24h", "24 h"]):
+    if any(k in s for k in ["tutto", "intera", "completa", "allday", "all day", "full day", "24h", "24 h", "ferie", "vacan", "holiday", "leave"]):
         return {"Any"}
     # Daytime (morning + afternoon, but still allows night)
     if s in ["diurno", "giorno", "daytime", "day"] or s.startswith("diurn"):
