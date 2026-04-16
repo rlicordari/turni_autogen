@@ -310,6 +310,7 @@ def shifts_from_fascia(x: str) -> Set[str]:
       - Mattina / Pomeriggio / Notte  -> that single shift
       - Diurno (or Giorno)            -> {'Mattina','Pomeriggio'}
       - Tutto il giorno / All day     -> {'Any'} (treated as full-day)
+      - Ferie / Vacanza / Holiday / Leave -> {'Any'} (treated as full-day)
     """
     s = str(x).strip().lower()
     # Full-day first (because it contains 'giorno')
