@@ -2102,15 +2102,19 @@ if mode == "Indisponibilità (Medico)":
                             st.error("La data di fine deve essere uguale o successiva alla data di inizio.")
                         else:
                             _current_rows = list(st.session_state.get(rows_key) or [])
+                            _existing_ferie_dates = {
+                                r["Data"] for r in _current_rows if r.get("Fascia") == "Ferie"
+                            }
                             _delta = (_ferie_end - _ferie_start).days + 1
                             for _offset in range(_delta):
                                 _d = _ferie_start + timedelta(days=_offset)
-                                _current_rows.append({
-                                    "id": str(uuid.uuid4()),
-                                    "Data": _d,
-                                    "Fascia": "Ferie",
-                                    "Note": "",
-                                })
+                                if _d not in _existing_ferie_dates:
+                                    _current_rows.append({
+                                        "id": str(uuid.uuid4()),
+                                        "Data": _d,
+                                        "Fascia": "Ferie",
+                                        "Note": "",
+                                    })
                             st.session_state[rows_key] = _current_rows
                             st.rerun()
 
