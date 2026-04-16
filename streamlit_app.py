@@ -88,6 +88,7 @@ def render_unav_flash(doctor: str) -> None:
 
 # ---- Indisponibilità: fasce ammesse e normalizzazione (per compatibilità con valori "storici") ----
 FASCIA_OPTIONS = ["Mattina", "Pomeriggio", "Notte", "Diurno", "Tutto il giorno", "Ferie"]
+AVAIL_FASCIA_OPTIONS = [f for f in FASCIA_OPTIONS if f != "Ferie"]
 
 def normalize_fascia(val: object) -> tuple[str, bool, bool]:
     """Return (canonical_value, changed, unknown).
@@ -2331,8 +2332,8 @@ if mode == "Indisponibilità (Medico)":
                                                     key=f"{avail_key}_{av_r['id']}_d",
                                                     format="DD/MM/YYYY")
                         with av_c2:
-                            av_shift = st.selectbox("Fascia", FASCIA_OPTIONS,
-                                                    index=FASCIA_OPTIONS.index(av_r.get("Fascia","Mattina")) if av_r.get("Fascia","Mattina") in FASCIA_OPTIONS else 0,
+                            av_shift = st.selectbox("Fascia", AVAIL_FASCIA_OPTIONS,
+                                                    index=AVAIL_FASCIA_OPTIONS.index(av_r.get("Fascia","Mattina")) if av_r.get("Fascia","Mattina") in AVAIL_FASCIA_OPTIONS else 0,
                                                     key=f"{avail_key}_{av_r['id']}_s")
                         with av_c3:
                             _prev_pri = av_r.get("Priorita", "media")
@@ -2361,7 +2362,7 @@ if mode == "Indisponibilità (Medico)":
                     if av_over:
                         st.error(f"Limite disponibilità superato: {av_over}. Rimuovi alcune righe.")
                     else:
-                        st.caption("Conteggi: " + ", ".join([f"{sh} {av_counts.get(sh,0)}/{max_avail}" for sh in FASCIA_OPTIONS if av_counts.get(sh,0)>0]))
+                        st.caption("Conteggi: " + ", ".join([f"{sh} {av_counts.get(sh,0)}/{max_avail}" for sh in AVAIL_FASCIA_OPTIONS if av_counts.get(sh,0)>0]))
 
                     st.divider()
                     _save_avail_disabled = bool(av_over)
@@ -2472,7 +2473,7 @@ if mode == "Indisponibilità (Medico)":
             over = {sh: n for sh, n in counts.items() if sh != "Ferie" and n > max_per_shift_for_doctor}
             if over:
                 hard_viol.append(
-                    f"{yy}-{mm:02d}: " + ", ".join([f"{sh} {n}/{max_per_shift_for_doctor}" for sh, n in over.items()])
+                    f"{yy}-{mm:02d}: " + ", ".join([f"{sh} {n}/{'∞' if sh == 'Ferie' else max_per_shift_for_doctor}" for sh, n in over.items()])
                 )
 
         if hard_viol:
