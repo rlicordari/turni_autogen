@@ -2070,6 +2070,50 @@ if mode == "Indisponibilità (Medico)":
                     }]
                     st.session_state[rows_key] = rows
 
+                with st.expander("📅 Aggiungi periodo ferie", expanded=False):
+                    _fp_col1, _fp_col2, _fp_col3 = st.columns([2, 2, 1])
+                    with _fp_col1:
+                        _ferie_start = st.date_input(
+                            "Dal",
+                            value=first_day,
+                            min_value=first_day,
+                            max_value=last_day,
+                            key=f"{rows_key}__ferie_start",
+                            format="DD/MM/YYYY",
+                        )
+                    with _fp_col2:
+                        _ferie_end = st.date_input(
+                            "Al",
+                            value=first_day,
+                            min_value=first_day,
+                            max_value=last_day,
+                            key=f"{rows_key}__ferie_end",
+                            format="DD/MM/YYYY",
+                        )
+                    with _fp_col3:
+                        st.markdown("<br>", unsafe_allow_html=True)
+                        _add_ferie = st.button(
+                            "Aggiungi giorni",
+                            key=f"{rows_key}__ferie_add",
+                            use_container_width=True,
+                        )
+                    if _add_ferie:
+                        if _ferie_end < _ferie_start:
+                            st.error("La data di fine deve essere uguale o successiva alla data di inizio.")
+                        else:
+                            _current_rows = list(st.session_state.get(rows_key) or [])
+                            _delta = (_ferie_end - _ferie_start).days + 1
+                            for _offset in range(_delta):
+                                _d = _ferie_start + timedelta(days=_offset)
+                                _current_rows.append({
+                                    "id": str(uuid.uuid4()),
+                                    "Data": _d,
+                                    "Fascia": "Ferie",
+                                    "Note": "",
+                                })
+                            st.session_state[rows_key] = _current_rows
+                            st.rerun()
+
                 # Header
                 h1, h2, h3, h4 = st.columns([2, 2, 6, 1])
                 h1.markdown("**Data**")
