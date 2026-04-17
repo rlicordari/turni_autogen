@@ -1598,7 +1598,7 @@ st.markdown("""
 
 mode = st.sidebar.radio(
     "Sezione",
-    ["Indisponibilità (Medico)", "Genera turni (Admin)"],
+    ["📋 Le mie indisponibilità", "⚙️ Admin"],
     index=0,
 )
 
@@ -1609,7 +1609,7 @@ doctors_default = doctors_from_cfg(cfg_default)
 # =====================================================================
 #                        MEDICO – Indisponibilità
 # =====================================================================
-if mode == "Indisponibilità (Medico)":
+if mode == "📋 Le mie indisponibilità":
     st.subheader("Indisponibilità (Medico)")
 
     # GitHub is required for both indisponibilità storage and PIN self-service.
@@ -2163,11 +2163,10 @@ if mode == "Indisponibilità (Medico)":
                             st.rerun()
 
                 # Header
-                h1, h2, h3, h4 = st.columns([2, 2, 6, 1])
+                h1, h2, h3 = st.columns([2, 2, 1])
                 h1.markdown("**Data**")
                 h2.markdown("**Fascia**")
-                h3.markdown("**Note**")
-                h4.markdown("**Rimuovi**")
+                h3.markdown("**Rimuovi**")
 
                 remove_ids = []
                 new_rows = []
@@ -2187,7 +2186,7 @@ if mode == "Indisponibilità (Medico)":
                     if n_key not in st.session_state:
                         st.session_state[n_key] = r.get("Note", "")
 
-                    c1, c2, c3, c4 = st.columns([2, 2, 6, 1])
+                    c1, c2, c3 = st.columns([2, 2, 1], vertical_alignment="bottom")
                     with c1:
                         d_val = st.date_input(
                             "Data",
@@ -2205,14 +2204,15 @@ if mode == "Indisponibilità (Medico)":
                             label_visibility="collapsed",
                         )
                     with c3:
+                        if st.button("🗑️", key=rm_key, help="Rimuovi questa riga"):
+                            remove_ids.append(rid)
+                    _has_note = bool(str(st.session_state.get(n_key, "") or "").strip())
+                    with st.expander("📝 Note", expanded=_has_note):
                         note_val = st.text_input(
                             "Note",
                             key=n_key,
                             label_visibility="collapsed",
                         )
-                    with c4:
-                        if st.button("🗑️", key=rm_key, help="Rimuovi questa riga"):
-                            remove_ids.append(rid)
 
                     # Enforce month bounds (extra safety)
                     if isinstance(d_val, date):
@@ -2279,14 +2279,13 @@ if mode == "Indisponibilità (Medico)":
             if info.get("invalid_date"):
                 st.warning(f"⚠️ {info['invalid_date']} righe hanno una data non valida e sono state ignorate.")
 
-            st.caption(
-                "Conteggi mese (per fascia): "
-                + ", ".join([
-                    f"{sh} {counts.get(sh, 0)}/{'∞' if sh == 'Ferie' else max_per_shift_for_doctor}"
-                    for sh in FASCIA_OPTIONS
-                ])
-                + f" | Weekend: Sab {len(sat_days)}/{max_weekend_days_cfg}, Dom {len(sun_days)}/{max_weekend_days_cfg}"
-            )
+            _fascia_str = " · ".join([
+                f"{sh} {counts.get(sh, 0)}/{'∞' if sh == 'Ferie' else max_per_shift_for_doctor}"
+                for sh in FASCIA_OPTIONS
+                if counts.get(sh, 0) > 0
+            ]) or "nessuna indisponibilità inserita"
+            st.caption(f"Fasce: {_fascia_str}")
+            st.caption(f"Weekend: Sabati {len(sat_days)}/{max_weekend_days_cfg} · Domeniche {len(sun_days)}/{max_weekend_days_cfg}")
 
             if over:
                 pretty = ", ".join([
@@ -2684,49 +2683,48 @@ else:
         if cur_max < 0:
             cur_max = 0
 
-        cS1, cS2, cS3, cS4, cS5 = st.columns([1.4, 1, 1, 1, 1.5])
-        with cS1:
-            new_open = st.toggle(
-                "Consenti ai medici di inserire/modificare indisponibilità",
-                value=cur_open,
-                help="Se disattivato, i medici possono solo visualizzare le proprie indisponibilità ma non salvarle.",
-            )
-        with cS2:
+        new_open = st.toggle(
+            "Consenti ai medici di inserire/modificare indisponibilità",
+            value=cur_open,
+            help="Se disattivato, i medici possono solo visualizzare le proprie indisponibilità ma non salvarle.",
+        )
+        _aS1, _aS2, _aS3, _aS4 = st.columns([1, 1, 1, 1.5])
+        with _aS1:
             new_max = st.number_input(
-                "Max indisponibilità per fascia",
+                "Max indisponibilità/fascia",
                 min_value=0,
                 max_value=31,
                 value=int(cur_max),
                 step=1,
                 help="Esempio: 6 = max 6 Mattine, 6 Pomeriggi, ecc. per ogni mese.",
             )
-        with cS3:
+        with _aS2:
             try:
                 cur_max_avail = int(app_settings.get("max_availability_per_shift", DEFAULT_SETTINGS["max_availability_per_shift"]))
             except Exception:
                 cur_max_avail = DEFAULT_SETTINGS["max_availability_per_shift"]
             new_max_avail = st.number_input(
-                "Max disponibilità per fascia",
+                "Max disponibilità/fascia",
                 min_value=0,
                 max_value=31,
                 value=int(cur_max_avail),
                 step=1,
                 help="Max preferenze 'disponibilità' inseribili per fascia per mese.",
             )
-        with cS4:
+        with _aS3:
             try:
                 cur_max_weekend = int(app_settings.get("max_weekend_days", DEFAULT_SETTINGS["max_weekend_days"]))
             except Exception:
                 cur_max_weekend = DEFAULT_SETTINGS["max_weekend_days"]
             new_max_weekend = st.number_input(
-                "Max weekend per mese",
+                "Max weekend/mese",
                 min_value=0,
                 max_value=5,
                 value=int(cur_max_weekend),
                 step=1,
                 help="Max sabati distinti e max domeniche distinte che ogni medico può segnare come indisponibile in un mese (Ferie incluse).",
             )
-        with cS5:
+        with _aS4:
             meta = ""
             if app_settings.get("updated_at"):
                 meta += f"Ultimo aggiornamento: {app_settings.get('updated_at')}"
