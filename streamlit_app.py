@@ -1889,21 +1889,22 @@ if mode == "Indisponibilità (Medico)":
     sel_set = set(sel_default)
 
     st.subheader("Mese da compilare")
-    st.caption("Seleziona anno e mese, poi premi **Aggiungi mese** per visualizzare il modulo di inserimento. Puoi aggiungere più mesi.")
-    c1, c2, c3, c4 = st.columns([1, 1.4, 1.3, 1])
-    with c1:
+    st.caption("Seleziona anno e mese, poi premi **▶ Aggiungi mese** per visualizzare il modulo di inserimento. Puoi aggiungere più mesi.")
+    _ms_c1, _ms_c2 = st.columns([1, 2])
+    with _ms_c1:
         yy_sel = st.selectbox("Anno", year_options, key="doctor_year_sel")
-    with c2:
+    with _ms_c2:
         mm_sel = st.selectbox(
             "Mese",
             list(range(1, 13)),
-            format_func=lambda m: f"{m:02d} - {month_names.get(m, str(m))}",
+            format_func=lambda m: f"{m:02d} – {month_names.get(m, str(m))}",
             key="doctor_month_sel",
         )
-    with c3:
-        add_month = st.button("Aggiungi mese ▶", use_container_width=True, help="Aggiunge l’anno/mese selezionato all’elenco.", type="primary")
-    with c4:
-        remove_month = st.button("Rimuovi mese", use_container_width=True, help="Rimuove l’anno/mese selezionato dall’elenco.")
+    _ms_b1, _ms_b2, _ms_b3 = st.columns([2, 2, 2])
+    with _ms_b1:
+        add_month = st.button("▶ Aggiungi mese", use_container_width=True, help="Aggiunge l’anno/mese selezionato all’elenco.", type="primary")
+    with _ms_b2:
+        remove_month = st.button("✕ Rimuovi mese", use_container_width=True, help="Rimuove l’anno/mese selezionato dall’elenco.")
 
     cur = (int(yy_sel), int(mm_sel))
     if add_month:
@@ -1928,9 +1929,9 @@ if mode == "Indisponibilità (Medico)":
     # Barra di navigazione tra i mesi aggiunti
     if len(selected) > 1:
         st.caption("Passa da un mese all'altro:")
-        nav_cols = st.columns(min(len(selected), 6))
+        nav_cols = st.columns(min(len(selected), 3))
         for _ni, (_syy, _smm) in enumerate(selected):
-            with nav_cols[_ni % 6]:
+            with nav_cols[_ni % 3]:
                 _is_active = (_syy, _smm) == active_month
                 if st.button(
                     f"{month_names.get(_smm, str(_smm))} {_syy}",
@@ -1944,14 +1945,10 @@ if mode == "Indisponibilità (Medico)":
 
     # Stable baseline (snapshot) for this editing session.
     # This is what we compare against at save-time to detect a stale editor.
-    cR1, cR2 = st.columns([1, 3])
-    with cR1:
-        refresh_baseline = st.button(
-            "🔄 Ricarica dati",
-            help="Ricarica l’archivio dal server (utile se qualcuno ha appena salvato).",
-        )
-    with cR2:
-        pass
+    refresh_baseline = st.button(
+        "🔄 Ricarica dati",
+        help="Ricarica l’archivio dal server (utile se qualcuno ha appena salvato).",
+    )
 
     if refresh_baseline:
         # Reset baseline + local editors so the UI reflects the latest server state.
