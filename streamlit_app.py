@@ -1900,7 +1900,7 @@ if mode == "📋 Le mie indisponibilità":
             format_func=lambda m: f"{m:02d} – {month_names.get(m, str(m))}",
             key="doctor_month_sel",
         )
-    _ms_b1, _ms_b2, _ms_b3 = st.columns([2, 2, 2])
+    _ms_b1, _ms_b2 = st.columns([2, 2])
     with _ms_b1:
         add_month = st.button("▶ Aggiungi mese", use_container_width=True, help="Aggiunge l’anno/mese selezionato all’elenco.", type="primary")
     with _ms_b2:
@@ -2447,9 +2447,9 @@ if mode == "📋 Le mie indisponibilità":
 
                     st.divider()
                     _save_avail_disabled = bool(av_over)
-                    _av_sc1, _av_sc2, _av_sc3, _av_sc4 = st.columns([2, 1, 1, 2])
+                    _av_sc1, _av_sc2, _av_sc3 = st.columns([3, 2, 2])
                     with _av_sc1:
-                        _do_save_avail = st.button("Salva preferenze", key=f"save_avail_{doctor}_{yy}_{mm}", type="primary", disabled=_save_avail_disabled)
+                        _do_save_avail = st.button("💾 Salva preferenze", key=f"save_avail_{doctor}_{yy}_{mm}", type="primary", disabled=_save_avail_disabled, use_container_width=True)
                     with _av_sc2:
                         if st.button("➕ Aggiungi", key=f"{avail_key}__add", use_container_width=True):
                             st.session_state[avail_key].append({
