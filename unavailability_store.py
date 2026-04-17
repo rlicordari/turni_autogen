@@ -20,7 +20,7 @@ import datetime as dt
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
 
-VALID_SHIFTS = {"Mattina", "Pomeriggio", "Notte", "Diurno", "Tutto il giorno"}
+VALID_SHIFTS = {"Mattina", "Pomeriggio", "Notte", "Diurno", "Tutto il giorno", "Ferie"}
 
 def norm_shift(s: str) -> str:
     s0 = (s or "").strip()
