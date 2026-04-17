@@ -2115,7 +2115,7 @@ if mode == "📋 Le mie indisponibilità":
                         "I sabati e le domeniche in ferie contano nel limite di "
                         f"{max_weekend_days_cfg} sabati e {max_weekend_days_cfg} domeniche al mese."
                     )
-                    _fp_col1, _fp_col2, _fp_col3 = st.columns([2, 2, 1])
+                    _fp_col1, _fp_col2, _fp_col3 = st.columns([2, 2, 1], vertical_alignment="bottom")
                     with _fp_col1:
                         _ferie_start = st.date_input(
                             "Dal",
@@ -2135,7 +2135,6 @@ if mode == "📋 Le mie indisponibilità":
                             format="DD/MM/YYYY",
                         )
                     with _fp_col3:
-                        st.markdown("<br>", unsafe_allow_html=True)
                         _add_ferie = st.button(
                             "Aggiungi giorni",
                             key=f"{rows_key}__ferie_add",
