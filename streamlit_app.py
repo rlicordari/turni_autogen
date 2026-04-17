@@ -1587,6 +1587,14 @@ def release_doctor_session(doctor: str):
 
 # ---------------- UI: Header ----------------
 st.title("UOC Cardiologia con UTIC - Turni")
+st.markdown("""
+<style>
+@media (max-width: 640px) {
+    .block-container { padding-left: 0.75rem !important; padding-right: 0.75rem !important; }
+}
+.stButton > button { white-space: normal !important; height: auto !important; }
+</style>
+""", unsafe_allow_html=True)
 
 mode = st.sidebar.radio(
     "Sezione",
@@ -2297,13 +2305,14 @@ if mode == "Indisponibilità (Medico)":
             # ── Pulsante salva indisponibilità (tra le due sezioni) ──────────────
             _can_save = bool(unav_open) and not bool(over) and not bool(weekend_over)
             render_unav_flash(doctor)
-            _sc1, _sc2, _sc3, _sc4 = st.columns([2, 1, 1, 2])
+            _sc1, _sc2, _sc3 = st.columns([3, 2, 2])
             with _sc1:
                 save = st.button(
-                    "Salva indisponibilità",
+                    "💾 Salva indisponibilità",
                     key=f"save_unav_{yy}_{mm}",
                     type="primary",
                     disabled=not _can_save,
+                    use_container_width=True,
                 )
             with _sc2:
                 add_row = st.button("➕ Aggiungi riga", key=f"{rows_key}__add", use_container_width=True, disabled=not unav_open)
