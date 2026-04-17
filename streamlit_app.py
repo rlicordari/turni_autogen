@@ -1129,6 +1129,7 @@ DEFAULT_SETTINGS = {
     "unavailability_open": True,
     "max_unavailability_per_shift": 6,
     "max_availability_per_shift": 6,  # max preferenze disponibilità per fascia per mese
+    "max_weekend_days": MAX_WEEKEND_DAYS,  # max sabati e max domeniche distinti per mese
     "doctor_caps": {},  # cap personalizzato per medico: {"Dattilo": 10, "De Gregorio": 10, "Zito": 10}
 }
 
@@ -1196,6 +1197,13 @@ def load_app_settings_from_github() -> tuple[dict, str | None]:
     except Exception:
         out["max_availability_per_shift"] = DEFAULT_SETTINGS["max_availability_per_shift"]
 
+    try:
+        out["max_weekend_days"] = int(
+            data.get("max_weekend_days", DEFAULT_SETTINGS["max_weekend_days"])
+        )
+    except Exception:
+        out["max_weekend_days"] = DEFAULT_SETTINGS["max_weekend_days"]
+
     # cap personalizzati per medico
     try:
         dc = data.get("doctor_caps", {})
@@ -1210,6 +1218,8 @@ def load_app_settings_from_github() -> tuple[dict, str | None]:
     # defensive bounds
     if out["max_unavailability_per_shift"] < 0:
         out["max_unavailability_per_shift"] = 0
+    if out["max_weekend_days"] < 0:
+        out["max_weekend_days"] = 0
 
     return out, gf.sha
 
@@ -1996,6 +2006,13 @@ if mode == "Indisponibilità (Medico)":
     if max_per_shift_for_doctor < 0:
         max_per_shift_for_doctor = 0
 
+    try:
+        max_weekend_days_cfg = int(app_settings.get("max_weekend_days", MAX_WEEKEND_DAYS))
+    except Exception:
+        max_weekend_days_cfg = MAX_WEEKEND_DAYS
+    if max_weekend_days_cfg < 0:
+        max_weekend_days_cfg = 0
+
     if not unav_open:
         st.warning("🔒 Inserimento indisponibilità temporaneamente **chiuso** dall'amministratore. Puoi solo visualizzare (non puoi salvare).")
     if max_per_shift_for_doctor != max_per_shift:
@@ -2091,7 +2108,7 @@ if mode == "Indisponibilità (Medico)":
                         "del periodo come riga con fascia *Ferie* nella tabella sottostante. "
                         "Puoi usare questo strumento più volte per aggiungere periodi separati. "
                         "I sabati e le domeniche in ferie contano nel limite di "
-                        f"{MAX_WEEKEND_DAYS} sabati e {MAX_WEEKEND_DAYS} domeniche al mese."
+                        f"{max_weekend_days_cfg} sabati e {max_weekend_days_cfg} domeniche al mese."
                     )
                     _fp_col1, _fp_col2, _fp_col3 = st.columns([2, 2, 1])
                     with _fp_col1:
@@ -2242,9 +2259,9 @@ if mode == "Indisponibilità (Medico)":
             sun_days = info.get("sun_days", set())
             over = {sh: n for sh, n in counts.items() if sh != "Ferie" and n > max_per_shift_for_doctor}
             weekend_over = {}
-            if len(sat_days) > MAX_WEEKEND_DAYS:
+            if len(sat_days) > max_weekend_days_cfg:
                 weekend_over["Sabati"] = len(sat_days)
-            if len(sun_days) > MAX_WEEKEND_DAYS:
+            if len(sun_days) > max_weekend_days_cfg:
                 weekend_over["Domeniche"] = len(sun_days)
             violations_by_month[(yy, mm)] = over
             weekend_violations_by_month[(yy, mm)] = weekend_over
@@ -2263,7 +2280,7 @@ if mode == "Indisponibilità (Medico)":
                     f"{sh} {counts.get(sh, 0)}/{'∞' if sh == 'Ferie' else max_per_shift_for_doctor}"
                     for sh in FASCIA_OPTIONS
                 ])
-                + f" | Weekend: Sab {len(sat_days)}/{MAX_WEEKEND_DAYS}, Dom {len(sun_days)}/{MAX_WEEKEND_DAYS}"
+                + f" | Weekend: Sab {len(sat_days)}/{max_weekend_days_cfg}, Dom {len(sun_days)}/{max_weekend_days_cfg}"
             )
 
             if over:
@@ -2274,8 +2291,8 @@ if mode == "Indisponibilità (Medico)":
                 st.error(f"Limite superato in questo mese → {pretty}. Rimuovi alcune righe prima di salvare.")
 
             if weekend_over:
-                we_pretty = ", ".join([f"{label}: {n}/{MAX_WEEKEND_DAYS}" for label, n in weekend_over.items()])
-                st.error(f"Limite weekend superato → {we_pretty}. Puoi segnare al massimo {MAX_WEEKEND_DAYS} sabati e {MAX_WEEKEND_DAYS} domeniche al mese.")
+                we_pretty = ", ".join([f"{label}: {n}/{max_weekend_days_cfg}" for label, n in weekend_over.items()])
+                st.error(f"Limite weekend superato → {we_pretty}. Puoi segnare al massimo {max_weekend_days_cfg} sabati e {max_weekend_days_cfg} domeniche al mese.")
 
             # ── Pulsante salva indisponibilità (tra le due sezioni) ──────────────
             _can_save = bool(unav_open) and not bool(over) and not bool(weekend_over)
@@ -2515,10 +2532,10 @@ if mode == "Indisponibilità (Medico)":
                 hard_viol.append(
                     f"{yy}-{mm:02d}: " + ", ".join([f"{sh} {n}/{'∞' if sh == 'Ferie' else max_per_shift_for_doctor}" for sh, n in over.items()])
                 )
-            if len(sat_days_s) > MAX_WEEKEND_DAYS:
-                hard_viol.append(f"{yy}-{mm:02d}: Sabati {len(sat_days_s)}/{MAX_WEEKEND_DAYS}")
-            if len(sun_days_s) > MAX_WEEKEND_DAYS:
-                hard_viol.append(f"{yy}-{mm:02d}: Domeniche {len(sun_days_s)}/{MAX_WEEKEND_DAYS}")
+            if len(sat_days_s) > max_weekend_days_cfg:
+                hard_viol.append(f"{yy}-{mm:02d}: Sabati {len(sat_days_s)}/{max_weekend_days_cfg}")
+            if len(sun_days_s) > max_weekend_days_cfg:
+                hard_viol.append(f"{yy}-{mm:02d}: Domeniche {len(sun_days_s)}/{max_weekend_days_cfg}")
 
         if hard_viol:
             st.error(
@@ -2635,7 +2652,7 @@ else:
         if cur_max < 0:
             cur_max = 0
 
-        cS1, cS2, cS3, cS4 = st.columns([1.4, 1, 1, 1.5])
+        cS1, cS2, cS3, cS4, cS5 = st.columns([1.4, 1, 1, 1, 1.5])
         with cS1:
             new_open = st.toggle(
                 "Consenti ai medici di inserire/modificare indisponibilità",
@@ -2665,6 +2682,19 @@ else:
                 help="Max preferenze 'disponibilità' inseribili per fascia per mese.",
             )
         with cS4:
+            try:
+                cur_max_weekend = int(app_settings.get("max_weekend_days", DEFAULT_SETTINGS["max_weekend_days"]))
+            except Exception:
+                cur_max_weekend = DEFAULT_SETTINGS["max_weekend_days"]
+            new_max_weekend = st.number_input(
+                "Max weekend per mese",
+                min_value=0,
+                max_value=5,
+                value=int(cur_max_weekend),
+                step=1,
+                help="Max sabati distinti e max domeniche distinte che ogni medico può segnare come indisponibile in un mese (Ferie incluse).",
+            )
+        with cS5:
             meta = ""
             if app_settings.get("updated_at"):
                 meta += f"Ultimo aggiornamento: {app_settings.get('updated_at')}"
@@ -2698,6 +2728,7 @@ else:
                 "unavailability_open": bool(new_open),
                 "max_unavailability_per_shift": int(new_max),
                 "max_availability_per_shift": int(new_max_avail),
+                "max_weekend_days": int(new_max_weekend),
                 "doctor_caps": {doc: int(v) for doc, v in new_doctor_caps.items()},
                 "updated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
                 "updated_by": "admin",
@@ -2706,7 +2737,7 @@ else:
                 save_app_settings_to_github(
                     settings_to_save,
                     app_settings_sha,
-                    message=f"Update settings: open={bool(new_open)} max_unav={int(new_max)} max_avail={int(new_max_avail)}",
+                    message=f"Update settings: open={bool(new_open)} max_unav={int(new_max)} max_avail={int(new_max_avail)} max_weekend={int(new_max_weekend)}",
                 )
                 st.success("Impostazioni salvate ✅")
                 st.rerun()
