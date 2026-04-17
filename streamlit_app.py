@@ -89,6 +89,7 @@ def render_unav_flash(doctor: str) -> None:
 # ---- Indisponibilità: fasce ammesse e normalizzazione (per compatibilità con valori "storici") ----
 FASCIA_OPTIONS = ["Mattina", "Pomeriggio", "Notte", "Diurno", "Tutto il giorno", "Ferie"]
 AVAIL_FASCIA_OPTIONS = [f for f in FASCIA_OPTIONS if f != "Ferie"]
+MAX_WEEKEND_DAYS = 2  # max sabati e max domeniche per mese (separatamente)
 
 def normalize_fascia(val: object) -> tuple[str, bool, bool]:
     """Return (canonical_value, changed, unknown).
@@ -1424,10 +1425,22 @@ def extract_entries_from_editor(edited_rows: list[dict], yy: int, mm: int) -> tu
     entries2 = [(d, sh, note) for (d, sh), note in dedup.items()]
 
     counts = {}
+    sat_days: set[date] = set()
+    sun_days: set[date] = set()
     for _d, sh, _n in entries2:
         counts[sh] = counts.get(sh, 0) + 1
+        if _d.weekday() == 5:  # sabato
+            sat_days.add(_d)
+        elif _d.weekday() == 6:  # domenica
+            sun_days.add(_d)
 
-    return entries2, {"invalid_date": invalid_date, "out_of_month": out_of_month, "counts": counts}
+    return entries2, {
+        "invalid_date": invalid_date,
+        "out_of_month": out_of_month,
+        "counts": counts,
+        "sat_days": sat_days,
+        "sun_days": sun_days,
+    }
 
 
 # ---------------- Medico UX: baseline snapshot + session guard ----------------
@@ -2001,6 +2014,7 @@ if mode == "Indisponibilità (Medico)":
     edited_by_month = {}
     normalized_entries_by_month = {}
     violations_by_month = {}
+    weekend_violations_by_month = {}
     info_by_month = {}
     avail_rows_by_month = {}
     save = False  # inizializzato prima del loop per sicurezza
@@ -2072,6 +2086,13 @@ if mode == "Indisponibilità (Medico)":
                     st.session_state[rows_key] = rows
 
                 with st.expander("📅 Aggiungi periodo ferie", expanded=False):
+                    st.caption(
+                        "Seleziona un intervallo di date e premi **Aggiungi giorni** per inserire ogni giorno "
+                        "del periodo come riga con fascia *Ferie* nella tabella sottostante. "
+                        "Puoi usare questo strumento più volte per aggiungere periodi separati. "
+                        "I sabati e le domeniche in ferie contano nel limite di "
+                        f"{MAX_WEEKEND_DAYS} sabati e {MAX_WEEKEND_DAYS} domeniche al mese."
+                    )
                     _fp_col1, _fp_col2, _fp_col3 = st.columns([2, 2, 1])
                     with _fp_col1:
                         _ferie_start = st.date_input(
@@ -2217,8 +2238,16 @@ if mode == "Indisponibilità (Medico)":
             info_by_month[(yy, mm)] = info
 
             counts = info.get("counts", {}) or {}
+            sat_days = info.get("sat_days", set())
+            sun_days = info.get("sun_days", set())
             over = {sh: n for sh, n in counts.items() if sh != "Ferie" and n > max_per_shift_for_doctor}
+            weekend_over = {}
+            if len(sat_days) > MAX_WEEKEND_DAYS:
+                weekend_over["Sabati"] = len(sat_days)
+            if len(sun_days) > MAX_WEEKEND_DAYS:
+                weekend_over["Domeniche"] = len(sun_days)
             violations_by_month[(yy, mm)] = over
+            weekend_violations_by_month[(yy, mm)] = weekend_over
 
             if info.get("out_of_month"):
                 st.warning(
@@ -2234,6 +2263,7 @@ if mode == "Indisponibilità (Medico)":
                     f"{sh} {counts.get(sh, 0)}/{'∞' if sh == 'Ferie' else max_per_shift_for_doctor}"
                     for sh in FASCIA_OPTIONS
                 ])
+                + f" | Weekend: Sab {len(sat_days)}/{MAX_WEEKEND_DAYS}, Dom {len(sun_days)}/{MAX_WEEKEND_DAYS}"
             )
 
             if over:
@@ -2243,8 +2273,12 @@ if mode == "Indisponibilità (Medico)":
                 ])
                 st.error(f"Limite superato in questo mese → {pretty}. Rimuovi alcune righe prima di salvare.")
 
+            if weekend_over:
+                we_pretty = ", ".join([f"{label}: {n}/{MAX_WEEKEND_DAYS}" for label, n in weekend_over.items()])
+                st.error(f"Limite weekend superato → {we_pretty}. Puoi segnare al massimo {MAX_WEEKEND_DAYS} sabati e {MAX_WEEKEND_DAYS} domeniche al mese.")
+
             # ── Pulsante salva indisponibilità (tra le due sezioni) ──────────────
-            _can_save = bool(unav_open) and not bool(over)
+            _can_save = bool(unav_open) and not bool(over) and not bool(weekend_over)
             render_unav_flash(doctor)
             _sc1, _sc2, _sc3, _sc4 = st.columns([2, 1, 1, 2])
             with _sc1:
@@ -2468,13 +2502,23 @@ if mode == "Indisponibilità (Medico)":
         hard_viol = []
         for (yy, mm), entries_norm in (normalized_entries_by_month or {}).items():
             counts = {}
+            sat_days_s: set[date] = set()
+            sun_days_s: set[date] = set()
             for _d, sh, _n in entries_norm:
                 counts[sh] = counts.get(sh, 0) + 1
+                if _d.weekday() == 5:
+                    sat_days_s.add(_d)
+                elif _d.weekday() == 6:
+                    sun_days_s.add(_d)
             over = {sh: n for sh, n in counts.items() if sh != "Ferie" and n > max_per_shift_for_doctor}
             if over:
                 hard_viol.append(
                     f"{yy}-{mm:02d}: " + ", ".join([f"{sh} {n}/{'∞' if sh == 'Ferie' else max_per_shift_for_doctor}" for sh, n in over.items()])
                 )
+            if len(sat_days_s) > MAX_WEEKEND_DAYS:
+                hard_viol.append(f"{yy}-{mm:02d}: Sabati {len(sat_days_s)}/{MAX_WEEKEND_DAYS}")
+            if len(sun_days_s) > MAX_WEEKEND_DAYS:
+                hard_viol.append(f"{yy}-{mm:02d}: Domeniche {len(sun_days_s)}/{MAX_WEEKEND_DAYS}")
 
         if hard_viol:
             st.error(
