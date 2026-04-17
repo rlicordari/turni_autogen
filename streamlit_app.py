@@ -2381,33 +2381,59 @@ if mode == "Indisponibilità (Medico)":
                     av_rows = list(st.session_state.get(avail_key) or [])
                     updated_av = []
                     for av_r in av_rows:
-                        av_c1, av_c2, av_c3, av_c4, av_c5 = st.columns([2, 2, 1.5, 2.5, 0.5])
-                        with av_c1:
-                            av_date = st.date_input("Data", value=av_r.get("Data") or date(yy, mm, 1),
-                                                    min_value=date(yy, mm, 1),
-                                                    max_value=date(yy, mm, 1) if mm == 12 else date(yy, mm + 1, 1) - timedelta(days=1),
-                                                    key=f"{avail_key}_{av_r['id']}_d",
-                                                    format="DD/MM/YYYY")
-                        with av_c2:
-                            av_shift = st.selectbox("Fascia", AVAIL_FASCIA_OPTIONS,
-                                                    index=AVAIL_FASCIA_OPTIONS.index(av_r.get("Fascia","Mattina")) if av_r.get("Fascia","Mattina") in AVAIL_FASCIA_OPTIONS else 0,
-                                                    key=f"{avail_key}_{av_r['id']}_s")
-                        with av_c3:
-                            _prev_pri = av_r.get("Priorita", "media")
-                            _pri_idx = _PRIORITY_OPTIONS.index(_prev_pri) if _prev_pri in _PRIORITY_OPTIONS else 0
-                            av_priority = st.selectbox("Priorità",
-                                                       [_PRIORITY_LABELS[p] for p in _PRIORITY_OPTIONS],
-                                                       index=_pri_idx,
-                                                       key=f"{avail_key}_{av_r['id']}_p")
-                            av_priority_val = _PRIORITY_OPTIONS[[_PRIORITY_LABELS[p] for p in _PRIORITY_OPTIONS].index(av_priority)]
-                        with av_c4:
-                            av_note = st.text_input("Note", value=av_r.get("Note",""),
-                                                    key=f"{avail_key}_{av_r['id']}_n")
-                        with av_c5:
+                        # Riga 1: Data, Fascia, bottone elimina
+                        _av_r1c1, _av_r1c2, _av_r1c3 = st.columns([2, 2, 0.5], vertical_alignment="bottom")
+                        with _av_r1c1:
+                            av_date = st.date_input(
+                                "Data",
+                                value=av_r.get("Data") or date(yy, mm, 1),
+                                min_value=date(yy, mm, 1),
+                                max_value=date(yy, mm, 1) if mm == 12 else date(yy, mm + 1, 1) - timedelta(days=1),
+                                key=f"{avail_key}_{av_r['id']}_d",
+                                format="DD/MM/YYYY",
+                            )
+                        with _av_r1c2:
+                            av_shift = st.selectbox(
+                                "Fascia",
+                                AVAIL_FASCIA_OPTIONS,
+                                index=AVAIL_FASCIA_OPTIONS.index(av_r.get("Fascia", "Mattina"))
+                                      if av_r.get("Fascia", "Mattina") in AVAIL_FASCIA_OPTIONS else 0,
+                                key=f"{avail_key}_{av_r['id']}_s",
+                            )
+                        with _av_r1c3:
                             del_av = st.button("🗑", key=f"{avail_key}_{av_r['id']}_del")
+
+                        # Riga 2 (collapsibile): Priorità e Note
+                        _prev_pri = av_r.get("Priorita", "media")
+                        _pri_idx = _PRIORITY_OPTIONS.index(_prev_pri) if _prev_pri in _PRIORITY_OPTIONS else 0
+                        _has_extra = _prev_pri != "media" or bool(av_r.get("Note", "").strip())
+                        with st.expander("Priorità / Note", expanded=_has_extra):
+                            _av_r2c1, _av_r2c2 = st.columns([1, 2])
+                            with _av_r2c1:
+                                av_priority = st.selectbox(
+                                    "Priorità",
+                                    [_PRIORITY_LABELS[p] for p in _PRIORITY_OPTIONS],
+                                    index=_pri_idx,
+                                    key=f"{avail_key}_{av_r['id']}_p",
+                                )
+                                av_priority_val = _PRIORITY_OPTIONS[
+                                    [_PRIORITY_LABELS[p] for p in _PRIORITY_OPTIONS].index(av_priority)
+                                ]
+                            with _av_r2c2:
+                                av_note = st.text_input(
+                                    "Note",
+                                    value=av_r.get("Note", ""),
+                                    key=f"{avail_key}_{av_r['id']}_n",
+                                )
+
                         if not del_av:
-                            updated_av.append({"id": av_r["id"], "Data": av_date, "Fascia": av_shift,
-                                               "Priorita": av_priority_val, "Note": av_note})
+                            updated_av.append({
+                                "id": av_r["id"],
+                                "Data": av_date,
+                                "Fascia": av_shift,
+                                "Priorita": av_priority_val,
+                                "Note": av_note,
+                            })
                     st.session_state[avail_key] = updated_av
 
                     # Conta per fascia
