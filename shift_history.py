@@ -294,6 +294,10 @@ def compute_doctor_stats(parsed: dict) -> dict:
 
         # Traccia medici attivi (non-C) per sabati/domeniche
         active_doctors_today: set[str] = set()
+        # Traccia medici che hanno lavorato in D/E/H/I su questo giorno festivo
+        # (un set per evitare doppio conteggio quando D e E, o H e I, hanno lo
+        # stesso medico nel turno unico di festivo)
+        dehi_doctors_today: set[str] = set()
 
         for col, names in assignments.items():
             for name in names:
@@ -320,13 +324,17 @@ def compute_doctor_stats(parsed: dict) -> dict:
                     if is_sun:
                         bucket["domeniche"] += 1
 
-                # Festivi D/E/H/I
+                # Raccolta medici DEHI festivi (conteggio posticipato per dedup)
                 if is_hol and col in _DEHI_COLUMNS:
-                    ds["_festivi_DE_HI"] += 1
+                    dehi_doctors_today.add(name)
 
                 # Raccolta medici attivi
                 if col in _ACTIVE_COLUMNS:
                     active_doctors_today.add(name)
+
+        # Conta festivi DEHI: un solo +1 per medico per giorno
+        for name in dehi_doctors_today:
+            _ensure(name)["_festivi_DE_HI"] += 1
 
         # Conta sabati/domeniche per medici attivi
         if is_sun:
