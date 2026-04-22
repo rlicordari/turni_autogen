@@ -72,8 +72,53 @@ _ACTIVE_COLUMNS = {k for k in TRACKED_COLUMNS if k != "C"}
 # Colonne D/E/H/I per festivi DEHI
 _DEHI_COLUMNS = {"D", "E", "H", "I"}
 
-# Parole da ignorare nelle celle
-_IGNORED_WORDS = {"recupero", "spostare", ""}
+# Nomi medici canonici (title-case). Usati per normalizzare casing
+# inconsistente nei file definitivi modificati a mano dal primario.
+_CANONICAL_NAMES: dict[str, str] = {
+    "allegra": "Allegra",
+    "andò": "Andò",  # nota: "ando" senza accento gestito sotto
+    "ando": "Andò",
+    "calabrò": "Calabrò",
+    "calabro": "Calabrò",
+    "carciotto": "Carciotto",
+    "cimino": "Cimino",
+    "colarusso": "Colarusso",
+    "crea": "Crea",
+    "cusmà": "Cusmà",
+    "cusma": "Cusmà",
+    "d'angelo": "D'Angelo",
+    "dangelo": "D'Angelo",
+    "dattilo": "Dattilo",
+    "de gregorio": "De Gregorio",
+    "degregorio": "De Gregorio",
+    "de luca": "De Luca",
+    "deluca": "De Luca",
+    "giusti": "Giusti",
+    "grimaldi": "Grimaldi",
+    "licordari": "Licordari",
+    "manganaro": "Manganaro",
+    "migliorato": "Migliorato",
+    "pugliatti": "Pugliatti",
+    "recupero": "Recupero",
+    "saporito": "Saporito",
+    "trio": "Trio",
+    "virga": "Virga",
+    "vizzari": "Vizzari",
+    "zito": "Zito",
+}
+
+# Nomi da escludere completamente dallo storico (non sono medici del reparto
+# oppure non fanno parte del pool turni).
+_EXCLUDED_NAMES = {"Recupero"}
+
+# Pattern che indicano note/commenti e non nomi medici
+import re as _re
+_NOTE_PATTERNS = _re.compile(
+    r"^(spostati?|spostare|anticipat[io]|posticipat[io]|da spostare|note|n\.b\.|nb:)",
+    _re.IGNORECASE,
+)
+# Pattern per stringhe che non sono nomi (frammenti numerici, date, ecc.)
+_NOT_A_NAME = _re.compile(r"^[\d/\)\(\.\-\s]+$")
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -83,11 +128,44 @@ def _is_holiday(dt: datetime) -> bool:
     return dt.weekday() == 6 or (dt.month, dt.day) in _ITALIAN_HOLIDAYS
 
 
+def _normalize_name(raw: str) -> str | None:
+    """Normalizza un nome medico grezzo.
+
+    - Rimuove parentesi e contenuto tra parentesi (es. "Virga (anticipare il 17/04)" → "Virga")
+    - Lookup case-insensitive nella tabella canonica
+    - Fallback: title case
+    - Ritorna None per note/commenti e nomi esclusi
+    """
+    s = raw.strip()
+    if not s:
+        return None
+    # Rimuovi contenuto tra parentesi (anche non chiuse)
+    s = _re.sub(r"\s*\(.*?\)", "", s).strip()
+    s = _re.sub(r"\s*\(.*$", "", s).strip()  # parentesi aperta senza chiusura
+    if not s:
+        return None
+    # Filtra frammenti non-nome (es. "04)", numeri, date)
+    if _NOT_A_NAME.match(s):
+        return None
+    # Filtra note/commenti
+    if _NOTE_PATTERNS.match(s):
+        return None
+    # Lookup canonico
+    key = s.lower().strip()
+    canonical = _CANONICAL_NAMES.get(key)
+    if canonical:
+        return canonical if canonical not in _EXCLUDED_NAMES else None
+    # Fallback: title case per nomi non in tabella (emodinamisti esterni, etc.)
+    result = s.title()
+    return result if result not in _EXCLUDED_NAMES else None
+
+
 def _parse_cell(value: Any) -> list[str]:
     """Estrae i nomi dei medici da una cella Excel.
 
-    Gestisce: None, float NaN, stringhe singole, stringhe multilinea.
-    Filtra 'Recupero' e valori vuoti.
+    Gestisce: None, float NaN, stringhe singole, stringhe multilinea,
+    nomi separati da "/" (es. "Grimaldi/Cimino"), casing inconsistente.
+    Filtra note, commenti e nomi esclusi.
     """
     if value is None:
         return []
@@ -96,13 +174,26 @@ def _parse_cell(value: Any) -> list[str]:
     text = str(value).strip()
     if not text:
         return []
-    parts = text.split("\n")
-    result = []
+    # Split su newline
+    parts = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    expanded: list[str] = []
     for p in parts:
-        name = p.strip()
-        if name.lower() in _IGNORED_WORDS:
-            continue
-        result.append(name)
+        p = p.strip()
+        # Split su " / " o "/" solo se sembra contenere nomi (non date come "17/04")
+        # Euristica: split se almeno una parte contiene lettere
+        if "/" in p and not _re.match(r"^\d+/\d+", p):
+            sub = [s.strip() for s in p.split("/")]
+            if all(any(c.isalpha() for c in s) for s in sub if s):
+                expanded.extend(sub)
+            else:
+                expanded.append(p)
+        else:
+            expanded.append(p)
+    result = []
+    for p in expanded:
+        name = _normalize_name(p)
+        if name and name not in _EXCLUDED_NAMES:
+            result.append(name)
     return result
 
 
