@@ -3063,8 +3063,8 @@ else:
                         "Festivi (D/E/H/I)": _ds.get("_festivi_DE_HI", 0),
                         "Domeniche": _ds.get("_domeniche", 0),
                         "Sabati": _ds.get("_sabati", 0),
-                        "H pom.": _h.get("total", 0) if isinstance(_h, dict) else 0,
-                        "I pom.": _i.get("total", 0) if isinstance(_i, dict) else 0,
+                        "H pom. (fer.)": _h.get("feriali", 0) if isinstance(_h, dict) else 0,
+                        "I pom. (fer.)": _i.get("feriali", 0) if isinstance(_i, dict) else 0,
                     })
                 _df_hist = pd.DataFrame(_rows_hist)
                 st.dataframe(_df_hist, use_container_width=True, hide_index=True)
@@ -3092,8 +3092,8 @@ else:
                         "Festivi (D/E/H/I)": _ds.get("_festivi_DE_HI", 0),
                         "Domeniche": _ds.get("_domeniche", 0),
                         "Sabati": _ds.get("_sabati", 0),
-                        "H pom.": _h.get("total", 0) if isinstance(_h, dict) else 0,
-                        "I pom.": _i.get("total", 0) if isinstance(_i, dict) else 0,
+                        "H pom. (fer.)": _h.get("feriali", 0) if isinstance(_h, dict) else 0,
+                        "I pom. (fer.)": _i.get("feriali", 0) if isinstance(_i, dict) else 0,
                     })
                 st.dataframe(pd.DataFrame(_rows_mese), use_container_width=True, hide_index=True)
 
