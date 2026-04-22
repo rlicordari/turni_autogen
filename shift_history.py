@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import math
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Optional, Tuple
 
 import openpyxl
@@ -66,6 +66,27 @@ _ITALIAN_HOLIDAYS: set[tuple[int, int]] = {
 
 _DOW_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
+
+def _easter_monday(year: int) -> tuple[int, int]:
+    """Calcola Pasquetta (mese, giorno) con l'algoritmo di Meeus/Jones/Butcher."""
+    a = year % 19
+    b = year // 100
+    c = year % 100
+    d = b // 4
+    e = b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i = c // 4
+    k = c % 4
+    el = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * el) // 451
+    month = (h + el - 7 * m + 114) // 31
+    day = ((h + el - 7 * m + 114) % 31) + 1
+    # Pasquetta = lunedì dopo Pasqua
+    easter_monday = datetime(year, month, day) + timedelta(days=1)
+    return (easter_monday.month, easter_monday.day)
+
 # Colonne usate per conteggio domeniche/sabati lavorati
 # Solo turni di guardia/notte/reperibilità: C, D, E, H, I, J
 _WEEKEND_COLUMNS = {"C", "D", "E", "H", "I", "J"}
@@ -110,7 +131,8 @@ _CANONICAL_NAMES: dict[str, str] = {
 
 # Nomi da escludere completamente dallo storico (non sono medici del reparto
 # oppure non fanno parte del pool turni).
-_EXCLUDED_NAMES = {"Recupero", "De Luca", "Saporito"}
+# Allineato con absolute_exclusions in Regole_Turni.yml
+_EXCLUDED_NAMES = {"Recupero", "De Luca", "Saporito", "Virga", "Carciotto", "Andò", "D'Angelo"}
 
 # Pattern che indicano note/commenti e non nomi medici
 import re as _re
@@ -125,8 +147,15 @@ _NOT_A_NAME = _re.compile(r"^[\d/\)\(\.\-\s]+$")
 # ── Helpers ────────────────────────────────────────────────────────────────
 
 def _is_holiday(dt: datetime) -> bool:
-    """True se domenica o festività nazionale italiana."""
-    return dt.weekday() == 6 or (dt.month, dt.day) in _ITALIAN_HOLIDAYS
+    """True se domenica o festività nazionale italiana (inclusa Pasquetta)."""
+    if dt.weekday() == 6:
+        return True
+    if (dt.month, dt.day) in _ITALIAN_HOLIDAYS:
+        return True
+    # Pasquetta (mobile)
+    if (dt.month, dt.day) == _easter_monday(dt.year):
+        return True
+    return False
 
 
 def _normalize_name(raw: str) -> str | None:

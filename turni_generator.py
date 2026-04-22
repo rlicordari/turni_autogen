@@ -2961,6 +2961,30 @@ def solve_with_ortools(
                 model.Add(_sun_cnt == sum(_sun_vars))
                 extra_obj.append(HIST_FEST_PENALTY * _hist_dom_j * _sun_cnt)
 
+        # Festivi DEHI: penalizza medici con più festivi storici (solo pool senza quota fissa)
+        HIST_DEHI_PENALTY = 200
+        _rFest_cfg = (cfg.get("rules") or {}).get("Festivi") or {}
+        _fest_fixed_hist = {norm_name(k) for k in (_rFest_cfg.get("quotas") or {}).keys()}
+        _fest_pool_hist = [norm_name(d) for d in (_rFest_cfg.get("pool") or [])
+                          if norm_name(d) in doctors and norm_name(d) != "Recupero"]
+        _fest_pool_free_hist = [d for d in _fest_pool_hist if d not in _fest_fixed_hist]
+        _festivo_slots_hist = [s for s in slots if s.rule_tag in ("Festivo_DE", "Festivo_HI")]
+
+        if _fest_pool_free_hist and _festivo_slots_hist:
+            for _doc in _fest_pool_free_hist:
+                _hist_dehi = _hist.get(_doc, {}).get("_festivi_DE_HI", 0)
+                if not isinstance(_hist_dehi, int):
+                    _hist_dehi = 0
+                if _hist_dehi <= 0:
+                    continue
+                _fvars = [x.get((s.slot_id, _doc)) for s in _festivo_slots_hist
+                          if (s.slot_id, _doc) in x]
+                if _fvars:
+                    _fcnt = model.NewIntVar(0, len(_festivo_slots_hist),
+                                            f"hist_dehi_{abs(hash(_doc)) % 10 ** 6}")
+                    model.Add(_fcnt == sum(_fvars))
+                    extra_obj.append(HIST_DEHI_PENALTY * _hist_dehi * _fcnt)
+
     model.Minimize(sum(objective_terms + extra_obj))
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = 30.0
