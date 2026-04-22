@@ -1482,6 +1482,74 @@ def build_relief_log(days: List[DayRow], slots: List[Slot], assignment: Dict[str
         "df_forced_same_days": df_forced_same_days,
         "blank_columns": dict(blank_cols),
     }
+
+def build_daily_diagnostic(
+    days: List[DayRow],
+    slots: List[Slot],
+    assignment: Dict[str, Optional[str]],
+    cfg: dict,
+) -> List[Dict]:
+    """Build a per-day diagnostic: blanks, relief valves, forced blanks."""
+    slots_by_day: Dict[dt.date, List[Slot]] = defaultdict(list)
+    for s in slots:
+        slots_by_day[s.day.date].append(s)
+
+    DOW_ITA = {"Mon": "Lun", "Tue": "Mar", "Wed": "Mer", "Thu": "Gio",
+               "Fri": "Ven", "Sat": "Sab", "Sun": "Dom"}
+    diagnostics: List[Dict] = []
+
+    for day in days:
+        day_slots = slots_by_day.get(day.date, [])
+        issues: List[str] = []
+
+        for s in day_slots:
+            doc = assignment.get(s.slot_id)
+            cols_str = "+".join(s.columns)
+
+            if doc is None:
+                if getattr(s, "empty_domain", False):
+                    issues.append(f"col {cols_str} vuota (nessun candidato eleggibile)")
+                elif s.required and int(getattr(s, "blank_penalty", 0)) >= 5_000_000:
+                    issues.append(f"col {cols_str} NON COPERTA (obbligatoria)")
+                elif int(getattr(s, "blank_penalty", 0)) > 0:
+                    bp = int(getattr(s, "blank_penalty", 0))
+                    issues.append(f"col {cols_str} blank (relief valve, penalty={bp})")
+                elif not s.required:
+                    pass  # optional slot left blank is normal
+                else:
+                    issues.append(f"col {cols_str} blank (non assegnata)")
+
+        # K/T same doctor
+        sk = next((s for s in day_slots if s.columns == ["K"]), None)
+        st_ = next((s for s in day_slots if s.columns == ["T"]), None)
+        if sk and st_:
+            dk = assignment.get(sk.slot_id)
+            dt_ = assignment.get(st_.slot_id)
+            if dk is not None and dk == dt_:
+                issues.append(f"K=T stesso medico ({dk})")
+
+        # D/F same doctor
+        sD = next((s for s in day_slots if s.columns == ["D"]), None)
+        sF = next((s for s in day_slots if s.columns == ["F"]), None)
+        if sD and sF:
+            dD = assignment.get(sD.slot_id)
+            dF = assignment.get(sF.slot_id)
+            if dD is not None and dD == dF:
+                forced = getattr(sD, "force_same_doctor", False) and getattr(sF, "force_same_doctor", False)
+                tag = " (forzato)" if forced else ""
+                issues.append(f"D=F stesso medico ({dD}){tag}")
+
+        if issues:
+            festivo = is_festivo(day, cfg)
+            diagnostics.append({
+                "date": day.date.isoformat(),
+                "dow": DOW_ITA.get(day.dow, day.dow),
+                "festivo": festivo,
+                "issues": issues,
+            })
+
+    return diagnostics
+
 def solve_with_ortools(
     cfg: dict,
     days: List[DayRow],
@@ -2694,19 +2762,29 @@ def solve_with_ortools(
                 b = model.NewBoolVar(f"wkoff_{wi}_{hash(doc)%10**6}")
                 weekend_off[(wi, doc)] = b
                 # If weekend_off=1 then doc has no assignment on sat and sun
+                # NOTE: C (Reperibilità) is excluded — it's passive on-call,
+                # not an active shift, so it doesn't consume a weekend off.
                 for s in slots_by_day.get(sat, []):
+                    if s.columns == ["C"]:
+                        continue
                     if (s.slot_id, doc) in x:
                         model.Add(x[(s.slot_id, doc)] == 0).OnlyEnforceIf(b)
                 for s in slots_by_day.get(sun, []):
+                    if s.columns == ["C"]:
+                        continue
                     if (s.slot_id, doc) in x:
                         model.Add(x[(s.slot_id, doc)] == 0).OnlyEnforceIf(b)
                 # Reverse implication: if any assignment on sat or sun then b=0
                 any_vars = []
                 for s in slots_by_day.get(sat, []):
+                    if s.columns == ["C"]:
+                        continue
                     v = x.get((s.slot_id, doc))
                     if v is not None:
                         any_vars.append(v)
                 for s in slots_by_day.get(sun, []):
+                    if s.columns == ["C"]:
+                        continue
                     v = x.get((s.slot_id, doc))
                     if v is not None:
                         any_vars.append(v)
@@ -3657,6 +3735,15 @@ def write_solver_log(out_path: Path, stats: Dict) -> Optional[Path]:
                     lines.append(f"- {item.get('date')} ({item.get('dow')}): required_slots={item.get('required_slots')}, union_doctors={item.get('union_doctors')}")
                     for us in (item.get("unmatched_slots") or [])[:3]:
                         lines.append(f"    * {us.get('slot_id')} cols={us.get('columns')} allowed_n={us.get('allowed_n')}")
+            # Day-by-day diagnostic
+            dd = sm.get("daily_diagnostic") or []
+            if dd:
+                lines.append("")
+                lines.append("== Diagnostica giorno per giorno ==")
+                for item in dd:
+                    tag = " [FESTIVO]" if item.get("festivo") else ""
+                    issues_str = "; ".join(item.get("issues", []))
+                    lines.append(f"{item.get('date')} ({item.get('dow')}){tag}: {issues_str}")
         log_path.write_text("\n".join(lines), encoding="utf-8")
         return log_path
     except Exception:
@@ -3772,6 +3859,11 @@ def solve_across_months(
         try:
             stats_m = dict(stats_m or {})
             stats_m["relief_used"] = build_relief_log(days_m, slots_m, assignment_m)
+        except Exception:
+            pass
+        # Day-by-day diagnostic
+        try:
+            stats_m["daily_diagnostic"] = build_daily_diagnostic(days_m, slots_m, assignment_m, cfg)
         except Exception:
             pass
 
