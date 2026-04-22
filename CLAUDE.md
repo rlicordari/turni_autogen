@@ -107,3 +107,21 @@ starttls = true
   - Rimuoverla da `absolute_exclusions` e da `C_reperibilita.excluded` (se applicabile al mese).
 - I medici universitari (`university_doctors`) possono avere `night_counts_double: true` per dimezzare la quota effettiva di notti.
 - La sezione `relief_valves` definisce fallback ad alta penalità per evitare l'infeasibility (es. permettere una colonna vuota a costo elevato anziché fallire).
+
+## Feature in sviluppo: Memoria Storica Turni
+
+**Piano completo:** `docs/PLAN_historical_shifts.md`
+
+**Stato avanzamento (aggiornare ad ogni step):**
+- [x] Task 1: `shift_history.py` — parser Excel definitivo + aggregazione stats + normalizzazione nomi (commit 2303447)
+- [x] Task 2: Storage su GitHub — load/save storico JSON (commit a01a611)
+- [ ] Task 3: Integrazione solver — soft constraints con `historical_stats` (PROSSIMO)
+- [ ] Task 4: UI admin Streamlit — upload, tabella, grafici Plotly
+- [ ] Task 5: Test end-to-end e push
+
+**Moduli coinvolti:**
+| File | Modifica |
+|---|---|
+| `shift_history.py` | NUOVO — parser + aggregazione + storage GitHub |
+| `turni_generator.py` | Aggiunto parametro `historical_stats` al solver |
+| `streamlit_app.py` | Nuova sezione admin "Memoria Storica" |
