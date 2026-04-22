@@ -20,6 +20,7 @@ from collections.abc import Mapping
 
 import streamlit as st
 import pandas as pd
+import plotly.express as px
 import yaml
 
 # Local modules
@@ -3065,9 +3066,8 @@ else:
 
         # Grafici
         with st.expander("📈 Grafici", expanded=False):
-            import plotly.express as _px_hist
             if _rows_hist:
-                _fig_j = _px_hist.bar(
+                _fig_j = px.bar(
                     _df_hist, x="Medico", y="Notti (J)",
                     title="Notti totali per medico (cumulativo)",
                     color="Notti (J)", color_continuous_scale="Reds",
@@ -3081,7 +3081,7 @@ else:
                     "Sabato": r["Notti Sab"],
                     "Domenica": r["Notti Dom"],
                 } for r in _rows_hist])
-                _fig_j2 = _px_hist.bar(
+                _fig_j2 = px.bar(
                     _df_j2, x="Medico", y=["Feriali", "Sabato", "Domenica"],
                     title="Notti: distribuzione feriali/sabato/domenica",
                     barmode="stack",
@@ -3089,7 +3089,7 @@ else:
                 _fig_j2.update_layout(xaxis_tickangle=-45, height=400)
                 st.plotly_chart(_fig_j2, use_container_width=True)
 
-                _fig_dom = _px_hist.bar(
+                _fig_dom = px.bar(
                     _df_hist, x="Medico", y="Domeniche",
                     title="Domeniche lavorate per medico (cumulativo)",
                     color="Domeniche", color_continuous_scale="Blues",
@@ -3097,7 +3097,7 @@ else:
                 _fig_dom.update_layout(xaxis_tickangle=-45, height=400)
                 st.plotly_chart(_fig_dom, use_container_width=True)
 
-                _fig_c = _px_hist.bar(
+                _fig_c = px.bar(
                     _df_hist, x="Medico", y="Reperibilità (C)",
                     title="Reperibilità per medico (cumulativo)",
                     color="Reperibilità (C)", color_continuous_scale="Greens",
@@ -3118,7 +3118,7 @@ else:
                             })
                     if _evo:
                         _df_evo = pd.DataFrame(_evo)
-                        _fig_evo = _px_hist.line(
+                        _fig_evo = px.line(
                             _df_evo, x="Mese", y="Notti", color="Medico",
                             title="Notti per mese", markers=True,
                         )
@@ -3413,8 +3413,7 @@ else:
                         "Max consentito": target + 1,
                         "Note": "Indisponibilità NON riducono il target",
                     })
-                import pandas as _pd
-                st.dataframe(_pd.DataFrame(rows_u), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(rows_u), use_container_width=True, hide_index=True)
             else:
                 st.info("Nessun medico universitario configurato nel YAML.")
         except Exception as e:
