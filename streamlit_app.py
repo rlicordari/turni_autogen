@@ -3022,7 +3022,8 @@ else:
                     _tmp.write_bytes(_hist_upload.getvalue())
                     _parsed = sh.parse_finalized_xlsx(str(_tmp))
                     _ml = _parsed["month_label"]
-                    _ms = sh.compute_doctor_stats(_parsed)
+                    _valid_docs = set(doctors) if doctors else None
+                    _ms = sh.compute_doctor_stats(_parsed, valid_doctors=_valid_docs)
                     _hist_data[_ml] = _ms
                     if _save_shift_history(_hist_data, _hist_sha):
                         st.success(f"✅ Mese **{_ml}** importato ({len(_parsed['days'])} giorni)")

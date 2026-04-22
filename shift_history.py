@@ -300,8 +300,20 @@ def parse_finalized_xlsx(xlsx_path: str, sheet_name: str | None = None) -> dict:
 
 # ── 2. Statistiche per medico ─────────────────────────────────────────────
 
-def compute_doctor_stats(parsed: dict) -> dict:
+def compute_doctor_stats(
+    parsed: dict,
+    valid_doctors: set[str] | None = None,
+) -> dict:
     """Calcola statistiche per medico dal risultato di parse_finalized_xlsx.
+
+    Parameters
+    ----------
+    parsed : dict
+        Output di parse_finalized_xlsx.
+    valid_doctors : set[str] | None
+        Se fornito, conta solo i medici presenti in questo set (nomi
+        normalizzati). Tutto il resto viene ignorato. Utile per filtrare
+        note/commenti scritti a mano dal primario nelle celle Excel.
 
     Returns
     -------
@@ -331,6 +343,9 @@ def compute_doctor_stats(parsed: dict) -> dict:
 
         for col, names in assignments.items():
             for name in names:
+                # Se c'è una whitelist, scarta nomi non riconosciuti
+                if valid_doctors and name not in valid_doctors:
+                    continue
                 ds = _ensure(name)
 
                 # Statistiche per colonna
@@ -496,6 +511,7 @@ def upload_month_to_history(
     token: str,
     branch: str = "main",
     sheet_name: Optional[str] = None,
+    valid_doctors: set[str] | None = None,
 ) -> Tuple[str, dict]:
     """Pipeline completa: parse xlsx → stats → load → upsert → save.
 
@@ -505,7 +521,7 @@ def upload_month_to_history(
     """
     parsed = parse_finalized_xlsx(xlsx_path, sheet_name)
     month_label: str = parsed["month_label"]
-    month_stats = compute_doctor_stats(parsed)
+    month_stats = compute_doctor_stats(parsed, valid_doctors=valid_doctors)
 
     history, sha = load_history_from_github(owner, repo, token, branch)
     history[month_label] = month_stats
