@@ -15,40 +15,85 @@ from typing import Any, Optional, Tuple
 import openpyxl
 from openpyxl.utils import column_index_from_string
 
-# ── Colonne tracciate ──────────────────────────────────────────────────────
-TRACKED_COLUMNS: dict[str, str] = {
-    "C": "Reperibilità",
-    "D": "UTIC mattina",
-    "E": "Cardiologia mattina",
-    "F": "Supporto 118",
-    "G": "Riabilitazione",
-    "H": "UTIC pomeriggio",
-    "I": "Cardiologia pomeriggio",
-    "J": "Notte",
-    "K": "Letto",
-    "L": "Padiglioni",
-    "M": "Emodinamica 1",
-    "N": "Emodinamica 2",
-    "O": "Emodinamica 3",
-    "P": "Emodinamica 4",
-    "Q": "ECO base",
-    "R": "ECOSTRESS/ETE",
-    "S": "Ecosala",
-    "T": "Interni",
-    "U": "Contr.PM",
-    "V": "Sala PM",
-    "W": "Ergometria/CPET",
-    "Y": "Ambulatori",
-    "Z": "Vascolare",
-    "AA": "SPOC",
-    "AB": "Holter/Brugada/FA",
-    "AC": "Scintigrafia",
+# ── Tag logici delle colonne ───────────────────────────────────────────────
+# Mappa: pattern contenuto nell'header → tag logico stabile.
+# Il parser legge la riga 1 del foglio Excel, cerca questi pattern
+# (case-insensitive, substring match) e assegna il tag logico alla colonna.
+# Così il layout può cambiare tra mesi diversi senza rompere i conteggi.
+_HEADER_TO_TAG: list[tuple[str, str]] = [
+    # ORDINE IMPORTANTE: pattern più specifici prima dei più generici
+    # (es. "emodinamica notte" prima di "notte", altrimenti "notte" matcha per primo)
+    ("reperibilit", "C"),
+    ("utic mattina", "D"),
+    ("cardiologia / riab mattina", "E"),  # layout vecchio (feb 2026) — prima del generico
+    ("cardiologia mattina", "E"),
+    ("riabilitazione", "G"),
+    ("supporto", "F"),
+    ("utic pomeriggio", "H"),
+    ("cardiologia/riab pomeriggio", "I"),  # layout vecchio — prima del generico
+    ("cardiologia pomeriggio", "I"),
+    ("emodinamica mattina", "M"),       # emodinamica PRIMA di "notte"/"letto"
+    ("emodinamica pomeriggio", "N"),
+    ("emodinamica notte", "O"),
+    ("emodinamica ambulat", "P"),
+    ("notte", "J"),                     # ora sicuro: "emodinamica notte" già matchato sopra
+    ("letto", "K"),
+    ("padiglion", "L"),
+    ("eco base", "Q"),
+    ("ecostress", "R"),
+    ("ecosala", "S"),
+    ("interni", "T"),
+    ("contr.pm", "U"),
+    ("contr. pm", "U"),
+    ("sala pm", "V"),
+    ("ergometria", "W"),
+    ("palestra", "X"),
+    ("ambulatori", "Y"),
+    ("vascolar", "Z"),
+    ("spoc", "AA"),
+    ("holter", "AB"),
+    ("scintigraf", "AC"),
+]
+
+# Tag che ci interessano per lo storico (i conteggi usano questi tag come chiavi)
+TRACKED_TAGS: set[str] = {
+    "C", "D", "E", "F", "G", "H", "I", "J", "K", "L",
+    "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V",
+    "W", "Y", "Z", "AA", "AB", "AC",
 }
 
-# Pre-calcola indici colonna (1-based)
-_COL_INDICES: dict[str, int] = {
-    letter: column_index_from_string(letter) for letter in TRACKED_COLUMNS
+# Etichette umane per i tag (usate nella UI)
+TAG_LABELS: dict[str, str] = {
+    "C": "Reperibilità", "D": "UTIC mattina", "E": "Cardiologia mattina",
+    "F": "Supporto 118", "G": "Riabilitazione", "H": "UTIC pomeriggio",
+    "I": "Cardiologia pomeriggio", "J": "Notte", "K": "Letto",
+    "L": "Padiglioni", "M": "Emodinamica 1", "N": "Emodinamica 2",
+    "O": "Emodinamica 3", "P": "Emodinamica 4", "Q": "ECO base",
+    "R": "ECOSTRESS/ETE", "S": "Ecosala", "T": "Interni",
+    "U": "Contr.PM", "V": "Sala PM", "W": "Ergometria/CPET",
+    "Y": "Ambulatori", "Z": "Vascolare", "AA": "SPOC",
+    "AB": "Holter/Brugada/FA", "AC": "Scintigrafia",
 }
+
+
+def _map_columns_from_header(ws) -> dict[int, str]:
+    """Legge la riga 1 del foglio e restituisce {col_index_1based: tag_logico}.
+
+    Usa pattern matching case-insensitive sugli header per mappare
+    la colonna fisica al tag logico, indipendentemente dal layout del mese.
+    """
+    col_map: dict[int, str] = {}
+    for c in range(1, ws.max_column + 1):
+        raw = ws.cell(1, c).value
+        if not raw:
+            continue
+        header = str(raw).strip().lower()
+        for pattern, tag in _HEADER_TO_TAG:
+            if pattern in header:
+                if tag in TRACKED_TAGS:
+                    col_map[c] = tag
+                break  # primo match vince
+    return col_map
 
 # ── Festività italiane (mese, giorno) ─────────────────────────────────────
 _ITALIAN_HOLIDAYS: set[tuple[int, int]] = {
@@ -257,6 +302,9 @@ def parse_finalized_xlsx(xlsx_path: str, sheet_name: str | None = None) -> dict:
             else:
                 ws = wb[wb.sheetnames[0]]
 
+        # Mappa dinamica colonne: legge header riga 1
+        col_map = _map_columns_from_header(ws)
+
         days: list[dict] = []
         year: int | None = None
         month: int | None = None
@@ -276,10 +324,10 @@ def parse_finalized_xlsx(xlsx_path: str, sheet_name: str | None = None) -> dict:
             dow = _DOW_NAMES[date_val.weekday()]
 
             assignments: dict[str, list[str]] = {}
-            for col_letter, col_idx in _COL_INDICES.items():
+            for col_idx, tag in col_map.items():
                 names = _parse_cell(ws.cell(row_idx, col_idx).value)
                 if names:
-                    assignments[col_letter] = names
+                    assignments[tag] = names
 
             days.append({
                 "date": date_val.strftime("%Y-%m-%d"),
