@@ -109,7 +109,7 @@ _CANONICAL_NAMES: dict[str, str] = {
 
 # Nomi da escludere completamente dallo storico (non sono medici del reparto
 # oppure non fanno parte del pool turni).
-_EXCLUDED_NAMES = {"Recupero"}
+_EXCLUDED_NAMES = {"Recupero", "De Luca", "Saporito"}
 
 # Pattern che indicano note/commenti e non nomi medici
 import re as _re
