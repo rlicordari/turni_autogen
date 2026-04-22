@@ -114,7 +114,7 @@ _EXCLUDED_NAMES = {"Recupero"}
 # Pattern che indicano note/commenti e non nomi medici
 import re as _re
 _NOTE_PATTERNS = _re.compile(
-    r"^(spostati?|spostare|anticipat[io]|posticipat[io]|da spostare|note|n\.b\.|nb:)",
+    r"^(spostati?|spostare|anticip\w*|posticip\w*|da\s+(?:spostare|anticip\w*|posticip\w*)|note|n\.b\.|nb:|pad\b|padiglion)",
     _re.IGNORECASE,
 )
 # Pattern per stringhe che non sono nomi (frammenti numerici, date, ecc.)
