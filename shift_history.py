@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import math
 from datetime import datetime
-from typing import Any
+from typing import Any, Optional, Tuple
 
 import openpyxl
 from openpyxl.utils import column_index_from_string
@@ -394,6 +394,85 @@ def history_to_json(history: dict) -> str:
 def history_from_json(text: str) -> dict:
     """Deserializza una stringa JSON in dizionario di storico."""
     return json.loads(text)
+
+
+# ── 5. GitHub storage ────────────────────────────────────────────────────
+
+HISTORY_PATH = "data/shift_history.json"
+
+
+def load_history_from_github(
+    owner: str,
+    repo: str,
+    token: str,
+    branch: str = "main",
+) -> Tuple[dict, Optional[str]]:
+    """Carica lo storico turni da GitHub.
+
+    Returns
+    -------
+    (history_dict, sha) — se il file non esiste restituisce ({}, None).
+    """
+    from github_utils import get_file
+
+    gf = get_file(owner, repo, HISTORY_PATH, token, branch)
+    if gf is None:
+        return {}, None
+    return history_from_json(gf.text), gf.sha
+
+
+def save_history_to_github(
+    history: dict,
+    owner: str,
+    repo: str,
+    token: str,
+    branch: str = "main",
+    sha: Optional[str] = None,
+) -> dict:
+    """Salva lo storico turni su GitHub.
+
+    Returns
+    -------
+    dict — risposta della GitHub Contents API.
+    """
+    from github_utils import put_file
+
+    text = history_to_json(history)
+    return put_file(
+        owner,
+        repo,
+        HISTORY_PATH,
+        token,
+        "Aggiornamento memoria storica turni",
+        text,
+        branch,
+        sha,
+    )
+
+
+def upload_month_to_history(
+    xlsx_path: str,
+    owner: str,
+    repo: str,
+    token: str,
+    branch: str = "main",
+    sheet_name: Optional[str] = None,
+) -> Tuple[str, dict]:
+    """Pipeline completa: parse xlsx → stats → load → upsert → save.
+
+    Returns
+    -------
+    (month_label, month_stats)
+    """
+    parsed = parse_finalized_xlsx(xlsx_path, sheet_name)
+    month_label: str = parsed["month_label"]
+    month_stats = compute_doctor_stats(parsed)
+
+    history, sha = load_history_from_github(owner, repo, token, branch)
+    history[month_label] = month_stats
+    save_history_to_github(history, owner, repo, token, branch, sha)
+
+    return month_label, month_stats
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────
