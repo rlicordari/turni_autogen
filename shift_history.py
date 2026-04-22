@@ -66,8 +66,9 @@ _ITALIAN_HOLIDAYS: set[tuple[int, int]] = {
 
 _DOW_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
-# Colonne "attive" (tutte tranne C=Reperibilità) per conteggio domeniche/sabati
-_ACTIVE_COLUMNS = {k for k in TRACKED_COLUMNS if k != "C"}
+# Colonne usate per conteggio domeniche/sabati lavorati
+# Solo turni di guardia/notte/reperibilità: C, D, E, H, I, J
+_WEEKEND_COLUMNS = {"C", "D", "E", "H", "I", "J"}
 
 # Colonne D/E/H/I per festivi DEHI
 _DEHI_COLUMNS = {"D", "E", "H", "I"}
@@ -328,8 +329,9 @@ def compute_doctor_stats(parsed: dict) -> dict:
                 if is_hol and col in _DEHI_COLUMNS:
                     dehi_doctors_today.add(name)
 
-                # Raccolta medici attivi
-                if col in _ACTIVE_COLUMNS:
+                # Raccolta medici per conteggio domeniche/sabati
+                # (solo C, D, E, H, I, J — turni di guardia/notte/reperibilità)
+                if col in _WEEKEND_COLUMNS:
                     active_doctors_today.add(name)
 
         # Conta festivi DEHI: un solo +1 per medico per giorno
