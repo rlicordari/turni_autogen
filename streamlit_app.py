@@ -3017,8 +3017,8 @@ else:
         if _hist_upload is not None:
             if st.button("📥 Importa nel storico", key="btn_import_hist"):
                 _tmp = Path(tempfile.gettempdir()) / f"hist_{int(time.time())}.xlsx"
-                _tmp.write_bytes(_hist_upload.getvalue())
                 try:
+                    _tmp.write_bytes(_hist_upload.getvalue())
                     _parsed = sh.parse_finalized_xlsx(str(_tmp))
                     _ml = _parsed["month_label"]
                     _ms = sh.compute_doctor_stats(_parsed)

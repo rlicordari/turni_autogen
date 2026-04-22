@@ -215,57 +215,57 @@ def parse_finalized_xlsx(xlsx_path: str, sheet_name: str | None = None) -> dict:
     dict con chiavi: year, month, month_label, days.
     """
     wb = openpyxl.load_workbook(xlsx_path, data_only=True)
-
-    if sheet_name:
-        ws = wb[sheet_name]
-    else:
-        # Usa il primo foglio che non sia "Riepilogo"
-        for name in wb.sheetnames:
-            if name.lower() != "riepilogo":
-                ws = wb[name]
-                break
+    try:
+        if sheet_name:
+            ws = wb[sheet_name]
         else:
-            ws = wb[wb.sheetnames[0]]
+            # Usa il primo foglio che non sia "Riepilogo"
+            for name in wb.sheetnames:
+                if name.lower() != "riepilogo":
+                    ws = wb[name]
+                    break
+            else:
+                ws = wb[wb.sheetnames[0]]
 
-    days: list[dict] = []
-    year: int | None = None
-    month: int | None = None
+        days: list[dict] = []
+        year: int | None = None
+        month: int | None = None
 
-    for row_idx in range(2, ws.max_row + 1):
-        date_val = ws.cell(row_idx, 1).value  # Colonna A
-        if date_val is None:
-            break
-        if not isinstance(date_val, datetime):
-            continue
+        for row_idx in range(2, ws.max_row + 1):
+            date_val = ws.cell(row_idx, 1).value  # Colonna A
+            if date_val is None:
+                break
+            if not isinstance(date_val, datetime):
+                continue
 
-        if year is None:
-            year = date_val.year
-            month = date_val.month
+            if year is None:
+                year = date_val.year
+                month = date_val.month
 
-        is_hol = _is_holiday(date_val)
-        dow = _DOW_NAMES[date_val.weekday()]
+            is_hol = _is_holiday(date_val)
+            dow = _DOW_NAMES[date_val.weekday()]
 
-        assignments: dict[str, list[str]] = {}
-        for col_letter, col_idx in _COL_INDICES.items():
-            names = _parse_cell(ws.cell(row_idx, col_idx).value)
-            if names:
-                assignments[col_letter] = names
+            assignments: dict[str, list[str]] = {}
+            for col_letter, col_idx in _COL_INDICES.items():
+                names = _parse_cell(ws.cell(row_idx, col_idx).value)
+                if names:
+                    assignments[col_letter] = names
 
-        days.append({
-            "date": date_val.strftime("%Y-%m-%d"),
-            "dow": dow,
-            "is_holiday": is_hol,
-            "assignments": assignments,
-        })
+            days.append({
+                "date": date_val.strftime("%Y-%m-%d"),
+                "dow": dow,
+                "is_holiday": is_hol,
+                "assignments": assignments,
+            })
 
-    wb.close()
-
-    return {
-        "year": year,
-        "month": month,
-        "month_label": f"{year:04d}-{month:02d}" if year and month else "",
-        "days": days,
-    }
+        return {
+            "year": year,
+            "month": month,
+            "month_label": f"{year:04d}-{month:02d}" if year and month else "",
+            "days": days,
+        }
+    finally:
+        wb.close()
 
 
 # ── 2. Statistiche per medico ─────────────────────────────────────────────
