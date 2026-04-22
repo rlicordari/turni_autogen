@@ -3039,91 +3039,139 @@ else:
         st.caption(f"Mesi in memoria: {', '.join(_sorted_months)}")
         _agg_hist = sh.aggregate_multi_month(_hist_data)
 
-        # Tabella riepilogativa
+        # Tabella riepilogativa — cumulativa + per mese
         with st.expander("📋 Tabella riepilogativa", expanded=True):
-            _rows_hist = []
-            for _doc in sorted(_agg_hist.keys()):
-                _ds = _agg_hist[_doc]
-                _j = _ds.get("J", {})
-                _c = _ds.get("C", {})
-                _h = _ds.get("H", {})
-                _i = _ds.get("I", {})
-                _rows_hist.append({
-                    "Medico": _doc,
-                    "Mesi": _ds.get("_months_counted", 0),
-                    "Notti (J)": _j.get("total", 0) if isinstance(_j, dict) else 0,
-                    "Notti Sab": _j.get("sabati", 0) if isinstance(_j, dict) else 0,
-                    "Notti Dom": _j.get("domeniche", 0) if isinstance(_j, dict) else 0,
-                    "Reperibilità (C)": _c.get("total", 0) if isinstance(_c, dict) else 0,
-                    "Festivi (D/E/H/I)": _ds.get("_festivi_DE_HI", 0),
-                    "Domeniche": _ds.get("_domeniche", 0),
-                    "Sabati": _ds.get("_sabati", 0),
-                    "H pom.": _h.get("total", 0) if isinstance(_h, dict) else 0,
-                    "I pom.": _i.get("total", 0) if isinstance(_i, dict) else 0,
-                })
-            _df_hist = pd.DataFrame(_rows_hist)
-            st.dataframe(_df_hist, use_container_width=True, hide_index=True)
+            _tab_cum, _tab_mese = st.tabs(["Cumulativo", "Per mese"])
 
-        # Grafici
+            # --- Tab cumulativo ---
+            with _tab_cum:
+                _rows_hist = []
+                for _doc in sorted(_agg_hist.keys()):
+                    _ds = _agg_hist[_doc]
+                    _j = _ds.get("J", {})
+                    _c = _ds.get("C", {})
+                    _h = _ds.get("H", {})
+                    _i = _ds.get("I", {})
+                    _rows_hist.append({
+                        "Medico": _doc,
+                        "Mesi": _ds.get("_months_counted", 0),
+                        "Notti (J)": _j.get("total", 0) if isinstance(_j, dict) else 0,
+                        "Notti Sab": _j.get("sabati", 0) if isinstance(_j, dict) else 0,
+                        "Notti Dom": _j.get("domeniche", 0) if isinstance(_j, dict) else 0,
+                        "Reperibilità (C)": _c.get("total", 0) if isinstance(_c, dict) else 0,
+                        "Festivi (D/E/H/I)": _ds.get("_festivi_DE_HI", 0),
+                        "Domeniche": _ds.get("_domeniche", 0),
+                        "Sabati": _ds.get("_sabati", 0),
+                        "H pom.": _h.get("total", 0) if isinstance(_h, dict) else 0,
+                        "I pom.": _i.get("total", 0) if isinstance(_i, dict) else 0,
+                    })
+                _df_hist = pd.DataFrame(_rows_hist)
+                st.dataframe(_df_hist, use_container_width=True, hide_index=True)
+
+            # --- Tab per mese ---
+            with _tab_mese:
+                _sel_mese = st.selectbox(
+                    "Mese", _sorted_months, key="hist_tab_mese",
+                    index=len(_sorted_months) - 1,
+                )
+                _ms_sel = _hist_data[_sel_mese]
+                _rows_mese = []
+                for _doc in sorted(_ms_sel.keys()):
+                    _ds = _ms_sel[_doc]
+                    _j = _ds.get("J", {})
+                    _c = _ds.get("C", {})
+                    _h = _ds.get("H", {})
+                    _i = _ds.get("I", {})
+                    _rows_mese.append({
+                        "Medico": _doc,
+                        "Notti (J)": _j.get("total", 0) if isinstance(_j, dict) else 0,
+                        "Notti Sab": _j.get("sabati", 0) if isinstance(_j, dict) else 0,
+                        "Notti Dom": _j.get("domeniche", 0) if isinstance(_j, dict) else 0,
+                        "Reperibilità (C)": _c.get("total", 0) if isinstance(_c, dict) else 0,
+                        "Festivi (D/E/H/I)": _ds.get("_festivi_DE_HI", 0),
+                        "Domeniche": _ds.get("_domeniche", 0),
+                        "Sabati": _ds.get("_sabati", 0),
+                        "H pom.": _h.get("total", 0) if isinstance(_h, dict) else 0,
+                        "I pom.": _i.get("total", 0) if isinstance(_i, dict) else 0,
+                    })
+                st.dataframe(pd.DataFrame(_rows_mese), use_container_width=True, hide_index=True)
+
+        # Grafici — menu a tendina per scegliere
         with st.expander("📈 Grafici", expanded=False):
             if _rows_hist:
-                _fig_j = px.bar(
-                    _df_hist, x="Medico", y="Notti (J)",
-                    title="Notti totali per medico (cumulativo)",
-                    color="Notti (J)", color_continuous_scale="Reds",
+                _graf_scelta = st.selectbox(
+                    "Grafico",
+                    [
+                        "Notti totali (cumulativo)",
+                        "Notti: feriali / sabato / domenica (cumulativo)",
+                        "Domeniche lavorate (cumulativo)",
+                        "Reperibilità (cumulativo)",
+                        "Evoluzione notti mese per mese",
+                    ],
+                    key="hist_graf_sel",
                 )
-                _fig_j.update_layout(xaxis_tickangle=-45, height=400)
-                st.plotly_chart(_fig_j, use_container_width=True)
 
-                _df_j2 = pd.DataFrame([{
-                    "Medico": r["Medico"],
-                    "Feriali": r["Notti (J)"] - r["Notti Sab"] - r["Notti Dom"],
-                    "Sabato": r["Notti Sab"],
-                    "Domenica": r["Notti Dom"],
-                } for r in _rows_hist])
-                _fig_j2 = px.bar(
-                    _df_j2, x="Medico", y=["Feriali", "Sabato", "Domenica"],
-                    title="Notti: distribuzione feriali/sabato/domenica",
-                    barmode="stack",
-                )
-                _fig_j2.update_layout(xaxis_tickangle=-45, height=400)
-                st.plotly_chart(_fig_j2, use_container_width=True)
+                if _graf_scelta == "Notti totali (cumulativo)":
+                    _fig = px.bar(
+                        _df_hist, x="Medico", y="Notti (J)",
+                        title="Notti totali per medico (cumulativo)",
+                        color="Notti (J)", color_continuous_scale="Reds",
+                    )
+                    _fig.update_layout(xaxis_tickangle=-45, height=400)
+                    st.plotly_chart(_fig, use_container_width=True)
 
-                _fig_dom = px.bar(
-                    _df_hist, x="Medico", y="Domeniche",
-                    title="Domeniche lavorate per medico (cumulativo)",
-                    color="Domeniche", color_continuous_scale="Blues",
-                )
-                _fig_dom.update_layout(xaxis_tickangle=-45, height=400)
-                st.plotly_chart(_fig_dom, use_container_width=True)
+                elif _graf_scelta == "Notti: feriali / sabato / domenica (cumulativo)":
+                    _df_j2 = pd.DataFrame([{
+                        "Medico": r["Medico"],
+                        "Feriali": r["Notti (J)"] - r["Notti Sab"] - r["Notti Dom"],
+                        "Sabato": r["Notti Sab"],
+                        "Domenica": r["Notti Dom"],
+                    } for r in _rows_hist])
+                    _fig = px.bar(
+                        _df_j2, x="Medico", y=["Feriali", "Sabato", "Domenica"],
+                        title="Notti: distribuzione feriali/sabato/domenica (cumulativo)",
+                        barmode="stack",
+                    )
+                    _fig.update_layout(xaxis_tickangle=-45, height=400)
+                    st.plotly_chart(_fig, use_container_width=True)
 
-                _fig_c = px.bar(
-                    _df_hist, x="Medico", y="Reperibilità (C)",
-                    title="Reperibilità per medico (cumulativo)",
-                    color="Reperibilità (C)", color_continuous_scale="Greens",
-                )
-                _fig_c.update_layout(xaxis_tickangle=-45, height=400)
-                st.plotly_chart(_fig_c, use_container_width=True)
+                elif _graf_scelta == "Domeniche lavorate (cumulativo)":
+                    _fig = px.bar(
+                        _df_hist, x="Medico", y="Domeniche",
+                        title="Domeniche lavorate per medico (cumulativo)",
+                        color="Domeniche", color_continuous_scale="Blues",
+                    )
+                    _fig.update_layout(xaxis_tickangle=-45, height=400)
+                    st.plotly_chart(_fig, use_container_width=True)
 
-                if len(_sorted_months) > 1:
-                    st.markdown("**Evoluzione mese per mese**")
-                    _evo = []
-                    for _ml2 in _sorted_months:
-                        for _doc2, _ds2 in _hist_data[_ml2].items():
-                            _j2 = _ds2.get("J", {})
-                            _evo.append({
-                                "Mese": _ml2,
-                                "Medico": _doc2,
-                                "Notti": _j2.get("total", 0) if isinstance(_j2, dict) else 0,
-                            })
-                    if _evo:
-                        _df_evo = pd.DataFrame(_evo)
-                        _fig_evo = px.line(
-                            _df_evo, x="Mese", y="Notti", color="Medico",
-                            title="Notti per mese", markers=True,
+                elif _graf_scelta == "Reperibilità (cumulativo)":
+                    _fig = px.bar(
+                        _df_hist, x="Medico", y="Reperibilità (C)",
+                        title="Reperibilità per medico (cumulativo)",
+                        color="Reperibilità (C)", color_continuous_scale="Greens",
+                    )
+                    _fig.update_layout(xaxis_tickangle=-45, height=400)
+                    st.plotly_chart(_fig, use_container_width=True)
+
+                elif _graf_scelta == "Evoluzione notti mese per mese":
+                    if len(_sorted_months) > 1:
+                        _evo = []
+                        for _ml2 in _sorted_months:
+                            for _doc2, _ds2 in _hist_data[_ml2].items():
+                                _j2 = _ds2.get("J", {})
+                                _evo.append({
+                                    "Mese": _ml2,
+                                    "Medico": _doc2,
+                                    "Notti": _j2.get("total", 0) if isinstance(_j2, dict) else 0,
+                                })
+                        _fig = px.line(
+                            pd.DataFrame(_evo), x="Mese", y="Notti", color="Medico",
+                            title="Evoluzione notti per medico", markers=True,
                         )
-                        _fig_evo.update_layout(height=400)
-                        st.plotly_chart(_fig_evo, use_container_width=True)
+                        _fig.update_layout(height=400)
+                        st.plotly_chart(_fig, use_container_width=True)
+                    else:
+                        st.info("Servono almeno 2 mesi per il grafico di evoluzione.")
 
         # Rimuovi mese
         with st.expander("🗑️ Rimuovi mese dallo storico", expanded=False):
