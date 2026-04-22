@@ -1557,6 +1557,7 @@ def solve_with_ortools(
     fixed_assignments: Optional[List[dict]] = None,
     availability_preferences: Optional[List[dict]] = None,
     unav_map: Optional[Dict[str, Dict[dt.date, Set[str]]]] = None,
+    historical_stats: Optional[dict] = None,
 ) -> Tuple[Dict[str, Optional[str]], Dict]:
     """
     Returns:
@@ -2916,6 +2917,50 @@ def solve_with_ortools(
         if penalties:
             objective_terms.append(3 * sum(penalties))
     # Weekend night concentration: già gestito nel blocco J sopra con hard max=2 e strong soft
+
+    # ── Historical balance: soft constraints from previous months ────────────
+    _hist = historical_stats or {}
+    if _hist:
+        HIST_NIGHT_PENALTY = 150
+        HIST_FEST_PENALTY = 200
+
+        # Notti J: penalizza medici con più notti storiche
+        _rJ_cfg = (cfg.get("rules") or {}).get("J") or {}
+        _mq_fixed_hist = set()
+        for _k in (_rJ_cfg.get("monthly_quotas") or {}).keys():
+            _mq_fixed_hist.add(norm_name(_k))
+        try:
+            _night_pool_hist = night_pool  # defined inside "J" block
+        except NameError:
+            _night_pool_hist = set()
+        _night_pool_free_hist = [d for d in sorted(_night_pool_hist) if d not in _mq_fixed_hist]
+
+        for _doc in _night_pool_free_hist:
+            _j_data = _hist.get(_doc, {}).get("J", {})
+            _hist_j_total = _j_data.get("total", 0) if isinstance(_j_data, dict) else 0
+            if _hist_j_total <= 0:
+                continue
+            _vars = [night_var_by_day_doc.get((d.date, _doc)) for d in days
+                     if night_var_by_day_doc.get((d.date, _doc)) is not None]
+            if _vars:
+                _cnt = model.NewIntVar(0, len(days), f"hist_j_{abs(hash(_doc)) % 10 ** 6}")
+                model.Add(_cnt == sum(_vars))
+                extra_obj.append(HIST_NIGHT_PENALTY * _hist_j_total * _cnt)
+
+        # Domeniche J: penalizza notti domenicali storiche
+        for _doc in sorted(_night_pool_hist):
+            _j_data2 = _hist.get(_doc, {}).get("J", {})
+            _hist_dom_j = _j_data2.get("domeniche", 0) if isinstance(_j_data2, dict) else 0
+            if _hist_dom_j <= 0:
+                continue
+            _sun_vars = [night_var_by_day_doc.get((d.date, _doc))
+                         for d in days if d.dow == "Sun"
+                         if night_var_by_day_doc.get((d.date, _doc)) is not None]
+            if _sun_vars:
+                _sun_cnt = model.NewIntVar(0, len(_sun_vars), f"hist_sunj_{abs(hash(_doc)) % 10 ** 6}")
+                model.Add(_sun_cnt == sum(_sun_vars))
+                extra_obj.append(HIST_FEST_PENALTY * _hist_dom_j * _sun_cnt)
+
     model.Minimize(sum(objective_terms + extra_obj))
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = 30.0
@@ -3757,6 +3802,7 @@ def solve_across_months(
     availability_preferences: Optional[List[dict]] = None,
     v_double_overrides: Optional[List[str]] = None,
     j_blank_week_overrides: Optional[Dict[str, Optional[str]]] = None,
+    historical_stats: Optional[dict] = None,
 ) -> Tuple[List[Slot], Dict[str, Optional[str]], Dict]:
     """Solve schedules month-by-month and merge.
 
@@ -3843,6 +3889,7 @@ def solve_across_months(
                 fixed_assignments=fixed_m,
                 availability_preferences=avail_m,
                 unav_map=local_unav,
+                historical_stats=historical_stats,
             )
         except Exception as e:
             # MODIFICA 2: niente Greedy. Se OR-Tools fallisce, propaga l'errore
@@ -3971,6 +4018,7 @@ def generate_schedule(
     availability_preferences: Optional[List[dict]] = None,
     v_double_overrides: Optional[List[str]] = None,
     j_blank_week_overrides: Optional[Dict[str, Optional[str]]] = None,
+    historical_stats: Optional[dict] = None,
 ):
     """Generate schedules without Tkinter.
 
@@ -4006,6 +4054,7 @@ def generate_schedule(
         j_blank_week_overrides=j_blank_week_overrides,
         fixed_assignments=fixed_assignments,
         availability_preferences=availability_preferences,
+        historical_stats=historical_stats,
     )
     # Safety net: enforce definitive C rules even if an older solver path skipped it
     assignment, cdiag = assign_reperibilita_C(cfg, days, slots, assignment)
