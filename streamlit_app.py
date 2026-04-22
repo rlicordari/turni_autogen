@@ -26,6 +26,7 @@ import yaml
 import github_utils
 import unavailability_store as ustore
 import xlsx_utils
+import shift_history as sh
 
 # Import generator
 import turni_generator as tg
@@ -298,6 +299,32 @@ def _github_cfg() -> dict:
         "contacts_path": _get_secret(("GITHUB_DOCTOR_CONTACTS_PATH",), "data/doctor_contacts.yml"),
         "availability_path": _get_secret(("GITHUB_AVAIL_PATH",), "data/availability_store.csv"),
     }
+
+# ---------------- Shift history helpers ----------------
+def _load_shift_history() -> tuple[dict, str | None]:
+    """Carica lo storico turni da GitHub."""
+    try:
+        sec = st.secrets["github_unavailability"]
+        return sh.load_history_from_github(
+            sec["owner"], sec["repo"], sec["token"], sec.get("branch", "main"),
+        )
+    except Exception:
+        return {}, None
+
+
+def _save_shift_history(history: dict, sha: str | None = None) -> bool:
+    """Salva lo storico turni su GitHub. Ritorna True se successo."""
+    try:
+        sec = st.secrets["github_unavailability"]
+        sh.save_history_to_github(
+            history, sec["owner"], sec["repo"], sec["token"],
+            sec.get("branch", "main"), sha,
+        )
+        return True
+    except Exception as e:
+        st.error(f"Errore salvataggio storico: {e}")
+        return False
+
 
 # ---------------- Rules / doctors ----------------
 def load_rules_from_source(uploaded) -> tuple[dict, Path]:
@@ -2968,6 +2995,150 @@ else:
 
     st.divider()
 
+    # ── Memoria Storica Turni ─────────────────────────────────────────────
+    st.markdown("### 📊 Memoria Storica Turni")
+    st.info(
+        "Carica i file Excel **definitivi** dei mesi precedenti per costruire "
+        "una memoria storica. Il solver userà questi dati per bilanciare le "
+        "quote tra i mesi.",
+        icon="🧠",
+    )
+
+    _hist_data, _hist_sha = _load_shift_history()
+
+    # Upload nuovo mese
+    with st.expander("📤 Carica mese definitivo", expanded=False):
+        _hist_upload = st.file_uploader(
+            "File Excel turni definitivo",
+            type=["xlsx"],
+            key="hist_upload",
+            help="Il file Excel finale (dopo le modifiche del primario) di un mese passato.",
+        )
+        if _hist_upload is not None:
+            if st.button("📥 Importa nel storico", key="btn_import_hist"):
+                _tmp = Path(tempfile.gettempdir()) / f"hist_{int(time.time())}.xlsx"
+                _tmp.write_bytes(_hist_upload.getvalue())
+                try:
+                    _parsed = sh.parse_finalized_xlsx(str(_tmp))
+                    _ml = _parsed["month_label"]
+                    _ms = sh.compute_doctor_stats(_parsed)
+                    _hist_data[_ml] = _ms
+                    if _save_shift_history(_hist_data, _hist_sha):
+                        st.success(f"✅ Mese **{_ml}** importato ({len(_parsed['days'])} giorni)")
+                        st.rerun()
+                except Exception as _e:
+                    st.error(f"Errore parsing: {_e}")
+                finally:
+                    if _tmp.exists():
+                        _tmp.unlink()
+
+    # Visualizzazione mesi caricati
+    if _hist_data:
+        _sorted_months = sorted(_hist_data.keys())
+        st.caption(f"Mesi in memoria: {', '.join(_sorted_months)}")
+        _agg_hist = sh.aggregate_multi_month(_hist_data)
+
+        # Tabella riepilogativa
+        with st.expander("📋 Tabella riepilogativa", expanded=True):
+            _rows_hist = []
+            for _doc in sorted(_agg_hist.keys()):
+                _ds = _agg_hist[_doc]
+                _j = _ds.get("J", {})
+                _c = _ds.get("C", {})
+                _h = _ds.get("H", {})
+                _i = _ds.get("I", {})
+                _rows_hist.append({
+                    "Medico": _doc,
+                    "Mesi": _ds.get("_months_counted", 0),
+                    "Notti (J)": _j.get("total", 0) if isinstance(_j, dict) else 0,
+                    "Notti Sab": _j.get("sabati", 0) if isinstance(_j, dict) else 0,
+                    "Notti Dom": _j.get("domeniche", 0) if isinstance(_j, dict) else 0,
+                    "Reperibilità (C)": _c.get("total", 0) if isinstance(_c, dict) else 0,
+                    "Festivi (D/E/H/I)": _ds.get("_festivi_DE_HI", 0),
+                    "Domeniche": _ds.get("_domeniche", 0),
+                    "Sabati": _ds.get("_sabati", 0),
+                    "H pom.": _h.get("total", 0) if isinstance(_h, dict) else 0,
+                    "I pom.": _i.get("total", 0) if isinstance(_i, dict) else 0,
+                })
+            _df_hist = pd.DataFrame(_rows_hist)
+            st.dataframe(_df_hist, use_container_width=True, hide_index=True)
+
+        # Grafici
+        with st.expander("📈 Grafici", expanded=False):
+            import plotly.express as _px_hist
+            if _rows_hist:
+                _fig_j = _px_hist.bar(
+                    _df_hist, x="Medico", y="Notti (J)",
+                    title="Notti totali per medico (cumulativo)",
+                    color="Notti (J)", color_continuous_scale="Reds",
+                )
+                _fig_j.update_layout(xaxis_tickangle=-45, height=400)
+                st.plotly_chart(_fig_j, use_container_width=True)
+
+                _df_j2 = pd.DataFrame([{
+                    "Medico": r["Medico"],
+                    "Feriali": r["Notti (J)"] - r["Notti Sab"] - r["Notti Dom"],
+                    "Sabato": r["Notti Sab"],
+                    "Domenica": r["Notti Dom"],
+                } for r in _rows_hist])
+                _fig_j2 = _px_hist.bar(
+                    _df_j2, x="Medico", y=["Feriali", "Sabato", "Domenica"],
+                    title="Notti: distribuzione feriali/sabato/domenica",
+                    barmode="stack",
+                )
+                _fig_j2.update_layout(xaxis_tickangle=-45, height=400)
+                st.plotly_chart(_fig_j2, use_container_width=True)
+
+                _fig_dom = _px_hist.bar(
+                    _df_hist, x="Medico", y="Domeniche",
+                    title="Domeniche lavorate per medico (cumulativo)",
+                    color="Domeniche", color_continuous_scale="Blues",
+                )
+                _fig_dom.update_layout(xaxis_tickangle=-45, height=400)
+                st.plotly_chart(_fig_dom, use_container_width=True)
+
+                _fig_c = _px_hist.bar(
+                    _df_hist, x="Medico", y="Reperibilità (C)",
+                    title="Reperibilità per medico (cumulativo)",
+                    color="Reperibilità (C)", color_continuous_scale="Greens",
+                )
+                _fig_c.update_layout(xaxis_tickangle=-45, height=400)
+                st.plotly_chart(_fig_c, use_container_width=True)
+
+                if len(_sorted_months) > 1:
+                    st.markdown("**Evoluzione mese per mese**")
+                    _evo = []
+                    for _ml2 in _sorted_months:
+                        for _doc2, _ds2 in _hist_data[_ml2].items():
+                            _j2 = _ds2.get("J", {})
+                            _evo.append({
+                                "Mese": _ml2,
+                                "Medico": _doc2,
+                                "Notti": _j2.get("total", 0) if isinstance(_j2, dict) else 0,
+                            })
+                    if _evo:
+                        _df_evo = pd.DataFrame(_evo)
+                        _fig_evo = _px_hist.line(
+                            _df_evo, x="Mese", y="Notti", color="Medico",
+                            title="Notti per mese", markers=True,
+                        )
+                        _fig_evo.update_layout(height=400)
+                        st.plotly_chart(_fig_evo, use_container_width=True)
+
+        # Rimuovi mese
+        with st.expander("🗑️ Rimuovi mese dallo storico", expanded=False):
+            _month_del = st.selectbox("Seleziona mese da rimuovere", _sorted_months, key="hist_del")
+            if st.button("Rimuovi", key="btn_del_hist"):
+                if _month_del in _hist_data:
+                    del _hist_data[_month_del]
+                    if _save_shift_history(_hist_data, _hist_sha):
+                        st.success(f"Mese {_month_del} rimosso.")
+                        st.rerun()
+    else:
+        st.caption("Nessun mese caricato nella memoria storica.")
+
+    st.divider()
+
     # ── Step 4: Assegnazioni fisse ────────────────────────────────────────────
     st.markdown("### 4) Assegnazioni fisse (opzionale)")
     st.info(
@@ -3320,6 +3491,10 @@ else:
                     all_avail_prefs = []
                     st.warning(f"Impossibile caricare preferenze da GitHub: {_e}")
 
+                # Storico aggregato per il solver
+                _hist_data2, _ = _load_shift_history()
+                _hist_agg_for_solver = sh.aggregate_multi_month(_hist_data2) if _hist_data2 else None
+
                 stats, log_path = tg.generate_schedule(
                     template_xlsx=template_path,
                     rules_yml=rules_path_use,
@@ -3331,6 +3506,7 @@ else:
                     availability_preferences=all_avail_prefs if all_avail_prefs else None,
                     v_double_overrides=_v_double_overrides_list if _v_double_overrides_list else None,
                     j_blank_week_overrides=_j_blank_week_overrides if _j_blank_week_overrides else None,
+                    historical_stats=_hist_agg_for_solver,
                 )
 
                 status.update(label="Completato ✅", state="complete")
