@@ -2330,10 +2330,10 @@ def solve_with_ortools(
             model.Add(we_sum >= min_we).OnlyEnforceIf(no_we.Not())
             extra_obj.append(wn_pen * no_we)
     # Night distribution (HARD min/max per dottore + soft balance weekend)
-    # Logica marzo 2026: 27 notti assegnabili.
-    #  - Licordari=3, Colarusso=3, Calabrò=2, Zito=2 (quote fisse YAML)
-    #  - Restano 17 notti per gli altri 8 medici del pool → tutti 2, uno casuale 3
-    #  - Regola generale: ogni medico del pool fa MIN 2, MAX 3 notti. NESSUNO può fare 0,1,4+.
+    # Logica: total_nights = giorni del mese - giovedì (thursday_blank).
+    # pool_available_nights esclude slot J pre-assegnate a medici fuori pool (es. festivi fissi).
+    # Quota fissa (monthly_quotas YAML) sottratta → free_total diviso equamente tra free_docs.
+    # Regola generale: ogni free doctor fa MIN floor(free_total/n), MAX floor+1 notti.
     if "rules" in cfg and "J" in cfg["rules"]:
         rJ = cfg["rules"]["J"]
         night_pool = set(norm_name(d) for d in (rJ.get("pool_other") or []))
@@ -2342,13 +2342,18 @@ def solve_with_ortools(
         mq_fixed = {norm_name(k): int(v) for k,v in (rJ.get("monthly_quotas") or {}).items()
                     if norm_name(k) in doctors}
         total_nights = sum(1 for s in slots if s.columns == ["J"])
+        # Notti disponibili per i pool doctors (esclude slot pre-assegnate a medici fuori pool)
+        pool_available_nights = sum(
+            1 for s in slots
+            if s.columns == ["J"] and any(d in night_pool for d in s.allowed)
+        )
 
         if night_pool and total_nights > 0:
             # Medici con quota fissa: già vincolati con == sopra.
             # Medici senza quota fissa: imponiamo min=2, max=3 hard.
             free_docs = [d for d in sorted(night_pool) if d not in mq_fixed]
             fixed_total = sum(mq_fixed.values())
-            free_total = total_nights - fixed_total
+            free_total = pool_available_nights - fixed_total
 
             # Calcola min/max bilanciati per i medici liberi
             if free_docs:
