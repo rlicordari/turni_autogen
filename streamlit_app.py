@@ -3085,7 +3085,8 @@ else:
 
                 _draft = st.session_state[_pool_draft_key]
                 _draft_doctors: dict = _draft.get("doctors", {})
-                _all_cols = sorted(cfg_admin.get("columns", {}).keys())
+                _LIBRE_COLS = {"AD", "AE", "AF", "AG"}
+                _all_cols = sorted(k for k in cfg_admin.get("columns", {}).keys() if k not in _LIBRE_COLS)
                 _all_docs_list = sorted(_draft_doctors.keys(), key=lambda s: (s == "Recupero", s.lower()))
 
                 import pool_config_store as _pcs_ui
