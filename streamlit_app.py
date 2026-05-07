@@ -3473,21 +3473,39 @@ else:
         st.caption("Nessun mese caricato nella memoria storica.")
 
     # ── Migrazione CSV aggregato → file per-medico ────────────────────────
-    st.markdown("#### Migrazione indisponibilità al nuovo formato")
-    st.warning(
-        "**Azione richiesta (una-tantum).** Il sistema ora salva un file CSV separato "
-        "per ogni medico, eliminando i conflitti di salvataggio concorrente. "
-        "Clicca il bottone qui sotto per copiare i dati storici dal vecchio CSV ai file per-medico.",
-        icon="⚠️",
+    _mg = _github_cfg()
+    _unavail_dir_files = github_utils.list_dir(
+        owner=_mg["owner"], repo=_mg["repo"],
+        path=_unavail_per_doctor_dir(),
+        token=_mg["token"], branch=_mg.get("branch", "main"),
     )
-    _mg_col1, _mg_col2 = st.columns([1, 3])
-    with _mg_col1:
-        _do_migrate = st.button("Esegui migrazione", key="btn_migrate_unavail", type="primary", use_container_width=True)
-    with _mg_col2:
-        st.caption(
-            f"Legge `unavailability_store.csv` → scrive file per-medico in `{_unavail_per_doctor_dir()}/`. "
-            "Il vecchio file resta intatto come backup."
+    _unavail_already_migrated = len(_unavail_dir_files) > 0
+
+    if _unavail_already_migrated:
+        with st.expander("✅ Indisponibilità — file per-medico già presenti", expanded=False):
+            st.success(
+                f"Trovati {len(_unavail_dir_files)} file in `{_unavail_per_doctor_dir()}/`. "
+                "Migrazione già effettuata.",
+                icon="✅",
+            )
+            st.caption("Se necessario puoi ripetere la migrazione qui sotto.")
+            _do_migrate = st.button("Ripeti migrazione indisponibilità", key="btn_migrate_unavail")
+    else:
+        st.markdown("#### Migrazione indisponibilità al nuovo formato")
+        st.warning(
+            "**Azione richiesta (una-tantum).** Il sistema ora salva un file CSV separato "
+            "per ogni medico, eliminando i conflitti di salvataggio concorrente. "
+            "Clicca il bottone qui sotto per copiare i dati storici dal vecchio CSV ai file per-medico.",
+            icon="⚠️",
         )
+        _mg_col1, _mg_col2 = st.columns([1, 3])
+        with _mg_col1:
+            _do_migrate = st.button("Esegui migrazione", key="btn_migrate_unavail", type="primary", use_container_width=True)
+        with _mg_col2:
+            st.caption(
+                f"Legge `unavailability_store.csv` → scrive file per-medico in `{_unavail_per_doctor_dir()}/`. "
+                "Il vecchio file resta intatto come backup."
+            )
     if _do_migrate:
         _mg = _github_cfg()
         if not _mg.get("path"):
@@ -3532,20 +3550,38 @@ else:
                 st.error(f"Errore migrazione: {_me}")
 
     # ── Migrazione preferenze disponibilità → file per-medico ─────────────
-    st.markdown("#### Migrazione preferenze disponibilità al nuovo formato")
-    st.warning(
-        "**Azione richiesta (una-tantum).** Divide `availability_store.csv` in file per-medico "
-        f"nella directory `{_avail_per_doctor_dir()}/`, eliminando i conflitti concorrenti.",
-        icon="⚠️",
+    _mga = _github_cfg()
+    _avail_dir_files = github_utils.list_dir(
+        owner=_mga["owner"], repo=_mga["repo"],
+        path=_avail_per_doctor_dir(),
+        token=_mga["token"], branch=_mga.get("branch", "main"),
     )
-    _mg2_col1, _mg2_col2 = st.columns([1, 3])
-    with _mg2_col1:
-        _do_migrate_avail = st.button("Esegui migrazione disponibilità", key="btn_migrate_avail", type="primary", use_container_width=True)
-    with _mg2_col2:
-        st.caption(
-            f"Legge `availability_store.csv` → scrive file per-medico in `{_avail_per_doctor_dir()}/`. "
-            "Il vecchio file resta intatto come backup."
+    _avail_already_migrated = len(_avail_dir_files) > 0
+
+    if _avail_already_migrated:
+        with st.expander("✅ Disponibilità — file per-medico già presenti", expanded=False):
+            st.success(
+                f"Trovati {len(_avail_dir_files)} file in `{_avail_per_doctor_dir()}/`. "
+                "Migrazione già effettuata.",
+                icon="✅",
+            )
+            st.caption("Se necessario puoi ripetere la migrazione qui sotto.")
+            _do_migrate_avail = st.button("Ripeti migrazione disponibilità", key="btn_migrate_avail")
+    else:
+        st.markdown("#### Migrazione preferenze disponibilità al nuovo formato")
+        st.warning(
+            "**Azione richiesta (una-tantum).** Divide `availability_store.csv` in file per-medico "
+            f"nella directory `{_avail_per_doctor_dir()}/`, eliminando i conflitti concorrenti.",
+            icon="⚠️",
         )
+        _mg2_col1, _mg2_col2 = st.columns([1, 3])
+        with _mg2_col1:
+            _do_migrate_avail = st.button("Esegui migrazione disponibilità", key="btn_migrate_avail", type="primary", use_container_width=True)
+        with _mg2_col2:
+            st.caption(
+                f"Legge `availability_store.csv` → scrive file per-medico in `{_avail_per_doctor_dir()}/`. "
+                "Il vecchio file resta intatto come backup."
+            )
     if _do_migrate_avail:
         _mga = _github_cfg()
         try:
