@@ -45,6 +45,30 @@ def get_file(owner: str, repo: str, path: str, token: str, branch: str = "main",
     return GithubFile(text=text, sha=sha)
 
 
+def list_dir(
+    owner: str,
+    repo: str,
+    path: str,
+    token: str,
+    branch: str = "main",
+    timeout_s: int = 20,
+) -> list[dict]:
+    """List files in a GitHub directory. Returns [] if path does not exist or is a plain file."""
+    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+    }
+    r = requests.get(url, headers=headers, params={"ref": branch}, timeout=timeout_s)
+    if r.status_code == 404:
+        return []
+    r.raise_for_status()
+    data = r.json()
+    if isinstance(data, list):
+        return data  # [{name, path, sha, type, ...}, ...]
+    return []  # single file, not a directory
+
+
 def put_file(
     owner: str,
     repo: str,
