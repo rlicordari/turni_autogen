@@ -1,4 +1,4 @@
-import io
+﻿import io
 import tempfile
 import time
 import traceback
@@ -1859,7 +1859,7 @@ st.markdown("""
 
 mode = st.sidebar.radio(
     "Sezione",
-    ["📋 Le mie indisponibilità", "⚙️ Admin"],
+    ["📋 Le mie indisponibilità", "⚙️ Admin — Genera turni", "🔧 Admin — Configurazione"],
     index=0,
 )
 
@@ -2910,10 +2910,10 @@ if mode == "📋 Le mie indisponibilità":
 
 
 # =====================================================================
-#                           ADMIN – Generazione
+#                           ADMIN
 # =====================================================================
 else:
-    st.subheader("Generazione turni (Admin)")
+    st.subheader("Area Admin")
     admin_pin = _get_admin_pin()
     if not admin_pin:
         st.error("Admin PIN non configurato in secrets (auth.admin_pin).")
@@ -2946,115 +2946,663 @@ else:
     with col_status:
         st.success("Area Admin sbloccata ✅")
 
-    # ---- Admin settings: open/close unavailability + limits ----
-    with st.expander("⚙️ Impostazioni indisponibilità (Admin)", expanded=True):
-        try:
-            app_settings, app_settings_sha = load_app_settings_from_github()
-        except Exception as e:
-            app_settings, app_settings_sha = dict(DEFAULT_SETTINGS), None
-            st.warning(f"Impossibile leggere impostazioni da GitHub (uso default): {e}")
+    # Carica cfg una volta per entrambi i rami (Genera e Configurazione)
+    cfg_admin = tg.load_rules(DEFAULT_RULES_PATH)
+    doctors = doctors_from_cfg(cfg_admin)
+    rules_path = DEFAULT_RULES_PATH
 
-        cur_open = bool(app_settings.get("unavailability_open", True))
-        try:
-            cur_max = int(app_settings.get("max_unavailability_per_shift", DEFAULT_SETTINGS["max_unavailability_per_shift"]))
-        except Exception:
-            cur_max = DEFAULT_SETTINGS["max_unavailability_per_shift"]
-        if cur_max < 0:
-            cur_max = 0
+    # ── Ramo Configurazione ───────────────────────────────────────────────
+    if mode == "🔧 Admin — Configurazione":
+        st.markdown("### 🔧 Configurazione sistema")
 
-        new_open = st.toggle(
-            "Consenti ai medici di inserire/modificare indisponibilità",
-            value=cur_open,
-            help="Se disattivato, i medici possono solo visualizzare le proprie indisponibilità ma non salvarle.",
-        )
-        _aS1, _aS2, _aS3, _aS4 = st.columns([1, 1, 1, 1.5])
-        with _aS1:
-            new_max = st.number_input(
-                "Max indisponibilità/fascia",
-                min_value=0,
-                max_value=31,
-                value=int(cur_max),
-                step=1,
-                help="Esempio: 6 = max 6 Mattine, 6 Pomeriggi, ecc. per ogni mese.",
-            )
-        with _aS2:
+        with st.expander("⚙️ Impostazioni indisponibilità", expanded=False):
             try:
-                cur_max_avail = int(app_settings.get("max_availability_per_shift", DEFAULT_SETTINGS["max_availability_per_shift"]))
-            except Exception:
-                cur_max_avail = DEFAULT_SETTINGS["max_availability_per_shift"]
-            new_max_avail = st.number_input(
-                "Max disponibilità/fascia",
-                min_value=0,
-                max_value=31,
-                value=int(cur_max_avail),
-                step=1,
-                help="Max preferenze 'disponibilità' inseribili per fascia per mese.",
-            )
-        with _aS3:
-            try:
-                cur_max_weekend = int(app_settings.get("max_weekend_days", DEFAULT_SETTINGS["max_weekend_days"]))
-            except Exception:
-                cur_max_weekend = DEFAULT_SETTINGS["max_weekend_days"]
-            new_max_weekend = st.number_input(
-                "Max weekend/mese",
-                min_value=0,
-                max_value=5,
-                value=int(cur_max_weekend),
-                step=1,
-                help="Max sabati distinti e max domeniche distinte che ogni medico può segnare come indisponibile in un mese (Ferie incluse).",
-            )
-        with _aS4:
-            meta = ""
-            if app_settings.get("updated_at"):
-                meta += f"Ultimo aggiornamento: {app_settings.get('updated_at')}"
-            if app_settings.get("updated_by"):
-                meta += f" | da: {app_settings.get('updated_by')}"
-            if meta:
-                st.caption(meta)
+                app_settings, app_settings_sha = load_app_settings_from_github()
+            except Exception as e:
+                app_settings, app_settings_sha = dict(DEFAULT_SETTINGS), None
+                st.warning(f"Impossibile leggere impostazioni da GitHub (uso default): {e}")
 
-        # Cap personalizzati per universitari
-        st.markdown("**Cap personalizzati per universitari** *(sovrascrivono il limite globale per i medici selezionati)*")
-        gc_uni = (cfg_default.get("global_constraints") or {}).get("university_doctors") or {}
-        uni_doctors = sorted(gc_uni.keys()) if gc_uni else ["Dattilo", "De Gregorio", "Zito"]
-        cur_doctor_caps = app_settings.get("doctor_caps") or {}
-        new_doctor_caps = {}
-        uni_cols = st.columns(len(uni_doctors))
-        for col, doc in zip(uni_cols, uni_doctors):
-            with col:
-                cur_cap = cur_doctor_caps.get(doc, int(new_max))
-                new_doctor_caps[doc] = st.number_input(
-                    doc,
+            cur_open = bool(app_settings.get("unavailability_open", True))
+            try:
+                cur_max = int(app_settings.get("max_unavailability_per_shift", DEFAULT_SETTINGS["max_unavailability_per_shift"]))
+            except Exception:
+                cur_max = DEFAULT_SETTINGS["max_unavailability_per_shift"]
+            if cur_max < 0:
+                cur_max = 0
+
+            new_open = st.toggle(
+                "Consenti ai medici di inserire/modificare indisponibilità",
+                value=cur_open,
+                help="Se disattivato, i medici possono solo visualizzare le proprie indisponibilità ma non salvarle.",
+            )
+            _aS1, _aS2, _aS3, _aS4 = st.columns([1, 1, 1, 1.5])
+            with _aS1:
+                new_max = st.number_input(
+                    "Max indisponibilità/fascia",
                     min_value=0,
                     max_value=31,
-                    value=int(cur_cap),
+                    value=int(cur_max),
                     step=1,
-                    key=f"doctor_cap_{doc}",
-                    help=f"Cap massimo di indisponibilità per fascia al mese per {doc}. Usa il limite globale ({int(new_max)}) se non vuoi differenziare.",
+                    help="Esempio: 6 = max 6 Mattine, 6 Pomeriggi, ecc. per ogni mese.",
+                )
+            with _aS2:
+                try:
+                    cur_max_avail = int(app_settings.get("max_availability_per_shift", DEFAULT_SETTINGS["max_availability_per_shift"]))
+                except Exception:
+                    cur_max_avail = DEFAULT_SETTINGS["max_availability_per_shift"]
+                new_max_avail = st.number_input(
+                    "Max disponibilità/fascia",
+                    min_value=0,
+                    max_value=31,
+                    value=int(cur_max_avail),
+                    step=1,
+                    help="Max preferenze 'disponibilità' inseribili per fascia per mese.",
+                )
+            with _aS3:
+                try:
+                    cur_max_weekend = int(app_settings.get("max_weekend_days", DEFAULT_SETTINGS["max_weekend_days"]))
+                except Exception:
+                    cur_max_weekend = DEFAULT_SETTINGS["max_weekend_days"]
+                new_max_weekend = st.number_input(
+                    "Max weekend/mese",
+                    min_value=0,
+                    max_value=5,
+                    value=int(cur_max_weekend),
+                    step=1,
+                    help="Max sabati distinti e max domeniche distinte che ogni medico può segnare come indisponibile in un mese (Ferie incluse).",
+                )
+            with _aS4:
+                meta = ""
+                if app_settings.get("updated_at"):
+                    meta += f"Ultimo aggiornamento: {app_settings.get('updated_at')}"
+                if app_settings.get("updated_by"):
+                    meta += f" | da: {app_settings.get('updated_by')}"
+                if meta:
+                    st.caption(meta)
+
+            # Cap personalizzati per universitari
+            st.markdown("**Cap personalizzati per universitari** *(sovrascrivono il limite globale per i medici selezionati)*")
+            gc_uni = (cfg_admin.get("global_constraints") or {}).get("university_doctors") or {}
+            uni_doctors = sorted(gc_uni.keys()) if gc_uni else ["Dattilo", "De Gregorio", "Zito"]
+            cur_doctor_caps = app_settings.get("doctor_caps") or {}
+            new_doctor_caps = {}
+            uni_cols = st.columns(len(uni_doctors))
+            for col, doc in zip(uni_cols, uni_doctors):
+                with col:
+                    cur_cap = cur_doctor_caps.get(doc, int(new_max))
+                    new_doctor_caps[doc] = st.number_input(
+                        doc,
+                        min_value=0,
+                        max_value=31,
+                        value=int(cur_cap),
+                        step=1,
+                        key=f"doctor_cap_{doc}",
+                        help=f"Cap massimo di indisponibilità per fascia al mese per {doc}. Usa il limite globale ({int(new_max)}) se non vuoi differenziare.",
+                    )
+
+            if st.button("Salva impostazioni indisponibilità", type="primary"):
+                settings_to_save = {
+                    "unavailability_open": bool(new_open),
+                    "max_unavailability_per_shift": int(new_max),
+                    "max_availability_per_shift": int(new_max_avail),
+                    "max_weekend_days": int(new_max_weekend),
+                    "doctor_caps": {doc: int(v) for doc, v in new_doctor_caps.items()},
+                    "updated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                    "updated_by": "admin",
+                }
+                try:
+                    save_app_settings_to_github(
+                        settings_to_save,
+                        app_settings_sha,
+                        message=f"Update settings: open={bool(new_open)} max_unav={int(new_max)} max_avail={int(new_max_avail)} max_weekend={int(new_max_weekend)}",
+                    )
+                    st.success("Impostazioni salvate ✅")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Errore salvataggio impostazioni su GitHub: {e}")
+
+        # ── Gestione Pool Medici ──────────────────────────────────────────
+        with st.expander("🩺 Gestione Pool Medici", expanded=False):
+            _pool_cfg_loaded, _pool_cfg_sha = load_pool_config_from_github_st()
+            _pool_cfg_exists = bool(_pool_cfg_loaded)
+
+            if not _pool_cfg_exists:
+                st.warning("Nessuna configurazione pool trovata su GitHub. Inizializza dal YAML attuale per cominciare.", icon="⚠️")
+                if st.button("🔧 Inizializza da YAML attuale", key="btn_init_pool_cfg"):
+                    import pool_config_store as _pcs_init
+                    _migrated = _pcs_init.migrate_from_yaml(cfg_admin)
+                    _ok, _msg = save_pool_config_with_retry(_migrated, None)
+                    if _ok:
+                        st.success("Configurazione pool inizializzata dal YAML. Ricarica la pagina per modificarla.", icon="✅")
+                        st.rerun()
+                    else:
+                        st.error(_msg)
+            else:
+                _pool_draft_key = "pool_cfg_draft"
+                if _pool_draft_key not in st.session_state:
+                    import copy as _copy_pool
+                    st.session_state[_pool_draft_key] = _copy_pool.deepcopy(_pool_cfg_loaded)
+
+                _draft = st.session_state[_pool_draft_key]
+                _draft_doctors: dict = _draft.get("doctors", {})
+                _all_cols = sorted(cfg_admin.get("columns", {}).keys())
+                _all_docs_list = sorted(_draft_doctors.keys(), key=lambda s: (s == "Recupero", s.lower()))
+
+                import pool_config_store as _pcs_ui
+                _tab_med, _tab_col, _tab_lim, _tab_serv = st.tabs(
+                    ["👨‍⚕️ Medici", "📋 Colonne", "⚖️ Limiti", "🔗 Servizi"]
                 )
 
-        if st.button("Salva impostazioni indisponibilità", type="primary"):
-            settings_to_save = {
-                "unavailability_open": bool(new_open),
-                "max_unavailability_per_shift": int(new_max),
-                "max_availability_per_shift": int(new_max_avail),
-                "max_weekend_days": int(new_max_weekend),
-                "doctor_caps": {doc: int(v) for doc, v in new_doctor_caps.items()},
-                "updated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-                "updated_by": "admin",
-            }
+                with _tab_med:
+                    st.markdown("**Stato e flag per ogni medico** — aggiungi righe con ＋, elimina con ✕")
+                    import pandas as _pd_pool
+                    _med_rows = []
+                    for _dname in _all_docs_list:
+                        _dc = _draft_doctors[_dname]
+                        _med_rows.append({
+                            "Medico": _dname,
+                            "Attivo": bool(_dc.get("active", True)),
+                            "Reperibilità": not bool(_dc.get("excluded_from_reperibilita", False)),
+                            "Festivi diurni": bool(_dc.get("festivi_diurni", True)),
+                            "Festivi notti": bool(_dc.get("festivi_notti", True)),
+                            "Universitario": bool(_dc.get("university_doctor")),
+                            "Ratio uni": float((_dc.get("university_doctor") or {}).get("ratio", 0.6) or 0.6)
+                            if _dc.get("university_doctor") else 0.0,
+                        })
+                    _med_df = _pd_pool.DataFrame(_med_rows)
+                    _edited_med = st.data_editor(
+                        _med_df,
+                        column_config={
+                            "Medico": st.column_config.TextColumn("Medico", help="Cognome esatto (maiuscola iniziale)"),
+                            "Attivo": st.column_config.CheckboxColumn("Attivo"),
+                            "Reperibilità": st.column_config.CheckboxColumn("Reperibilità C"),
+                            "Festivi diurni": st.column_config.CheckboxColumn("Festivi diurni"),
+                            "Festivi notti": st.column_config.CheckboxColumn("Festivi notti"),
+                            "Universitario": st.column_config.CheckboxColumn("Universitario"),
+                            "Ratio uni": st.column_config.NumberColumn("Ratio", min_value=0.0, max_value=1.0, step=0.05, format="%.2f"),
+                        },
+                        hide_index=True,
+                        use_container_width=True,
+                        key="pool_med_editor",
+                        num_rows="dynamic",
+                    )
+                    _edited_names: set[str] = set()
+                    for _, _row in _edited_med.iterrows():
+                        _dn = (_row.get("Medico") or "").strip()
+                        if not _dn:
+                            continue
+                        _edited_names.add(_dn)
+                        if _dn not in _draft_doctors:
+                            _draft_doctors[_dn] = {
+                                "active": True, "columns": [],
+                                "festivi_diurni": True, "festivi_notti": True,
+                                "excluded_from_reperibilita": False,
+                                "university_doctor": None, "column_overrides": {},
+                            }
+                        _draft_doctors[_dn]["active"] = bool(_row["Attivo"])
+                        _draft_doctors[_dn]["excluded_from_reperibilita"] = not bool(_row["Reperibilità"])
+                        _draft_doctors[_dn]["festivi_diurni"] = bool(_row["Festivi diurni"])
+                        _draft_doctors[_dn]["festivi_notti"] = bool(_row["Festivi notti"])
+                        _is_uni = bool(_row["Universitario"])
+                        if _is_uni:
+                            _draft_doctors[_dn]["university_doctor"] = {"ratio": float(_row["Ratio uni"] or 0.6)}
+                        else:
+                            _draft_doctors[_dn]["university_doctor"] = None
+                    for _dn_old in list(_draft_doctors.keys()):
+                        if _dn_old not in _edited_names:
+                            del _draft_doctors[_dn_old]
+
+                    st.divider()
+                    with st.expander("📌 Vincoli strutturali fissi (sola lettura — modificabili solo da YAML)", expanded=False):
+                        st.info(
+                            "Questi vincoli sono hardcoded nel YAML e non modificabili da questa GUI:\n\n"
+                            "- **Cimino** esatto 2 turni U al mese\n"
+                            "- **Crea** unico medico per i sabati AB (2/mese)\n"
+                            "- **Allegra** vincolo lunedì V+U (stessa giornata)\n"
+                            "- **De Gregorio** max 3 giorni feriali su I\n"
+                            "- **Grimaldi e Calabrò** esenti dal vincolo 'min 2 weekend liberi/mese'\n"
+                            "- **Pugliatti** fisso martedì su W",
+                            icon="🔒",
+                        )
+
+                with _tab_col:
+                    _sel_doc = st.selectbox("Seleziona medico", _all_docs_list, key="pool_col_doc_sel")
+                    if _sel_doc and _sel_doc in _draft_doctors:
+                        _doc_cols = set(_draft_doctors[_sel_doc].get("columns") or [])
+                        st.markdown(f"**Colonne assegnate a {_sel_doc}** — clicca per aggiungere/rimuovere")
+                        _col_names = cfg_admin.get("columns", {})
+                        _cols_per_row = 4
+                        _col_items = sorted(_col_names.items())
+                        for _ci in range(0, len(_col_items), _cols_per_row):
+                            _chunk = _col_items[_ci:_ci + _cols_per_row]
+                            _gcols = st.columns(len(_chunk))
+                            for _gci, ((_col_letter, _col_name), _gc) in enumerate(zip(_chunk, _gcols)):
+                                _is_on = _col_letter in _doc_cols
+                                _locked = _col_letter == "C"
+                                if _locked:
+                                    _gc.markdown(f"{'🔵' if _is_on else '⚫'} **{_col_letter}** — {_col_name}  \n*(C gestita da Reperibilità)*")
+                                else:
+                                    if _gc.checkbox(f"{_col_letter} · {_col_name}", value=_is_on,
+                                                    key=f"pool_col_{_sel_doc}_{_col_letter}"):
+                                        _doc_cols.add(_col_letter)
+                                    else:
+                                        _doc_cols.discard(_col_letter)
+                        _draft_doctors[_sel_doc]["columns"] = sorted(_doc_cols)
+
+                with _tab_lim:
+                    st.markdown("**Impostazioni globali per colonna**")
+                    _col_settings: dict = _draft.setdefault("column_settings", {})
+                    _cs_rows = []
+                    for _cl in _all_cols:
+                        _cs = _col_settings.get(_cl) or {}
+                        _cs_rows.append({
+                            "Colonna": _cl,
+                            "Nome": (cfg_admin.get("columns") or {}).get(_cl, ""),
+                            "Target mensile": _cs.get("monthly_target"),
+                            "Spacing min (gg)": int(_cs.get("spacing_min_days", 0) or 0),
+                            "Spacing pref (gg)": int(_cs.get("spacing_preferred_days", 0) or 0),
+                            "Conta come": int(_cs.get("counts_as", 1) if _cl != "C" else 0),
+                        })
+                    _cs_df = _pd_pool.DataFrame(_cs_rows)
+                    _edited_cs = st.data_editor(
+                        _cs_df,
+                        column_config={
+                            "Colonna": st.column_config.TextColumn("Col", disabled=True),
+                            "Nome": st.column_config.TextColumn("Nome", disabled=True),
+                            "Target mensile": st.column_config.NumberColumn("Target", min_value=0, max_value=31, step=1),
+                            "Spacing min (gg)": st.column_config.NumberColumn("Spacing min", min_value=0, max_value=30, step=1),
+                            "Spacing pref (gg)": st.column_config.NumberColumn("Spacing pref", min_value=0, max_value=30, step=1, help="Solo per J — soft preference"),
+                            "Conta come": st.column_config.NumberColumn("Conta come", min_value=0, max_value=4, step=1, help="C=0 (bloccato), J=2, altri=1"),
+                        },
+                        hide_index=True, use_container_width=True, key="pool_cs_editor", num_rows="fixed",
+                    )
+                    for _, _row in _edited_cs.iterrows():
+                        _cl = _row["Colonna"]
+                        _csd = _col_settings.setdefault(_cl, {})
+                        _mt = _row["Target mensile"]
+                        _csd["monthly_target"] = int(_mt) if _mt is not None and not _pd_pool.isna(_mt) else None
+                        _csd["spacing_min_days"] = int(_row["Spacing min (gg)"] or 0)
+                        _csd["spacing_preferred_days"] = int(_row["Spacing pref (gg)"] or 0)
+                        _csd["counts_as"] = 0 if _cl == "C" else int(_row["Conta come"] or 1)
+
+                    st.divider()
+                    st.markdown("**Override quota per singolo medico**")
+                    _ov_rows = []
+                    for _dname, _dc in _draft_doctors.items():
+                        for _col, _ov in (_dc.get("column_overrides") or {}).items():
+                            if not isinstance(_ov, dict):
+                                continue
+                            _ov_rows.append({
+                                "Medico": _dname, "Colonna": _col,
+                                "Quota mensile": _ov.get("monthly_quota"),
+                                "Tipo": _ov.get("quota_type", "fixed"),
+                                "Notti weekend": _ov.get("weekend_nights", True) if _col == "J" else None,
+                            })
+                    _ov_df = _pd_pool.DataFrame(_ov_rows) if _ov_rows else _pd_pool.DataFrame(
+                        columns=["Medico", "Colonna", "Quota mensile", "Tipo", "Notti weekend"]
+                    )
+                    _edited_ov = st.data_editor(
+                        _ov_df,
+                        column_config={
+                            "Medico": st.column_config.SelectboxColumn("Medico", options=_all_docs_list),
+                            "Colonna": st.column_config.SelectboxColumn("Colonna", options=_all_cols),
+                            "Quota mensile": st.column_config.NumberColumn("Quota", min_value=0, max_value=31),
+                            "Tipo": st.column_config.SelectboxColumn("Tipo", options=["fixed", "max", "min"]),
+                            "Notti weekend": st.column_config.CheckboxColumn("Notti weekend (J)", help="Solo per col. J"),
+                        },
+                        hide_index=True, use_container_width=True, key="pool_ov_editor", num_rows="dynamic",
+                    )
+                    _new_overrides: dict[str, dict] = {}
+                    for _, _row in _edited_ov.iterrows():
+                        _dname = _row.get("Medico")
+                        _col = _row.get("Colonna")
+                        if not _dname or not _col or _dname not in _draft_doctors:
+                            continue
+                        _ov_entry: dict = {}
+                        _mq = _row.get("Quota mensile")
+                        if _mq is not None and not _pd_pool.isna(_mq):
+                            _ov_entry["monthly_quota"] = int(_mq)
+                            _ov_entry["quota_type"] = str(_row.get("Tipo") or "fixed")
+                        if _col == "J":
+                            _wn = _row.get("Notti weekend")
+                            if _wn is not None and not _pd_pool.isna(_wn):
+                                _ov_entry["weekend_nights"] = bool(_wn)
+                        if _ov_entry:
+                            _new_overrides.setdefault(_dname, {})[_col] = _ov_entry
+                    for _dname in _draft_doctors:
+                        _draft_doctors[_dname]["column_overrides"] = _new_overrides.get(_dname, {})
+
+                with _tab_serv:
+                    st.markdown("**Combinazioni same-day**")
+                    _combos: list = _draft.setdefault("service_combinations", [])
+                    _combo_rows = [
+                        {"Col 1": c["columns"][0], "Col 2": c["columns"][1], "Modalità": c["mode"]}
+                        for c in _combos if len(c.get("columns", [])) == 2
+                    ]
+                    _combo_df = _pd_pool.DataFrame(_combo_rows) if _combo_rows else _pd_pool.DataFrame(columns=["Col 1", "Col 2", "Modalità"])
+                    _edited_combo = st.data_editor(
+                        _combo_df,
+                        column_config={
+                            "Col 1": st.column_config.SelectboxColumn("Col 1", options=_all_cols),
+                            "Col 2": st.column_config.SelectboxColumn("Col 2", options=_all_cols),
+                            "Modalità": st.column_config.SelectboxColumn("Modalità", options=["always", "fallback", "preferred"]),
+                        },
+                        hide_index=True, use_container_width=True, key="pool_combo_editor", num_rows="dynamic",
+                    )
+                    _new_combos = []
+                    for _, _row in _edited_combo.iterrows():
+                        _c1, _c2, _mode = _row.get("Col 1"), _row.get("Col 2"), _row.get("Modalità")
+                        if _c1 and _c2 and _mode:
+                            _new_combos.append({"columns": [str(_c1), str(_c2)], "same_day": True, "mode": str(_mode)})
+                    _draft["service_combinations"] = _new_combos
+
+                    st.divider()
+                    st.markdown("**Servizi critici** — fallback se pool primario esaurito")
+                    _critical: dict = _draft.setdefault("critical_services", {})
+                    _crit_rows = []
+                    for _col, _spec in _critical.items():
+                        _fb = _spec.get("fallback", "any")
+                        _crit_rows.append({"Colonna": _col, "Fallback": "any" if _fb == "any" else ", ".join(_fb)})
+                    _crit_df = _pd_pool.DataFrame(_crit_rows) if _crit_rows else _pd_pool.DataFrame(columns=["Colonna", "Fallback"])
+                    _edited_crit = st.data_editor(
+                        _crit_df,
+                        column_config={
+                            "Colonna": st.column_config.SelectboxColumn("Colonna", options=_all_cols),
+                            "Fallback": st.column_config.TextColumn("Fallback", help="'any' oppure nomi separati da virgola"),
+                        },
+                        hide_index=True, use_container_width=True, key="pool_crit_editor", num_rows="dynamic",
+                    )
+                    _new_crit: dict = {}
+                    for _, _row in _edited_crit.iterrows():
+                        _col = _row.get("Colonna")
+                        _fb_raw = str(_row.get("Fallback") or "any").strip()
+                        if not _col:
+                            continue
+                        if _fb_raw.lower() == "any":
+                            _new_crit[str(_col)] = {"fallback": "any"}
+                        else:
+                            _fb_list = [x.strip() for x in _fb_raw.split(",") if x.strip()]
+                            if _fb_list:
+                                _new_crit[str(_col)] = {"fallback": _fb_list}
+                    _draft["critical_services"] = _new_crit
+
+                st.divider()
+                _col_save, _col_reset = st.columns([3, 1])
+                with _col_reset:
+                    if st.button("↩️ Reset draft", key="btn_pool_reset"):
+                        del st.session_state["pool_cfg_draft"]
+                        st.rerun()
+                with _col_save:
+                    if st.button("💾 Salva configurazione pool", type="primary", key="btn_pool_save"):
+                        import copy as _copy_save
+                        from datetime import datetime as _dt_save, timezone as _tz_save
+                        _to_save = _copy_save.deepcopy(_draft)
+                        _to_save["updated_at"] = _dt_save.now(_tz_save.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                        _to_save["updated_by"] = "admin"
+                        _errs = _pcs_ui.validate_pool_config(_to_save)
+                        if _errs:
+                            st.error("Configurazione non valida:\n\n" + "\n".join(f"- {e}" for e in _errs))
+                        else:
+                            _ok_save, _msg_save = save_pool_config_with_retry(_to_save, _pool_cfg_sha)
+                            if _ok_save:
+                                st.success(_msg_save, icon="✅")
+                                del st.session_state["pool_cfg_draft"]
+                                st.rerun()
+                            else:
+                                st.error(_msg_save)
+
+        # ── Memoria storica turni ────────────────────────────────────────
+        with st.expander("📊 Memoria storica turni", expanded=False):
+            st.info(
+                "Carica i file Excel **definitivi** dei mesi precedenti per costruire "
+                "una memoria storica. Il solver userà questi dati per bilanciare le "
+                "quote tra i mesi.",
+                icon="🧠",
+            )
+            _hist_data, _hist_sha = _load_shift_history()
+
+            with st.expander("📤 Carica mese definitivo", expanded=False):
+                _hist_upload = st.file_uploader(
+                    "File Excel turni definitivo", type=["xlsx"], key="hist_upload",
+                    help="Il file Excel finale (dopo le modifiche del primario) di un mese passato.",
+                )
+                if _hist_upload is not None:
+                    if st.button("📥 Importa nel storico", key="btn_import_hist"):
+                        _tmp = Path(tempfile.gettempdir()) / f"hist_{int(time.time())}.xlsx"
+                        try:
+                            _tmp.write_bytes(_hist_upload.getvalue())
+                            _parsed = sh.parse_finalized_xlsx(str(_tmp))
+                            _ml = _parsed["month_label"]
+                            if not _ml:
+                                st.error("Impossibile determinare il mese dal file Excel.")
+                            else:
+                                _valid_docs = set(doctors) if doctors else None
+                                _ms = sh.compute_doctor_stats(_parsed, valid_doctors=_valid_docs)
+                                _last_night = []
+                                if _parsed["days"]:
+                                    _last_night = _parsed["days"][-1].get("assignments", {}).get("J", [])
+                                _ms["_meta"] = {"last_day_night_doctors": _last_night}
+                                _hist_data[_ml] = _ms
+                                if _save_shift_history(_hist_data, _hist_sha):
+                                    st.success(f"✅ Mese **{_ml}** importato ({len(_parsed['days'])} giorni)")
+                                    st.rerun()
+                        except Exception as _e:
+                            st.error(f"Errore parsing: {_e}")
+                        finally:
+                            if _tmp.exists():
+                                _tmp.unlink()
+
+            if _hist_data:
+                _sorted_months = sorted(_hist_data.keys())
+                st.caption(f"Mesi in memoria: {', '.join(_sorted_months)}")
+                _agg_hist = sh.aggregate_multi_month(_hist_data)
+
+                with st.expander("📋 Tabella riepilogativa", expanded=True):
+                    _tab_cum, _tab_mese = st.tabs(["Cumulativo", "Per mese"])
+                    with _tab_cum:
+                        _rows_hist = []
+                        for _doc in sorted(_agg_hist.keys()):
+                            _ds = _agg_hist[_doc]
+                            _j = _ds.get("J", {}); _c = _ds.get("C", {})
+                            _h = _ds.get("H", {}); _i = _ds.get("I", {})
+                            _rows_hist.append({
+                                "Medico": _doc, "Mesi": _ds.get("_months_counted", 0),
+                                "Notti (J)": _j.get("total", 0) if isinstance(_j, dict) else 0,
+                                "Notti Sab": _j.get("sabati", 0) if isinstance(_j, dict) else 0,
+                                "Notti Dom": _j.get("domeniche", 0) if isinstance(_j, dict) else 0,
+                                "Reperibilità (C)": _c.get("total", 0) if isinstance(_c, dict) else 0,
+                                "Festivi (D/E/H/I)": _ds.get("_festivi_DE_HI", 0),
+                                "Domeniche": _ds.get("_domeniche", 0), "Sabati": _ds.get("_sabati", 0),
+                                "H pom. (fer.)": _h.get("feriali", 0) if isinstance(_h, dict) else 0,
+                                "I pom. (fer.)": _i.get("feriali", 0) if isinstance(_i, dict) else 0,
+                            })
+                        _df_hist = pd.DataFrame(_rows_hist)
+                        st.dataframe(_df_hist, use_container_width=True, hide_index=True)
+                    with _tab_mese:
+                        _sel_mese = st.selectbox("Mese", _sorted_months, key="hist_tab_mese", index=len(_sorted_months)-1)
+                        _ms_sel = _hist_data[_sel_mese]
+                        _rows_mese = []
+                        for _doc in sorted(k for k in _ms_sel.keys() if k != "_meta"):
+                            _ds = _ms_sel[_doc]
+                            _j = _ds.get("J", {}); _c = _ds.get("C", {})
+                            _h = _ds.get("H", {}); _i = _ds.get("I", {})
+                            _rows_mese.append({
+                                "Medico": _doc,
+                                "Notti (J)": _j.get("total", 0) if isinstance(_j, dict) else 0,
+                                "Notti Sab": _j.get("sabati", 0) if isinstance(_j, dict) else 0,
+                                "Notti Dom": _j.get("domeniche", 0) if isinstance(_j, dict) else 0,
+                                "Reperibilità (C)": _c.get("total", 0) if isinstance(_c, dict) else 0,
+                                "Festivi (D/E/H/I)": _ds.get("_festivi_DE_HI", 0),
+                                "Domeniche": _ds.get("_domeniche", 0), "Sabati": _ds.get("_sabati", 0),
+                                "H pom. (fer.)": _h.get("feriali", 0) if isinstance(_h, dict) else 0,
+                                "I pom. (fer.)": _i.get("feriali", 0) if isinstance(_i, dict) else 0,
+                            })
+                        st.dataframe(pd.DataFrame(_rows_mese), use_container_width=True, hide_index=True)
+
+                with st.expander("📈 Grafici", expanded=False):
+                    if _rows_hist:
+                        _graf_scelta = st.selectbox("Grafico", [
+                            "Notti totali (cumulativo)", "Notti: feriali / sabato / domenica (cumulativo)",
+                            "Domeniche lavorate (cumulativo)", "Reperibilità (cumulativo)",
+                            "Evoluzione notti mese per mese",
+                        ], key="hist_graf_sel")
+                        if _graf_scelta == "Notti totali (cumulativo)":
+                            _fig = px.bar(_df_hist, x="Medico", y="Notti (J)", title="Notti totali per medico (cumulativo)", color="Notti (J)", color_continuous_scale="Reds")
+                            _fig.update_layout(xaxis_tickangle=-45, height=400); st.plotly_chart(_fig, use_container_width=True)
+                        elif _graf_scelta == "Notti: feriali / sabato / domenica (cumulativo)":
+                            _df_j2 = pd.DataFrame([{"Medico": r["Medico"], "Feriali": r["Notti (J)"]-r["Notti Sab"]-r["Notti Dom"], "Sabato": r["Notti Sab"], "Domenica": r["Notti Dom"]} for r in _rows_hist])
+                            _fig = px.bar(_df_j2, x="Medico", y=["Feriali","Sabato","Domenica"], title="Notti: distribuzione feriali/sabato/domenica", barmode="stack")
+                            _fig.update_layout(xaxis_tickangle=-45, height=400); st.plotly_chart(_fig, use_container_width=True)
+                        elif _graf_scelta == "Domeniche lavorate (cumulativo)":
+                            _fig = px.bar(_df_hist, x="Medico", y="Domeniche", title="Domeniche lavorate per medico (cumulativo)", color="Domeniche", color_continuous_scale="Blues")
+                            _fig.update_layout(xaxis_tickangle=-45, height=400); st.plotly_chart(_fig, use_container_width=True)
+                        elif _graf_scelta == "Reperibilità (cumulativo)":
+                            _fig = px.bar(_df_hist, x="Medico", y="Reperibilità (C)", title="Reperibilità per medico (cumulativo)", color="Reperibilità (C)", color_continuous_scale="Greens")
+                            _fig.update_layout(xaxis_tickangle=-45, height=400); st.plotly_chart(_fig, use_container_width=True)
+                        elif _graf_scelta == "Evoluzione notti mese per mese":
+                            if len(_sorted_months) > 1:
+                                _evo = []
+                                for _ml2 in _sorted_months:
+                                    for _doc2, _ds2 in _hist_data[_ml2].items():
+                                        if _doc2 == "_meta": continue
+                                        _j2 = _ds2.get("J", {})
+                                        _evo.append({"Mese": _ml2, "Medico": _doc2, "Notti": _j2.get("total", 0) if isinstance(_j2, dict) else 0})
+                                _fig = px.line(pd.DataFrame(_evo), x="Mese", y="Notti", color="Medico", title="Evoluzione notti per medico", markers=True)
+                                _fig.update_layout(height=400); st.plotly_chart(_fig, use_container_width=True)
+                            else:
+                                st.info("Servono almeno 2 mesi per il grafico di evoluzione.")
+
+                with st.expander("🗑️ Rimuovi mese dallo storico", expanded=False):
+                    _month_del = st.selectbox("Seleziona mese da rimuovere", _sorted_months, key="hist_del")
+                    if st.button("Rimuovi", key="btn_del_hist"):
+                        if _month_del in _hist_data:
+                            del _hist_data[_month_del]
+                            if _save_shift_history(_hist_data, _hist_sha):
+                                st.success(f"Mese {_month_del} rimosso."); st.rerun()
+            else:
+                st.caption("Nessun mese caricato nella memoria storica.")
+
+        # ── Contatore turni universitari ──────────────────────────────────
+        with st.expander("🎓 Contatore turni universitari", expanded=False):
             try:
-                save_app_settings_to_github(
-                    settings_to_save,
-                    app_settings_sha,
-                    message=f"Update settings: open={bool(new_open)} max_unav={int(new_max)} max_avail={int(new_max_avail)} max_weekend={int(new_max_weekend)}",
-                )
-                st.success("Impostazioni salvate ✅")
-                st.rerun()
+                gc_u = (cfg_admin.get("global_constraints") or {})
+                uni_docs = gc_u.get("university_doctors") or {}
+                uni_ratio = float(gc_u.get("university_ratio", 0.6))
+                if uni_docs:
+                    import calendar as _cal
+                    _cont_col1, _cont_col2 = st.columns(2)
+                    with _cont_col1:
+                        _cont_year = st.number_input("Anno", min_value=2025, max_value=2035, value=date.today().year, step=1, key="cont_year")
+                    with _cont_col2:
+                        _cont_month = st.number_input("Mese", min_value=1, max_value=12, value=date.today().month, step=1, key="cont_month")
+                    _, n_days = _cal.monthrange(int(_cont_year), int(_cont_month))
+                    _holidays = tg.italy_public_holidays(int(_cont_year))
+                    working = sum(1 for d in range(1, n_days+1)
+                        if (dt_date := date(int(_cont_year), int(_cont_month), d)).weekday() < 6
+                        and dt_date not in _holidays)
+                    _cont_mk = f"{int(_cont_year)}-{int(_cont_month):02d}"
+                    st.markdown(f"**{_cont_mk}** — giorni lavorativi lun-sab (esclusi festivi): **{working}**")
+                    st.markdown(f"Rapporto universitari: **{int(uni_ratio*100)}%** → target = round({working} × {uni_ratio}) = **{round(working * uni_ratio)}**")
+                    rows_u = []
+                    for doc_raw, dcfg in uni_docs.items():
+                        night_double = bool((dcfg or {}).get("night_counts_double", False))
+                        target = round(working * uni_ratio)
+                        rows_u.append({"Medico": doc_raw, "Notte vale doppio": "✓ (2 turni)" if night_double else "✗ (1 turno)", "Target turni pesati": target, "Max consentito": target+1, "Note": "Indisponibilità NON riducono il target"})
+                    st.dataframe(pd.DataFrame(rows_u), use_container_width=True, hide_index=True)
+                else:
+                    st.info("Nessun medico universitario configurato nel YAML.")
             except Exception as e:
-                st.error(f"Errore salvataggio impostazioni su GitHub: {e}")
+                st.warning(f"Errore contatore universitari: {e}")
 
-    st.divider()
+        # ── Migrazioni (condizionali) ─────────────────────────────────────
+        _mg = _github_cfg()
+        _unavail_dir_files = github_utils.list_dir(
+            owner=_mg["owner"], repo=_mg["repo"],
+            path=_unavail_per_doctor_dir(),
+            token=_mg["token"], branch=_mg.get("branch", "main"),
+        )
+        _unavail_already_migrated = len(_unavail_dir_files) > 0
 
+        if _unavail_already_migrated:
+            with st.expander("✅ Indisponibilità — file per-medico già presenti", expanded=False):
+                st.success(f"Trovati {len(_unavail_dir_files)} file in `{_unavail_per_doctor_dir()}/`. Migrazione già effettuata.", icon="✅")
+                st.caption("Se necessario puoi ripetere la migrazione qui sotto.")
+                _do_migrate = st.button("Ripeti migrazione indisponibilità", key="btn_migrate_unavail")
+        else:
+            st.markdown("#### Migrazione indisponibilità al nuovo formato")
+            st.warning("**Azione richiesta (una-tantum).** Il sistema ora salva un file CSV separato per ogni medico, eliminando i conflitti di salvataggio concorrente. Clicca il bottone qui sotto per copiare i dati storici dal vecchio CSV ai file per-medico.", icon="⚠️")
+            _mg_col1, _mg_col2 = st.columns([1, 3])
+            with _mg_col1:
+                _do_migrate = st.button("Esegui migrazione", key="btn_migrate_unavail", type="primary", use_container_width=True)
+            with _mg_col2:
+                st.caption(f"Legge `unavailability_store.csv` → scrive file per-medico in `{_unavail_per_doctor_dir()}/`. Il vecchio file resta intatto come backup.")
+        if _do_migrate:
+            if not _mg.get("path"):
+                st.error("Chiave `path` non trovata nei secrets — migrazione non possibile.")
+            else:
+                try:
+                    _leg_gf = github_utils.get_file(owner=_mg["owner"], repo=_mg["repo"], path=_mg["path"], token=_mg["token"], branch=_mg.get("branch", "main"))
+                    if _leg_gf is None or not (_leg_gf.text or "").strip():
+                        st.warning("CSV aggregato vuoto o non trovato — nessun dato da migrare.")
+                    else:
+                        from collections import defaultdict as _dd
+                        _all = ustore.load_store(_leg_gf.text)
+                        _by_doc: dict[str, list[dict]] = _dd(list)
+                        for _r in _all:
+                            _by_doc[_r["doctor"]].append(_r)
+                        _prog = st.progress(0)
+                        _docs_list = list(_by_doc.keys()); _ok = 0
+                        for _i, _doc in enumerate(_docs_list):
+                            _doc_path = _doctor_unavail_path(_doc)
+                            _ex_gf = github_utils.get_file(owner=_mg["owner"], repo=_mg["repo"], path=_doc_path, token=_mg["token"], branch=_mg.get("branch", "main"))
+                            github_utils.put_file(owner=_mg["owner"], repo=_mg["repo"], path=_doc_path, token=_mg["token"], branch=_mg.get("branch", "main"), sha=_ex_gf.sha if _ex_gf else None, message=f"migrate: unavailability for {_doc}", text=ustore.to_csv(_by_doc[_doc]))
+                            _ok += 1; _prog.progress((_i+1)/len(_docs_list))
+                        st.success(f"Migrazione completata: {_ok} medici migrati in `{_unavail_per_doctor_dir()}/`.")
+                except Exception as _me:
+                    st.error(f"Errore migrazione: {_me}")
+
+        _mga = _github_cfg()
+        _avail_dir_files = github_utils.list_dir(owner=_mga["owner"], repo=_mga["repo"], path=_avail_per_doctor_dir(), token=_mga["token"], branch=_mga.get("branch", "main"))
+        _avail_already_migrated = len(_avail_dir_files) > 0
+
+        if _avail_already_migrated:
+            with st.expander("✅ Disponibilità — file per-medico già presenti", expanded=False):
+                st.success(f"Trovati {len(_avail_dir_files)} file in `{_avail_per_doctor_dir()}/`. Migrazione già effettuata.", icon="✅")
+                st.caption("Se necessario puoi ripetere la migrazione qui sotto.")
+                _do_migrate_avail = st.button("Ripeti migrazione disponibilità", key="btn_migrate_avail")
+        else:
+            st.markdown("#### Migrazione preferenze disponibilità al nuovo formato")
+            st.warning(f"**Azione richiesta (una-tantum).** Divide `availability_store.csv` in file per-medico nella directory `{_avail_per_doctor_dir()}/`, eliminando i conflitti concorrenti.", icon="⚠️")
+            _mg2_col1, _mg2_col2 = st.columns([1, 3])
+            with _mg2_col1:
+                _do_migrate_avail = st.button("Esegui migrazione disponibilità", key="btn_migrate_avail", type="primary", use_container_width=True)
+            with _mg2_col2:
+                st.caption(f"Legge `availability_store.csv` → scrive file per-medico in `{_avail_per_doctor_dir()}/`. Il vecchio file resta intatto come backup.")
+        if _do_migrate_avail:
+            try:
+                _avail_legacy_path = _mga.get("availability_path", "data/availability_store.csv")
+                _leg_avail_gf = github_utils.get_file(owner=_mga["owner"], repo=_mga["repo"], path=_avail_legacy_path, token=_mga["token"], branch=_mga.get("branch", "main"))
+                if _leg_avail_gf is None or not (_leg_avail_gf.text or "").strip():
+                    st.warning("CSV aggregato disponibilità vuoto o non trovato — nessun dato da migrare.")
+                else:
+                    from collections import defaultdict as _dd2
+                    _all_avail = ustore.load_store(_leg_avail_gf.text)
+                    _by_doc_avail: dict[str, list[dict]] = _dd2(list)
+                    for _r in _all_avail:
+                        _by_doc_avail[_r["doctor"]].append(_r)
+                    _prog2 = st.progress(0); _docs2 = list(_by_doc_avail.keys()); _ok2 = 0
+                    for _i2, _doc2 in enumerate(_docs2):
+                        _dp = _doctor_avail_path(_doc2)
+                        _ex2 = github_utils.get_file(owner=_mga["owner"], repo=_mga["repo"], path=_dp, token=_mga["token"], branch=_mga.get("branch", "main"))
+                        github_utils.put_file(owner=_mga["owner"], repo=_mga["repo"], path=_dp, token=_mga["token"], branch=_mga.get("branch", "main"), sha=_ex2.sha if _ex2 else None, message=f"migrate: availability for {_doc2}", text=ustore.to_csv(_by_doc_avail[_doc2]))
+                        _ok2 += 1; _prog2.progress((_i2+1)/len(_docs2))
+                    st.success(f"Migrazione disponibilità completata: {_ok2} medici → `{_avail_per_doctor_dir()}/`.")
+            except Exception as _me2:
+                st.error(f"Errore migrazione disponibilità: {_me2}")
+
+        st.stop()  # Fine ramo Configurazione
+
+    # ── Ramo Genera turni ────────────────────────────────────────────────
     # Step 1: Periodo
     st.markdown("### 1) Periodo")
     today = date.today()
@@ -3065,106 +3613,6 @@ else:
         month = st.number_input("Mese", min_value=1, max_value=12, value=today.month, step=1)
     mk = f"{int(year)}-{int(month):02d}"
     st.caption(f"Stai generando: **{mk}**")
-
-    # ---- Admin: download / inspect monthly audit log (unavailability edits) ----
-    with st.expander("📜 Log inserimenti/modifiche indisponibilità (Audit)", expanded=False):
-        st.write(
-            "Questo log registra chi ha inserito/modificato indisponibilità, con timestamp e conteggi. "
-            "È utile per tracciare le modifiche mese per mese."
-        )
-
-        cL1, cL2, cL3 = st.columns([1, 1, 2])
-        with cL1:
-            audit_year = st.number_input(
-                "Anno log",
-                min_value=2025,
-                max_value=2035,
-                value=int(year),
-                step=1,
-                key="audit_year",
-            )
-        with cL2:
-            audit_month = st.number_input(
-                "Mese log",
-                min_value=1,
-                max_value=12,
-                value=int(month),
-                step=1,
-                key="audit_month",
-            )
-        with cL3:
-            mk_log = f"{int(audit_year)}-{int(audit_month):02d}"
-            st.caption(f"Log selezionato: **{mk_log}**")
-
-        try:
-            audit_text = load_audit_log_text_from_github(mk_log)
-        except Exception as e:
-            audit_text = None
-            st.error(f"Errore lettura audit log da GitHub: {e}")
-
-        if not audit_text or not str(audit_text).strip():
-            st.info(
-                "Nessun audit log trovato per questo mese (nessuna modifica registrata oppure file non ancora creato)."
-            )
-        else:
-            # Download buttons (full file)
-            st.download_button(
-                "⬇️ Scarica audit log (CSV)",
-                data=str(audit_text).encode("utf-8"),
-                file_name=f"unavailability_audit_{mk_log}.csv",
-                mime="text/csv",
-                key=f"dl_audit_csv_{mk_log}",
-            )
-
-            # Parse for preview + optional Excel export
-            try:
-                df_audit = pd.read_csv(io.StringIO(audit_text))
-            except Exception as e:
-                df_audit = None
-                st.error("Il file audit log esiste ma non riesco a leggerlo come CSV.")
-                st.code(str(e))
-
-            if df_audit is not None and not df_audit.empty:
-                try:
-                    # Sort newest first if possible
-                    if "ts_utc" in df_audit.columns:
-                        df_audit = df_audit.sort_values("ts_utc", ascending=False)
-                except Exception:
-                    pass
-
-                # Optional doctor filter for on-screen preview
-                doctor_filter = "Tutti"
-                if "doctor" in df_audit.columns:
-                    doctors_in_log = sorted(
-                        [str(x) for x in df_audit["doctor"].dropna().unique().tolist() if str(x).strip()]
-                    )
-                    doctor_filter = st.selectbox(
-                        "Filtro medico (solo anteprima)",
-                        ["Tutti"] + doctors_in_log,
-                        index=0,
-                        key=f"audit_filter_{mk_log}",
-                    )
-
-                df_preview = df_audit
-                if doctor_filter != "Tutti" and "doctor" in df_audit.columns:
-                    df_preview = df_audit[df_audit["doctor"] == doctor_filter]
-
-                # Excel export
-                try:
-                    xlsx_bytes = audit_df_to_excel_bytes(df_audit, sheet_name=f"audit_{mk_log}")
-                    st.download_button(
-                        "⬇️ Scarica audit log (Excel)",
-                        data=xlsx_bytes,
-                        file_name=f"unavailability_audit_{mk_log}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        key=f"dl_audit_xlsx_{mk_log}",
-                    )
-                except Exception as e:
-                    st.warning(f"Esportazione Excel non disponibile: {e}")
-
-                st.markdown("**Anteprima**")
-                st.dataframe(df_preview.head(200), use_container_width=True, hide_index=True)
-                st.caption("Mostro al massimo 200 righe. Per analisi completa usa il download.")
 
     # Step 2: Indisponibilità
     st.markdown("### 2) Indisponibilità")
@@ -3182,35 +3630,66 @@ else:
         unav_upload = st.file_uploader("Carica indisponibilità (xlsx/csv/tsv)", type=["xlsx", "csv", "tsv"])
     use_archive = (unav_mode == "Usa archivio (privacy)")
 
+    with st.expander("📜 Log inserimenti/modifiche indisponibilità (Audit)", expanded=False):
+        st.write(
+            "Questo log registra chi ha inserito/modificato indisponibilità, con timestamp e conteggi. "
+            "È utile per tracciare le modifiche mese per mese."
+        )
+
+        cL1, cL2, cL3 = st.columns([1, 1, 2])
+        with cL1:
+            audit_year = st.number_input(
+                "Anno log", min_value=2025, max_value=2035, value=int(year), step=1, key="audit_year",
+            )
+        with cL2:
+            audit_month = st.number_input(
+                "Mese log", min_value=1, max_value=12, value=int(month), step=1, key="audit_month",
+            )
+        with cL3:
+            mk_log = f"{int(audit_year)}-{int(audit_month):02d}"
+            st.caption(f"Log selezionato: **{mk_log}**")
+
+        try:
+            audit_text = load_audit_log_text_from_github(mk_log)
+        except Exception as e:
+            audit_text = None
+            st.error(f"Errore lettura audit log da GitHub: {e}")
+
+        if not audit_text or not str(audit_text).strip():
+            st.info("Nessun audit log trovato per questo mese.")
+        else:
+            st.download_button(
+                "⬇️ Scarica audit log (CSV)", data=str(audit_text).encode("utf-8"),
+                file_name=f"unavailability_audit_{mk_log}.csv", mime="text/csv",
+                key=f"dl_audit_csv_{mk_log}",
+            )
+            try:
+                df_audit = pd.read_csv(io.StringIO(audit_text))
+            except Exception:
+                df_audit = None
+            if df_audit is not None and not df_audit.empty:
+                try:
+                    if "ts_utc" in df_audit.columns:
+                        df_audit = df_audit.sort_values("ts_utc", ascending=False)
+                except Exception:
+                    pass
+                doctor_filter = "Tutti"
+                if "doctor" in df_audit.columns:
+                    doctors_in_log = sorted([str(x) for x in df_audit["doctor"].dropna().unique().tolist() if str(x).strip()])
+                    doctor_filter = st.selectbox("Filtro medico", ["Tutti"] + doctors_in_log, index=0, key=f"audit_filter_{mk_log}")
+                df_preview = df_audit if doctor_filter == "Tutti" else df_audit[df_audit["doctor"] == doctor_filter]
+                try:
+                    xlsx_bytes = audit_df_to_excel_bytes(df_audit, sheet_name=f"audit_{mk_log}")
+                    st.download_button("⬇️ Scarica audit log (Excel)", data=xlsx_bytes, file_name=f"unavailability_audit_{mk_log}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=f"dl_audit_xlsx_{mk_log}")
+                except Exception:
+                    pass
+                st.markdown("**Anteprima**")
+                st.dataframe(df_preview.head(200), use_container_width=True, hide_index=True)
+                st.caption("Mostro al massimo 200 righe. Per analisi completa usa il download.")
+
     # Step 3: Vincolo post-notte (carryover)
     st.markdown("### 3) Vincolo post-notte a cavallo mese")
-    st.info("Inserire medico che ha fatto turno di NOTTE l'ultimo giorno del mese precedente.", icon="💡")
-
-
-    # Admin advanced (rules/template/carryover file)
-    with st.expander("⚙️ Avanzate (Regole, Template, Carryover file)", expanded=False):
-        st.markdown("**Regole (solo Admin)**")
-        rules_upload = st.file_uploader("Carica Regole YAML (opzionale)", type=["yml", "yaml"])
-        cfg_admin, rules_path = load_rules_from_source(rules_upload)
-        doctors = doctors_from_cfg(cfg_admin)
-
-        st.markdown("**Template Excel**")
-        template_upload = st.file_uploader("Carica template turni (opzionale)", type=["xlsx"])
-        style_upload = st.file_uploader("Carica Style_Template.xlsx (opzionale)", type=["xlsx"])
-        sheet_name = st.text_input("Nome foglio (opzionale)", value="")
-
-        st.markdown("**Carryover – file mese precedente (opzionale)**")
-        prev_out = st.file_uploader("Carica output mese precedente", type=["xlsx"], key="prev")
-
-    # If advanced not expanded, still need cfg_admin/doctors variables
-    if "cfg_admin" not in locals():
-        cfg_admin, rules_path = tg.load_rules(DEFAULT_RULES_PATH), DEFAULT_RULES_PATH
-        doctors = doctors_from_cfg(cfg_admin)
-        template_upload = None
-        style_upload = None
-        sheet_name = ""
-
-        prev_out = None
+    st.info("Inserire medico che ha fatto turno di NOTTE l’ultimo giorno del mese precedente.", icon="💡")
 
     # Auto-carryover da storico: chi ha fatto notte l’ultimo giorno del mese precedente
     _carry_default = []
@@ -3240,723 +3719,13 @@ else:
     )
 
     carryover_by_month = {}
-    carry_info = None
 
-    # From file
-    if prev_out is not None:
-        tmp_prev = Path(tempfile.gettempdir()) / f"prev_{int(time.time())}.xlsx"
-        tmp_prev.write_bytes(prev_out.getvalue())
-        try:
-            carry_info = tg.extract_carryover_from_output_xlsx(
-                tmp_prev,
-                sheet_name=sheet_name or None,
-                night_col_letter="J",
-                min_gap=int((cfg_admin.get("global_constraints") or {}).get("night_spacing_days_min", 5)),
-            )
-            carryover_by_month[mk] = carry_info
-            st.success(
-                f"Carryover letto: ultima data {carry_info.get('source_last_date')} | "
-                f"NOTTE ultimo giorno: {carry_info.get('night_last_day_doctor')}"
-            )
-        except Exception as e:
-            st.error(f"Errore lettura carryover: {e}")
-
-    # Manual fallback: solo se prev_out non ha già fornito il carryover dal file
-    if manual_block and carry_info is None:
+    if manual_block:
         carryover_by_month.setdefault(mk, {})
         carryover_by_month[mk].setdefault("blocked_day1_doctors", [])
         for d in manual_block:
             if d not in carryover_by_month[mk]["blocked_day1_doctors"]:
                 carryover_by_month[mk]["blocked_day1_doctors"].append(d)
-
-    st.divider()
-
-    # ── Memoria Storica Turni ─────────────────────────────────────────────
-    st.markdown("### 📊 Memoria Storica Turni")
-    st.info(
-        "Carica i file Excel **definitivi** dei mesi precedenti per costruire "
-        "una memoria storica. Il solver userà questi dati per bilanciare le "
-        "quote tra i mesi.",
-        icon="🧠",
-    )
-
-    _hist_data, _hist_sha = _load_shift_history()
-
-    # Upload nuovo mese
-    with st.expander("📤 Carica mese definitivo", expanded=False):
-        _hist_upload = st.file_uploader(
-            "File Excel turni definitivo",
-            type=["xlsx"],
-            key="hist_upload",
-            help="Il file Excel finale (dopo le modifiche del primario) di un mese passato.",
-        )
-        if _hist_upload is not None:
-            if st.button("📥 Importa nel storico", key="btn_import_hist"):
-                _tmp = Path(tempfile.gettempdir()) / f"hist_{int(time.time())}.xlsx"
-                try:
-                    _tmp.write_bytes(_hist_upload.getvalue())
-                    _parsed = sh.parse_finalized_xlsx(str(_tmp))
-                    _ml = _parsed["month_label"]
-                    if not _ml:
-                        st.error(
-                            "Impossibile determinare il mese dal file Excel: la colonna A non contiene date valide. "
-                            "Verifica che il foglio selezionato sia quello corretto."
-                        )
-                    else:
-                        _valid_docs = set(doctors) if doctors else None
-                        _ms = sh.compute_doctor_stats(_parsed, valid_doctors=_valid_docs)
-                        # Salva metadata: chi ha fatto notte l'ultimo giorno
-                        _last_night = []
-                        if _parsed["days"]:
-                            _last_night = _parsed["days"][-1].get("assignments", {}).get("J", [])
-                        _ms["_meta"] = {"last_day_night_doctors": _last_night}
-                        _hist_data[_ml] = _ms
-                        if _save_shift_history(_hist_data, _hist_sha):
-                            st.success(f"✅ Mese **{_ml}** importato ({len(_parsed['days'])} giorni)")
-                            st.rerun()
-                except Exception as _e:
-                    st.error(f"Errore parsing: {_e}")
-                finally:
-                    if _tmp.exists():
-                        _tmp.unlink()
-
-    # Visualizzazione mesi caricati
-    if _hist_data:
-        _sorted_months = sorted(_hist_data.keys())
-        st.caption(f"Mesi in memoria: {', '.join(_sorted_months)}")
-        _agg_hist = sh.aggregate_multi_month(_hist_data)
-
-        # Tabella riepilogativa — cumulativa + per mese
-        with st.expander("📋 Tabella riepilogativa", expanded=True):
-            _tab_cum, _tab_mese = st.tabs(["Cumulativo", "Per mese"])
-
-            # --- Tab cumulativo ---
-            with _tab_cum:
-                _rows_hist = []
-                for _doc in sorted(_agg_hist.keys()):
-                    _ds = _agg_hist[_doc]
-                    _j = _ds.get("J", {})
-                    _c = _ds.get("C", {})
-                    _h = _ds.get("H", {})
-                    _i = _ds.get("I", {})
-                    _rows_hist.append({
-                        "Medico": _doc,
-                        "Mesi": _ds.get("_months_counted", 0),
-                        "Notti (J)": _j.get("total", 0) if isinstance(_j, dict) else 0,
-                        "Notti Sab": _j.get("sabati", 0) if isinstance(_j, dict) else 0,
-                        "Notti Dom": _j.get("domeniche", 0) if isinstance(_j, dict) else 0,
-                        "Reperibilità (C)": _c.get("total", 0) if isinstance(_c, dict) else 0,
-                        "Festivi (D/E/H/I)": _ds.get("_festivi_DE_HI", 0),
-                        "Domeniche": _ds.get("_domeniche", 0),
-                        "Sabati": _ds.get("_sabati", 0),
-                        "H pom. (fer.)": _h.get("feriali", 0) if isinstance(_h, dict) else 0,
-                        "I pom. (fer.)": _i.get("feriali", 0) if isinstance(_i, dict) else 0,
-                    })
-                _df_hist = pd.DataFrame(_rows_hist)
-                st.dataframe(_df_hist, use_container_width=True, hide_index=True)
-
-            # --- Tab per mese ---
-            with _tab_mese:
-                _sel_mese = st.selectbox(
-                    "Mese", _sorted_months, key="hist_tab_mese",
-                    index=len(_sorted_months) - 1,
-                )
-                _ms_sel = _hist_data[_sel_mese]
-                _rows_mese = []
-                for _doc in sorted(k for k in _ms_sel.keys() if k != "_meta"):
-                    _ds = _ms_sel[_doc]
-                    _j = _ds.get("J", {})
-                    _c = _ds.get("C", {})
-                    _h = _ds.get("H", {})
-                    _i = _ds.get("I", {})
-                    _rows_mese.append({
-                        "Medico": _doc,
-                        "Notti (J)": _j.get("total", 0) if isinstance(_j, dict) else 0,
-                        "Notti Sab": _j.get("sabati", 0) if isinstance(_j, dict) else 0,
-                        "Notti Dom": _j.get("domeniche", 0) if isinstance(_j, dict) else 0,
-                        "Reperibilità (C)": _c.get("total", 0) if isinstance(_c, dict) else 0,
-                        "Festivi (D/E/H/I)": _ds.get("_festivi_DE_HI", 0),
-                        "Domeniche": _ds.get("_domeniche", 0),
-                        "Sabati": _ds.get("_sabati", 0),
-                        "H pom. (fer.)": _h.get("feriali", 0) if isinstance(_h, dict) else 0,
-                        "I pom. (fer.)": _i.get("feriali", 0) if isinstance(_i, dict) else 0,
-                    })
-                st.dataframe(pd.DataFrame(_rows_mese), use_container_width=True, hide_index=True)
-
-        # Grafici — menu a tendina per scegliere
-        with st.expander("📈 Grafici", expanded=False):
-            if _rows_hist:
-                _graf_scelta = st.selectbox(
-                    "Grafico",
-                    [
-                        "Notti totali (cumulativo)",
-                        "Notti: feriali / sabato / domenica (cumulativo)",
-                        "Domeniche lavorate (cumulativo)",
-                        "Reperibilità (cumulativo)",
-                        "Evoluzione notti mese per mese",
-                    ],
-                    key="hist_graf_sel",
-                )
-
-                if _graf_scelta == "Notti totali (cumulativo)":
-                    _fig = px.bar(
-                        _df_hist, x="Medico", y="Notti (J)",
-                        title="Notti totali per medico (cumulativo)",
-                        color="Notti (J)", color_continuous_scale="Reds",
-                    )
-                    _fig.update_layout(xaxis_tickangle=-45, height=400)
-                    st.plotly_chart(_fig, use_container_width=True)
-
-                elif _graf_scelta == "Notti: feriali / sabato / domenica (cumulativo)":
-                    _df_j2 = pd.DataFrame([{
-                        "Medico": r["Medico"],
-                        "Feriali": r["Notti (J)"] - r["Notti Sab"] - r["Notti Dom"],
-                        "Sabato": r["Notti Sab"],
-                        "Domenica": r["Notti Dom"],
-                    } for r in _rows_hist])
-                    _fig = px.bar(
-                        _df_j2, x="Medico", y=["Feriali", "Sabato", "Domenica"],
-                        title="Notti: distribuzione feriali/sabato/domenica (cumulativo)",
-                        barmode="stack",
-                    )
-                    _fig.update_layout(xaxis_tickangle=-45, height=400)
-                    st.plotly_chart(_fig, use_container_width=True)
-
-                elif _graf_scelta == "Domeniche lavorate (cumulativo)":
-                    _fig = px.bar(
-                        _df_hist, x="Medico", y="Domeniche",
-                        title="Domeniche lavorate per medico (cumulativo)",
-                        color="Domeniche", color_continuous_scale="Blues",
-                    )
-                    _fig.update_layout(xaxis_tickangle=-45, height=400)
-                    st.plotly_chart(_fig, use_container_width=True)
-
-                elif _graf_scelta == "Reperibilità (cumulativo)":
-                    _fig = px.bar(
-                        _df_hist, x="Medico", y="Reperibilità (C)",
-                        title="Reperibilità per medico (cumulativo)",
-                        color="Reperibilità (C)", color_continuous_scale="Greens",
-                    )
-                    _fig.update_layout(xaxis_tickangle=-45, height=400)
-                    st.plotly_chart(_fig, use_container_width=True)
-
-                elif _graf_scelta == "Evoluzione notti mese per mese":
-                    if len(_sorted_months) > 1:
-                        _evo = []
-                        for _ml2 in _sorted_months:
-                            for _doc2, _ds2 in _hist_data[_ml2].items():
-                                if _doc2 == "_meta":
-                                    continue
-                                _j2 = _ds2.get("J", {})
-                                _evo.append({
-                                    "Mese": _ml2,
-                                    "Medico": _doc2,
-                                    "Notti": _j2.get("total", 0) if isinstance(_j2, dict) else 0,
-                                })
-                        _fig = px.line(
-                            pd.DataFrame(_evo), x="Mese", y="Notti", color="Medico",
-                            title="Evoluzione notti per medico", markers=True,
-                        )
-                        _fig.update_layout(height=400)
-                        st.plotly_chart(_fig, use_container_width=True)
-                    else:
-                        st.info("Servono almeno 2 mesi per il grafico di evoluzione.")
-
-        # Rimuovi mese
-        with st.expander("🗑️ Rimuovi mese dallo storico", expanded=False):
-            _month_del = st.selectbox("Seleziona mese da rimuovere", _sorted_months, key="hist_del")
-            if st.button("Rimuovi", key="btn_del_hist"):
-                if _month_del in _hist_data:
-                    del _hist_data[_month_del]
-                    if _save_shift_history(_hist_data, _hist_sha):
-                        st.success(f"Mese {_month_del} rimosso.")
-                        st.rerun()
-    else:
-        st.caption("Nessun mese caricato nella memoria storica.")
-
-    # ── Migrazione CSV aggregato → file per-medico ────────────────────────
-    _mg = _github_cfg()
-    _unavail_dir_files = github_utils.list_dir(
-        owner=_mg["owner"], repo=_mg["repo"],
-        path=_unavail_per_doctor_dir(),
-        token=_mg["token"], branch=_mg.get("branch", "main"),
-    )
-    _unavail_already_migrated = len(_unavail_dir_files) > 0
-
-    if _unavail_already_migrated:
-        with st.expander("✅ Indisponibilità — file per-medico già presenti", expanded=False):
-            st.success(
-                f"Trovati {len(_unavail_dir_files)} file in `{_unavail_per_doctor_dir()}/`. "
-                "Migrazione già effettuata.",
-                icon="✅",
-            )
-            st.caption("Se necessario puoi ripetere la migrazione qui sotto.")
-            _do_migrate = st.button("Ripeti migrazione indisponibilità", key="btn_migrate_unavail")
-    else:
-        st.markdown("#### Migrazione indisponibilità al nuovo formato")
-        st.warning(
-            "**Azione richiesta (una-tantum).** Il sistema ora salva un file CSV separato "
-            "per ogni medico, eliminando i conflitti di salvataggio concorrente. "
-            "Clicca il bottone qui sotto per copiare i dati storici dal vecchio CSV ai file per-medico.",
-            icon="⚠️",
-        )
-        _mg_col1, _mg_col2 = st.columns([1, 3])
-        with _mg_col1:
-            _do_migrate = st.button("Esegui migrazione", key="btn_migrate_unavail", type="primary", use_container_width=True)
-        with _mg_col2:
-            st.caption(
-                f"Legge `unavailability_store.csv` → scrive file per-medico in `{_unavail_per_doctor_dir()}/`. "
-                "Il vecchio file resta intatto come backup."
-            )
-    if _do_migrate:
-        _mg = _github_cfg()
-        if not _mg.get("path"):
-            st.error("Chiave `path` non trovata nei secrets — migrazione non possibile.")
-        else:
-            try:
-                _leg_gf = github_utils.get_file(
-                    owner=_mg["owner"], repo=_mg["repo"], path=_mg["path"],
-                    token=_mg["token"], branch=_mg.get("branch", "main"),
-                )
-                if _leg_gf is None or not (_leg_gf.text or "").strip():
-                    st.warning("CSV aggregato vuoto o non trovato — nessun dato da migrare.")
-                else:
-                    from collections import defaultdict as _dd
-                    _all = ustore.load_store(_leg_gf.text)
-                    _by_doc: dict[str, list[dict]] = _dd(list)
-                    for _r in _all:
-                        _by_doc[_r["doctor"]].append(_r)
-                    _prog = st.progress(0)
-                    _docs_list = list(_by_doc.keys())
-                    _ok = 0
-                    for _i, _doc in enumerate(_docs_list):
-                        _doc_path = _doctor_unavail_path(_doc)
-                        _ex_gf = github_utils.get_file(
-                            owner=_mg["owner"], repo=_mg["repo"], path=_doc_path,
-                            token=_mg["token"], branch=_mg.get("branch", "main"),
-                        )
-                        github_utils.put_file(
-                            owner=_mg["owner"], repo=_mg["repo"], path=_doc_path,
-                            token=_mg["token"], branch=_mg.get("branch", "main"),
-                            sha=_ex_gf.sha if _ex_gf else None,
-                            message=f"migrate: unavailability for {_doc}",
-                            text=ustore.to_csv(_by_doc[_doc]),
-                        )
-                        _ok += 1
-                        _prog.progress((_i + 1) / len(_docs_list))
-                    st.success(
-                        f"Migrazione completata: {_ok} medici migrati in `{_unavail_per_doctor_dir()}/`. "
-                        "Da ora ogni salvataggio usa il file per-medico."
-                    )
-            except Exception as _me:
-                st.error(f"Errore migrazione: {_me}")
-
-    # ── Migrazione preferenze disponibilità → file per-medico ─────────────
-    _mga = _github_cfg()
-    _avail_dir_files = github_utils.list_dir(
-        owner=_mga["owner"], repo=_mga["repo"],
-        path=_avail_per_doctor_dir(),
-        token=_mga["token"], branch=_mga.get("branch", "main"),
-    )
-    _avail_already_migrated = len(_avail_dir_files) > 0
-
-    if _avail_already_migrated:
-        with st.expander("✅ Disponibilità — file per-medico già presenti", expanded=False):
-            st.success(
-                f"Trovati {len(_avail_dir_files)} file in `{_avail_per_doctor_dir()}/`. "
-                "Migrazione già effettuata.",
-                icon="✅",
-            )
-            st.caption("Se necessario puoi ripetere la migrazione qui sotto.")
-            _do_migrate_avail = st.button("Ripeti migrazione disponibilità", key="btn_migrate_avail")
-    else:
-        st.markdown("#### Migrazione preferenze disponibilità al nuovo formato")
-        st.warning(
-            "**Azione richiesta (una-tantum).** Divide `availability_store.csv` in file per-medico "
-            f"nella directory `{_avail_per_doctor_dir()}/`, eliminando i conflitti concorrenti.",
-            icon="⚠️",
-        )
-        _mg2_col1, _mg2_col2 = st.columns([1, 3])
-        with _mg2_col1:
-            _do_migrate_avail = st.button("Esegui migrazione disponibilità", key="btn_migrate_avail", type="primary", use_container_width=True)
-        with _mg2_col2:
-            st.caption(
-                f"Legge `availability_store.csv` → scrive file per-medico in `{_avail_per_doctor_dir()}/`. "
-                "Il vecchio file resta intatto come backup."
-            )
-    if _do_migrate_avail:
-        _mga = _github_cfg()
-        try:
-            _avail_legacy_path = _mga.get("availability_path", "data/availability_store.csv")
-            _leg_avail_gf = github_utils.get_file(
-                owner=_mga["owner"], repo=_mga["repo"], path=_avail_legacy_path,
-                token=_mga["token"], branch=_mga.get("branch", "main"),
-            )
-            if _leg_avail_gf is None or not (_leg_avail_gf.text or "").strip():
-                st.warning("CSV aggregato disponibilità vuoto o non trovato — nessun dato da migrare.")
-            else:
-                from collections import defaultdict as _dd2
-                _all_avail = ustore.load_store(_leg_avail_gf.text)
-                _by_doc_avail: dict[str, list[dict]] = _dd2(list)
-                for _r in _all_avail:
-                    _by_doc_avail[_r["doctor"]].append(_r)
-                _prog2 = st.progress(0)
-                _docs2 = list(_by_doc_avail.keys())
-                _ok2 = 0
-                for _i2, _doc2 in enumerate(_docs2):
-                    _dp = _doctor_avail_path(_doc2)
-                    _ex2 = github_utils.get_file(
-                        owner=_mga["owner"], repo=_mga["repo"], path=_dp,
-                        token=_mga["token"], branch=_mga.get("branch", "main"),
-                    )
-                    github_utils.put_file(
-                        owner=_mga["owner"], repo=_mga["repo"], path=_dp,
-                        token=_mga["token"], branch=_mga.get("branch", "main"),
-                        sha=_ex2.sha if _ex2 else None,
-                        message=f"migrate: availability for {_doc2}",
-                        text=ustore.to_csv(_by_doc_avail[_doc2]),
-                    )
-                    _ok2 += 1
-                    _prog2.progress((_i2 + 1) / len(_docs2))
-                st.success(
-                    f"Migrazione disponibilità completata: {_ok2} medici → `{_avail_per_doctor_dir()}/`."
-                )
-        except Exception as _me2:
-            st.error(f"Errore migrazione disponibilità: {_me2}")
-
-    st.divider()
-
-    # ── Gestione Pool Medici ──────────────────────────────────────────────────
-    st.markdown("### 🩺 Gestione Pool Medici (avanzato)")
-    st.info(
-        "Configura pool, quote e combinazioni di servizi senza modificare il file YAML. "
-        "Le modifiche vengono salvate su GitHub e applicate alla prossima generazione.",
-        icon="⚙️",
-    )
-
-    _pool_cfg_loaded, _pool_cfg_sha = load_pool_config_from_github_st()
-    _pool_cfg_exists = bool(_pool_cfg_loaded)
-
-    if not _pool_cfg_exists:
-        st.warning("Nessuna configurazione pool trovata su GitHub. Inizializza dal YAML attuale per cominciare.", icon="⚠️")
-        if st.button("🔧 Inizializza da YAML attuale", key="btn_init_pool_cfg"):
-            import pool_config_store as _pcs_init
-            _migrated = _pcs_init.migrate_from_yaml(cfg_admin)
-            _ok, _msg = save_pool_config_with_retry(_migrated, None)
-            if _ok:
-                st.success("Configurazione pool inizializzata dal YAML. Ricarica la pagina per modificarla.", icon="✅")
-                st.rerun()
-            else:
-                st.error(_msg)
-    else:
-        # Draft modificabile in session_state (isolato da altri mesi/sessioni)
-        _pool_draft_key = "pool_cfg_draft"
-        if _pool_draft_key not in st.session_state:
-            import copy as _copy_pool
-            st.session_state[_pool_draft_key] = _copy_pool.deepcopy(_pool_cfg_loaded)
-
-        _draft = st.session_state[_pool_draft_key]
-        _draft_doctors: dict = _draft.get("doctors", {})
-        _all_cols = sorted(cfg_admin.get("columns", {}).keys())
-        _all_docs_list = sorted(_draft_doctors.keys(), key=lambda s: (s == "Recupero", s.lower()))
-
-        import pool_config_store as _pcs_ui
-        _tab_med, _tab_col, _tab_lim, _tab_serv = st.tabs(
-            ["👨‍⚕️ Medici", "📋 Colonne", "⚖️ Limiti", "🔗 Servizi"]
-        )
-
-        # ── Tab 1: Medici ─────────────────────────────────────────────────────
-        with _tab_med:
-            st.markdown("**Stato e flag per ogni medico** — aggiungi righe con ＋, elimina con ✕")
-            import pandas as _pd_pool
-            _med_rows = []
-            for _dname in _all_docs_list:
-                _dc = _draft_doctors[_dname]
-                _med_rows.append({
-                    "Medico": _dname,
-                    "Attivo": bool(_dc.get("active", True)),
-                    "Reperibilità": not bool(_dc.get("excluded_from_reperibilita", False)),
-                    "Festivi diurni": bool(_dc.get("festivi_diurni", True)),
-                    "Festivi notti": bool(_dc.get("festivi_notti", True)),
-                    "Universitario": bool(_dc.get("university_doctor")),
-                    "Ratio uni": float((_dc.get("university_doctor") or {}).get("ratio", 0.6) or 0.6)
-                    if _dc.get("university_doctor") else 0.0,
-                })
-            _med_df = _pd_pool.DataFrame(_med_rows)
-            _edited_med = st.data_editor(
-                _med_df,
-                column_config={
-                    "Medico": st.column_config.TextColumn("Medico", help="Cognome esatto (maiuscola iniziale)"),
-                    "Attivo": st.column_config.CheckboxColumn("Attivo"),
-                    "Reperibilità": st.column_config.CheckboxColumn("Reperibilità C"),
-                    "Festivi diurni": st.column_config.CheckboxColumn("Festivi diurni"),
-                    "Festivi notti": st.column_config.CheckboxColumn("Festivi notti"),
-                    "Universitario": st.column_config.CheckboxColumn("Universitario"),
-                    "Ratio uni": st.column_config.NumberColumn("Ratio", min_value=0.0, max_value=1.0, step=0.05, format="%.2f"),
-                },
-                hide_index=True,
-                use_container_width=True,
-                key="pool_med_editor",
-                num_rows="dynamic",
-            )
-            # Sincronizza il draft: aggiunte, modifiche e rimozioni
-            _edited_names: set[str] = set()
-            for _, _row in _edited_med.iterrows():
-                _dn = (_row.get("Medico") or "").strip()
-                if not _dn:
-                    continue
-                _edited_names.add(_dn)
-                if _dn not in _draft_doctors:
-                    # Nuovo medico: crea entry con valori di default
-                    _draft_doctors[_dn] = {
-                        "active": True, "columns": [],
-                        "festivi_diurni": True, "festivi_notti": True,
-                        "excluded_from_reperibilita": False,
-                        "university_doctor": None, "column_overrides": {},
-                    }
-                _draft_doctors[_dn]["active"] = bool(_row["Attivo"])
-                _draft_doctors[_dn]["excluded_from_reperibilita"] = not bool(_row["Reperibilità"])
-                _draft_doctors[_dn]["festivi_diurni"] = bool(_row["Festivi diurni"])
-                _draft_doctors[_dn]["festivi_notti"] = bool(_row["Festivi notti"])
-                _is_uni = bool(_row["Universitario"])
-                if _is_uni:
-                    _draft_doctors[_dn]["university_doctor"] = {"ratio": float(_row["Ratio uni"] or 0.6)}
-                else:
-                    _draft_doctors[_dn]["university_doctor"] = None
-            # Rimuovi medici eliminati dalla tabella
-            for _dn_old in list(_draft_doctors.keys()):
-                if _dn_old not in _edited_names:
-                    del _draft_doctors[_dn_old]
-
-            st.divider()
-            with st.expander("📌 Vincoli strutturali fissi (sola lettura — modificabili solo da YAML)", expanded=False):
-                st.info(
-                    "Questi vincoli sono hardcoded nel YAML e non modificabili da questa GUI:\n\n"
-                    "- **Cimino** esatto 2 turni U al mese\n"
-                    "- **Crea** unico medico per i sabati AB (2/mese)\n"
-                    "- **Allegra** vincolo lunedì V+U (stessa giornata)\n"
-                    "- **De Gregorio** max 3 giorni feriali su I\n"
-                    "- **Grimaldi e Calabrò** esenti dal vincolo 'min 2 weekend liberi/mese'\n"
-                    "- **Pugliatti** fisso martedì su W",
-                    icon="🔒",
-                )
-
-        # ── Tab 2: Colonne ────────────────────────────────────────────────────
-        with _tab_col:
-            _sel_doc = st.selectbox("Seleziona medico", _all_docs_list, key="pool_col_doc_sel")
-            if _sel_doc and _sel_doc in _draft_doctors:
-                _doc_cols = set(_draft_doctors[_sel_doc].get("columns") or [])
-                st.markdown(f"**Colonne assegnate a {_sel_doc}** — clicca per aggiungere/rimuovere")
-                _col_names = cfg_admin.get("columns", {})
-                _cols_per_row = 4
-                _col_items = sorted(_col_names.items())
-                for _ci in range(0, len(_col_items), _cols_per_row):
-                    _chunk = _col_items[_ci:_ci + _cols_per_row]
-                    _gcols = st.columns(len(_chunk))
-                    for _gci, ((_col_letter, _col_name), _gc) in enumerate(zip(_chunk, _gcols)):
-                        _is_on = _col_letter in _doc_cols
-                        _locked = _col_letter == "C"
-                        _label = f"**{_col_letter}** — {_col_name}"
-                        if _locked:
-                            _gc.markdown(f"{'🔵' if _is_on else '⚫'} {_label}  \n*(C gestita da Reperibilità)*")
-                        else:
-                            if _gc.checkbox(f"{_col_letter} · {_col_name}", value=_is_on,
-                                            key=f"pool_col_{_sel_doc}_{_col_letter}"):
-                                _doc_cols.add(_col_letter)
-                            else:
-                                _doc_cols.discard(_col_letter)
-                _draft_doctors[_sel_doc]["columns"] = sorted(_doc_cols)
-
-        # ── Tab 3: Limiti ─────────────────────────────────────────────────────
-        with _tab_lim:
-            # Globali per colonna
-            st.markdown("**Impostazioni globali per colonna**")
-            _col_settings: dict = _draft.setdefault("column_settings", {})
-            _cs_rows = []
-            for _cl in _all_cols:
-                _cs = _col_settings.get(_cl) or {}
-                _cs_rows.append({
-                    "Colonna": _cl,
-                    "Nome": (cfg_admin.get("columns") or {}).get(_cl, ""),
-                    "Target mensile": _cs.get("monthly_target"),
-                    "Spacing min (gg)": int(_cs.get("spacing_min_days", 0) or 0),
-                    "Spacing pref (gg)": int(_cs.get("spacing_preferred_days", 0) or 0),
-                    "Conta come": int(_cs.get("counts_as", 1) if _cl != "C" else 0),
-                })
-            _cs_df = _pd_pool.DataFrame(_cs_rows)
-            _edited_cs = st.data_editor(
-                _cs_df,
-                column_config={
-                    "Colonna": st.column_config.TextColumn("Col", disabled=True),
-                    "Nome": st.column_config.TextColumn("Nome", disabled=True),
-                    "Target mensile": st.column_config.NumberColumn("Target", min_value=0, max_value=31, step=1),
-                    "Spacing min (gg)": st.column_config.NumberColumn("Spacing min", min_value=0, max_value=30, step=1),
-                    "Spacing pref (gg)": st.column_config.NumberColumn("Spacing pref", min_value=0, max_value=30, step=1,
-                                                                        help="Solo per J — soft preference"),
-                    "Conta come": st.column_config.NumberColumn("Conta come", min_value=0, max_value=4, step=1,
-                                                                 help="C=0 (bloccato), J=2, altri=1"),
-                },
-                hide_index=True,
-                use_container_width=True,
-                key="pool_cs_editor",
-                num_rows="fixed",
-            )
-            for _, _row in _edited_cs.iterrows():
-                _cl = _row["Colonna"]
-                _csd = _col_settings.setdefault(_cl, {})
-                _mt = _row["Target mensile"]
-                _csd["monthly_target"] = int(_mt) if _mt is not None and not _pd_pool.isna(_mt) else None
-                _csd["spacing_min_days"] = int(_row["Spacing min (gg)"] or 0)
-                _csd["spacing_preferred_days"] = int(_row["Spacing pref (gg)"] or 0)
-                _csd["counts_as"] = 0 if _cl == "C" else int(_row["Conta come"] or 1)
-
-            st.divider()
-            # Override per medico
-            st.markdown("**Override quota per singolo medico**")
-            _ov_rows = []
-            for _dname, _dc in _draft_doctors.items():
-                for _col, _ov in (_dc.get("column_overrides") or {}).items():
-                    if not isinstance(_ov, dict):
-                        continue
-                    _ov_rows.append({
-                        "Medico": _dname,
-                        "Colonna": _col,
-                        "Quota mensile": _ov.get("monthly_quota"),
-                        "Tipo": _ov.get("quota_type", "fixed"),
-                        "Notti weekend": _ov.get("weekend_nights", True) if _col == "J" else None,
-                    })
-            _ov_df = _pd_pool.DataFrame(_ov_rows) if _ov_rows else _pd_pool.DataFrame(
-                columns=["Medico", "Colonna", "Quota mensile", "Tipo", "Notti weekend"]
-            )
-            _edited_ov = st.data_editor(
-                _ov_df,
-                column_config={
-                    "Medico": st.column_config.SelectboxColumn("Medico", options=_all_docs_list),
-                    "Colonna": st.column_config.SelectboxColumn("Colonna", options=_all_cols),
-                    "Quota mensile": st.column_config.NumberColumn("Quota", min_value=0, max_value=31),
-                    "Tipo": st.column_config.SelectboxColumn("Tipo", options=["fixed", "max", "min"]),
-                    "Notti weekend": st.column_config.CheckboxColumn("Notti weekend (J)", help="Solo per col. J"),
-                },
-                hide_index=True,
-                use_container_width=True,
-                key="pool_ov_editor",
-                num_rows="dynamic",
-            )
-            # Ricostruisce column_overrides da tabella
-            _new_overrides: dict[str, dict] = {}
-            for _, _row in _edited_ov.iterrows():
-                _dname = _row.get("Medico")
-                _col = _row.get("Colonna")
-                if not _dname or not _col or _dname not in _draft_doctors:
-                    continue
-                _ov_entry: dict = {}
-                _mq = _row.get("Quota mensile")
-                if _mq is not None and not _pd_pool.isna(_mq):
-                    _ov_entry["monthly_quota"] = int(_mq)
-                    _ov_entry["quota_type"] = str(_row.get("Tipo") or "fixed")
-                if _col == "J":
-                    _wn = _row.get("Notti weekend")
-                    if _wn is not None and not _pd_pool.isna(_wn):
-                        _ov_entry["weekend_nights"] = bool(_wn)
-                if _ov_entry:
-                    _new_overrides.setdefault(_dname, {})[_col] = _ov_entry
-            # Aggiorna column_overrides di tutti i medici (reset prima)
-            for _dname in _draft_doctors:
-                _draft_doctors[_dname]["column_overrides"] = _new_overrides.get(_dname, {})
-
-        # ── Tab 4: Servizi ────────────────────────────────────────────────────
-        with _tab_serv:
-            st.markdown("**Combinazioni same-day**")
-            _combos: list = _draft.setdefault("service_combinations", [])
-            _combo_rows = [
-                {"Col 1": c["columns"][0], "Col 2": c["columns"][1], "Modalità": c["mode"]}
-                for c in _combos if len(c.get("columns", [])) == 2
-            ]
-            _combo_df = _pd_pool.DataFrame(_combo_rows) if _combo_rows else _pd_pool.DataFrame(
-                columns=["Col 1", "Col 2", "Modalità"]
-            )
-            _edited_combo = st.data_editor(
-                _combo_df,
-                column_config={
-                    "Col 1": st.column_config.SelectboxColumn("Col 1", options=_all_cols),
-                    "Col 2": st.column_config.SelectboxColumn("Col 2", options=_all_cols),
-                    "Modalità": st.column_config.SelectboxColumn("Modalità", options=["always", "fallback", "preferred"]),
-                },
-                hide_index=True,
-                use_container_width=True,
-                key="pool_combo_editor",
-                num_rows="dynamic",
-            )
-            _new_combos = []
-            for _, _row in _edited_combo.iterrows():
-                _c1, _c2, _mode = _row.get("Col 1"), _row.get("Col 2"), _row.get("Modalità")
-                if _c1 and _c2 and _mode:
-                    _new_combos.append({"columns": [str(_c1), str(_c2)], "same_day": True, "mode": str(_mode)})
-            _draft["service_combinations"] = _new_combos
-
-            st.divider()
-            st.markdown("**Servizi critici** — fallback se pool primario esaurito")
-            _critical: dict = _draft.setdefault("critical_services", {})
-            _crit_rows = []
-            for _col, _spec in _critical.items():
-                _fb = _spec.get("fallback", "any")
-                _crit_rows.append({
-                    "Colonna": _col,
-                    "Fallback": "any" if _fb == "any" else ", ".join(_fb),
-                })
-            _crit_df = _pd_pool.DataFrame(_crit_rows) if _crit_rows else _pd_pool.DataFrame(
-                columns=["Colonna", "Fallback"]
-            )
-            _edited_crit = st.data_editor(
-                _crit_df,
-                column_config={
-                    "Colonna": st.column_config.SelectboxColumn("Colonna", options=_all_cols),
-                    "Fallback": st.column_config.TextColumn("Fallback", help="'any' oppure nomi separati da virgola"),
-                },
-                hide_index=True,
-                use_container_width=True,
-                key="pool_crit_editor",
-                num_rows="dynamic",
-            )
-            _new_crit: dict = {}
-            for _, _row in _edited_crit.iterrows():
-                _col = _row.get("Colonna")
-                _fb_raw = str(_row.get("Fallback") or "any").strip()
-                if not _col:
-                    continue
-                if _fb_raw.lower() == "any":
-                    _new_crit[str(_col)] = {"fallback": "any"}
-                else:
-                    _fb_list = [x.strip() for x in _fb_raw.split(",") if x.strip()]
-                    if _fb_list:
-                        _new_crit[str(_col)] = {"fallback": _fb_list}
-            _draft["critical_services"] = _new_crit
-
-        # ── Salvataggio ──────────────────────────────────────────────────────
-        st.divider()
-        _col_save, _col_reset = st.columns([3, 1])
-        with _col_reset:
-            if st.button("↩️ Reset draft", key="btn_pool_reset"):
-                del st.session_state["pool_cfg_draft"]
-                st.rerun()
-        with _col_save:
-            if st.button("💾 Salva configurazione pool", type="primary", key="btn_pool_save"):
-                import copy as _copy_save
-                from datetime import datetime as _dt_save, timezone as _tz_save
-                _to_save = _copy_save.deepcopy(_draft)
-                _to_save["updated_at"] = _dt_save.now(_tz_save.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-                _to_save["updated_by"] = "admin"
-                _errs = _pcs_ui.validate_pool_config(_to_save)
-                if _errs:
-                    st.error("Configurazione non valida:\n\n" + "\n".join(f"- {e}" for e in _errs))
-                else:
-                    _ok_save, _msg_save = save_pool_config_with_retry(_to_save, _pool_cfg_sha)
-                    if _ok_save:
-                        st.success(_msg_save, icon="✅")
-                        del st.session_state["pool_cfg_draft"]
-                        st.rerun()
-                    else:
-                        st.error(_msg_save)
 
     st.divider()
 
@@ -4196,52 +3965,6 @@ else:
 
     st.divider()
 
-    # ── Contatore universitari ────────────────────────────────────────────────
-    with st.expander("🎓 Contatore turni universitari", expanded=False):
-        try:
-            cfg_u = tg.load_rules(rules_path if "rules_path" in locals() else tg.DEFAULT_RULES_PATH
-                                  if hasattr(tg, "DEFAULT_RULES_PATH") else None) if False else cfg_admin
-            gc_u = (cfg_u.get("global_constraints") or {})
-            uni_docs = gc_u.get("university_doctors") or {}
-            uni_ratio = float(gc_u.get("university_ratio", 0.6))
-            if uni_docs:
-                import calendar as _cal
-                y_u, m_u = int(year), int(month)
-                _, n_days = _cal.monthrange(y_u, m_u)
-                _holidays = tg.italy_public_holidays(y_u)
-                _extra_hol = set()
-                for _x in (cfg_u.get("festivi_extra") or []):
-                    try:
-                        _extra_hol.add(tg.parse_date(_x))
-                    except Exception:
-                        pass
-                working = sum(
-                    1 for d in range(1, n_days + 1)
-                    if (dt_date := date(y_u, m_u, d)).weekday() < 6  # lun=0..sab=5
-                    and dt_date not in _holidays
-                    and dt_date not in _extra_hol
-                )
-                st.markdown(f"**{mk}** — giorni lavorativi lun-sab (esclusi festivi): **{working}**")
-                st.markdown(f"Rapporto universitari: **{int(uni_ratio*100)}%** → target = round({working} × {uni_ratio}) = **{round(working * uni_ratio)}**")
-                rows_u = []
-                for doc_raw, dcfg in uni_docs.items():
-                    night_double = bool((dcfg or {}).get("night_counts_double", False))
-                    target = round(working * uni_ratio)
-                    rows_u.append({
-                        "Medico": doc_raw,
-                        "Notte vale doppio": "✓ (2 turni)" if night_double else "✗ (1 turno)",
-                        "Target turni pesati": target,
-                        "Max consentito": target + 1,
-                        "Note": "Indisponibilità NON riducono il target",
-                    })
-                st.dataframe(pd.DataFrame(rows_u), use_container_width=True, hide_index=True)
-            else:
-                st.info("Nessun medico universitario configurato nel YAML.")
-        except Exception as e:
-            st.warning(f"Errore contatore universitari: {e}")
-
-    st.divider()
-
     # Generate button
     generate = st.button("🚀 Genera turni", type="primary")
 
@@ -4251,27 +3974,16 @@ else:
         try:
             with tempfile.TemporaryDirectory() as td:
                 td = Path(td)
-                rules_path_use = rules_path
 
                 status.update(label="Preparazione template…", state="running")
-                if template_upload is not None:
-                    template_path = td / "template.xlsx"
-                    template_path.write_bytes(template_upload.getvalue())
-                else:
-                    # Auto template
-                    if style_upload is not None:
-                        style_path = td / "Style_Template.xlsx"
-                        style_path.write_bytes(style_upload.getvalue())
-                    else:
-                        style_path = DEFAULT_STYLE_TEMPLATE if DEFAULT_STYLE_TEMPLATE.exists() else None
-                    template_path = td / f"turni_{mk}.xlsx"
-                    tg.create_month_template_xlsx(
-                        rules_path_use,
-                        int(year),
-                        int(month),
-                        out_path=template_path,
-                        sheet_name=sheet_name or None,
-                    )
+                style_path = DEFAULT_STYLE_TEMPLATE if DEFAULT_STYLE_TEMPLATE.exists() else None
+                template_path = td / f"turni_{mk}.xlsx"
+                tg.create_month_template_xlsx(
+                    rules_path,
+                    int(year),
+                    int(month),
+                    out_path=template_path,
+                )
 
                 status.update(label="Carico indisponibilità…", state="running")
                 unav_path = None
@@ -4321,10 +4033,10 @@ else:
 
                 stats, log_path = tg.generate_schedule(
                     template_xlsx=template_path,
-                    rules_yml=rules_path_use,
+                    rules_yml=rules_path,
                     out_xlsx=out_path,
                     unavailability_path=unav_path,
-                    sheet_name=sheet_name or None,
+                    sheet_name=None,
                     carryover_by_month=carryover_by_month if carryover_by_month else None,
                     fixed_assignments=fixed_assignments_list if fixed_assignments_list else None,
                     availability_preferences=all_avail_prefs if all_avail_prefs else None,
