@@ -3314,57 +3314,63 @@ else:
         st.caption("Nessun mese caricato nella memoria storica.")
 
     # ── Migrazione CSV aggregato → file per-medico ────────────────────────
-    with st.expander("🔄 Migrazione indisponibilità: CSV aggregato → file per-medico", expanded=False):
-        st.info(
-            "**Operazione una-tantum.** Legge il vecchio `unavailability_store.csv`, "
-            "divide i dati per medico e scrive un file CSV separato per ciascun medico "
-            f"nella directory `{_unavail_per_doctor_dir()}/`. "
-            "Dopo la migrazione ogni medico salva sul proprio file — zero conflitti concorrenti.",
-            icon="ℹ️",
+    st.markdown("#### Migrazione indisponibilità al nuovo formato")
+    st.warning(
+        "**Azione richiesta (una-tantum).** Il sistema ora salva un file CSV separato "
+        "per ogni medico, eliminando i conflitti di salvataggio concorrente. "
+        "Clicca il bottone qui sotto per copiare i dati storici dal vecchio CSV ai file per-medico.",
+        icon="⚠️",
+    )
+    _mg_col1, _mg_col2 = st.columns([1, 3])
+    with _mg_col1:
+        _do_migrate = st.button("Esegui migrazione", key="btn_migrate_unavail", type="primary", use_container_width=True)
+    with _mg_col2:
+        st.caption(
+            f"Legge `unavailability_store.csv` → scrive file per-medico in `{_unavail_per_doctor_dir()}/`. "
+            "Il vecchio file resta intatto come backup."
         )
-        if st.button("Esegui migrazione", key="btn_migrate_unavail"):
-            _mg = _github_cfg()
-            if not _mg.get("path"):
-                st.error("Chiave `path` non trovata nei secrets — migrazione non possibile.")
-            else:
-                try:
-                    _leg_gf = github_utils.get_file(
-                        owner=_mg["owner"], repo=_mg["repo"], path=_mg["path"],
-                        token=_mg["token"], branch=_mg.get("branch", "main"),
-                    )
-                    if _leg_gf is None or not (_leg_gf.text or "").strip():
-                        st.warning("CSV aggregato vuoto o non trovato — nessun dato da migrare.")
-                    else:
-                        from collections import defaultdict as _dd
-                        _all = ustore.load_store(_leg_gf.text)
-                        _by_doc: dict[str, list[dict]] = _dd(list)
-                        for _r in _all:
-                            _by_doc[_r["doctor"]].append(_r)
-                        _prog = st.progress(0)
-                        _docs_list = list(_by_doc.keys())
-                        _ok = 0
-                        for _i, _doc in enumerate(_docs_list):
-                            _doc_path = _doctor_unavail_path(_doc)
-                            _ex_gf = github_utils.get_file(
-                                owner=_mg["owner"], repo=_mg["repo"], path=_doc_path,
-                                token=_mg["token"], branch=_mg.get("branch", "main"),
-                            )
-                            github_utils.put_file(
-                                owner=_mg["owner"], repo=_mg["repo"], path=_doc_path,
-                                token=_mg["token"], branch=_mg.get("branch", "main"),
-                                sha=_ex_gf.sha if _ex_gf else None,
-                                message=f"migrate: unavailability for {_doc}",
-                                text=ustore.to_csv(_by_doc[_doc]),
-                            )
-                            _ok += 1
-                            _prog.progress((_i + 1) / len(_docs_list))
-                        st.success(
-                            f"Migrazione completata: {_ok} medici → `{_unavail_per_doctor_dir()}/`  \n"
-                            "Da ora ogni salvataggio usa il file per-medico. "
-                            "Il vecchio `unavailability_store.csv` rimane intatto come backup."
+    if _do_migrate:
+        _mg = _github_cfg()
+        if not _mg.get("path"):
+            st.error("Chiave `path` non trovata nei secrets — migrazione non possibile.")
+        else:
+            try:
+                _leg_gf = github_utils.get_file(
+                    owner=_mg["owner"], repo=_mg["repo"], path=_mg["path"],
+                    token=_mg["token"], branch=_mg.get("branch", "main"),
+                )
+                if _leg_gf is None or not (_leg_gf.text or "").strip():
+                    st.warning("CSV aggregato vuoto o non trovato — nessun dato da migrare.")
+                else:
+                    from collections import defaultdict as _dd
+                    _all = ustore.load_store(_leg_gf.text)
+                    _by_doc: dict[str, list[dict]] = _dd(list)
+                    for _r in _all:
+                        _by_doc[_r["doctor"]].append(_r)
+                    _prog = st.progress(0)
+                    _docs_list = list(_by_doc.keys())
+                    _ok = 0
+                    for _i, _doc in enumerate(_docs_list):
+                        _doc_path = _doctor_unavail_path(_doc)
+                        _ex_gf = github_utils.get_file(
+                            owner=_mg["owner"], repo=_mg["repo"], path=_doc_path,
+                            token=_mg["token"], branch=_mg.get("branch", "main"),
                         )
-                except Exception as _me:
-                    st.error(f"Errore migrazione: {_me}")
+                        github_utils.put_file(
+                            owner=_mg["owner"], repo=_mg["repo"], path=_doc_path,
+                            token=_mg["token"], branch=_mg.get("branch", "main"),
+                            sha=_ex_gf.sha if _ex_gf else None,
+                            message=f"migrate: unavailability for {_doc}",
+                            text=ustore.to_csv(_by_doc[_doc]),
+                        )
+                        _ok += 1
+                        _prog.progress((_i + 1) / len(_docs_list))
+                    st.success(
+                        f"Migrazione completata: {_ok} medici migrati in `{_unavail_per_doctor_dir()}/`. "
+                        "Da ora ogni salvataggio usa il file per-medico."
+                    )
+            except Exception as _me:
+                st.error(f"Errore migrazione: {_me}")
 
     st.divider()
 
