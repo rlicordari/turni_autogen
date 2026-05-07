@@ -620,6 +620,183 @@ def load_rules(path: Path) -> dict:
     return cfg
 
 
+def apply_pool_config(cfg_yaml: dict, pool_cfg: Optional[dict]) -> dict:
+    """Sovrascrive pool/quote/flag nel cfg YAML con i valori del pool_config JSON.
+
+    Se pool_cfg è None o vuoto ritorna una deep copy di cfg_yaml invariata.
+    La funzione è idempotente: applicata più volte produce lo stesso risultato.
+    """
+    import copy as _copy
+
+    cfg = _copy.deepcopy(cfg_yaml)
+    if not pool_cfg or not pool_cfg.get("doctors"):
+        return cfg
+
+    doctors: dict = pool_cfg.get("doctors", {})
+    col_settings: dict = pool_cfg.get("column_settings", {})
+    rules = cfg.setdefault("rules", {})
+    gc = cfg.setdefault("global_constraints", {})
+
+    # 1. active=false → absolute_exclusions
+    abs_excl: list = list(cfg.get("absolute_exclusions") or [])
+    abs_excl_set = {norm_name(x) for x in abs_excl}
+    for doc, dcfg in doctors.items():
+        if not dcfg.get("active", True) and norm_name(doc) not in abs_excl_set:
+            abs_excl.append(doc)
+            abs_excl_set.add(norm_name(doc))
+    cfg["absolute_exclusions"] = abs_excl
+
+    # Medici attivi (normalizzati)
+    active_docs = [doc for doc, dcfg in doctors.items() if dcfg.get("active", True)]
+    active_set = {norm_name(d) for d in active_docs}
+
+    # 2. Mappa colonna → pool key nel YAML (per sostituire i pool)
+    _COL_RULE: dict[str, list[tuple[str, str]]] = {
+        # (rule_key, pool_field)
+        "C":  [("C_reperibilita", None)],         # C si gestisce via excluded, non pool
+        "D":  [("D_F", "allowed")],
+        "F":  [("D_F", "allowed")],
+        "E":  [("E_G", "allowed")],
+        "G":  [("E_G", "allowed")],
+        "H":  [("H", "pool_mon_fri"), ("H", "distribution_pool")],
+        "I":  [("I", "distribution_pool")],
+        "J":  [("J", "pool_other")],
+        "K":  [("K", "pool")],
+        "L":  [("L", "pool_other")],
+        "Q":  [("Q", "pool")],
+        "R":  [("R", "pool")],
+        "S":  [("S", "pool")],
+        "T":  [("T", "pool")],
+        "U":  [("U", "pool")],
+        "V":  [("V", "pool")],
+        "W":  [("W", "other_days_pool")],
+        "Y":  [("Y", "other_pool")],
+        "Z":  [("Z", "pool")],
+        "AB": [("AB", "fallback_pool")],
+    }
+
+    for col, rule_targets in _COL_RULE.items():
+        if col == "C":
+            continue  # gestito separatamente al punto 5
+        new_pool = [
+            doc for doc, dcfg in doctors.items()
+            if dcfg.get("active", True) and col in (dcfg.get("columns") or [])
+        ]
+        if not new_pool:
+            continue  # safety: se il pool è vuoto, lascia il YAML invariato
+        for rule_key, pool_field in rule_targets:
+            rules.setdefault(rule_key, {})[pool_field] = new_pool
+
+    # 3. Pool festivi diurni (D/E/H/I nei giorni festivi)
+    fest_incl = [
+        doc for doc, dcfg in doctors.items()
+        if dcfg.get("active", True) and dcfg.get("festivi_diurni", True)
+    ]
+    fest_excl = [
+        doc for doc, dcfg in doctors.items()
+        if dcfg.get("active", True) and not dcfg.get("festivi_diurni", True)
+    ]
+    if fest_incl:
+        rules.setdefault("Festivi", {})["pool"] = fest_incl
+    if fest_excl:
+        rules.setdefault("Festivi", {})["excluded"] = fest_excl
+
+    # 4. Pool festivi notti (J nei giorni festivi)
+    festivi_notti_excl = [
+        doc for doc, dcfg in doctors.items()
+        if dcfg.get("active", True)
+        and "J" in (dcfg.get("columns") or [])
+        and not dcfg.get("festivi_notti", True)
+    ]
+    cfg["pool_festivi_notti_excluded"] = {norm_name(d) for d in festivi_notti_excl}
+
+    # 5. Reperibilità C: sostituisce excluded list
+    c_excl = [
+        doc for doc, dcfg in doctors.items()
+        if dcfg.get("active", True) and dcfg.get("excluded_from_reperibilita", False)
+    ]
+    # Aggiungi anche i non-attivi (non assegnabili comunque ma meglio espliciti)
+    for doc, dcfg in doctors.items():
+        if not dcfg.get("active", True) and doc not in c_excl:
+            c_excl.append(doc)
+    rules.setdefault("C_reperibilita", {})["excluded"] = c_excl
+
+    # 6. Weekend J excluded — non richiede J in columns (può entrare via monthly_quotas)
+    j_weekend_excl = [
+        doc for doc, dcfg in doctors.items()
+        if dcfg.get("active", True)
+        and not (dcfg.get("column_overrides") or {}).get("J", {}).get("weekend_nights", True)
+    ]
+    rules.setdefault("J", {})["weekend_excluded_doctors"] = j_weekend_excl
+
+    # 7. Quote J fixed → J.monthly_quotas (compatibile con solver esistente)
+    j_mq: dict = dict(rules.get("J", {}).get("monthly_quotas") or {})
+    quota_overrides: dict = {}  # (doc_norm, col) → {type, value}
+
+    for doc, dcfg in doctors.items():
+        dn = norm_name(doc)
+        overrides: dict = dcfg.get("column_overrides") or {}
+        for col, ov in overrides.items():
+            if not isinstance(ov, dict):
+                continue
+            mq = ov.get("monthly_quota")
+            qt = ov.get("quota_type", "fixed")
+            if mq is None:
+                continue
+            if col == "J" and qt == "fixed":
+                j_mq[doc] = mq  # usa chiave originale per compatibilità
+            else:
+                quota_overrides[(dn, col)] = {"type": qt, "value": int(mq)}
+
+    rules.setdefault("J", {})["monthly_quotas"] = j_mq
+    cfg["pool_quota_overrides"] = quota_overrides
+
+    # 8. counts_as per colonna
+    counts_as_map: dict[str, int] = {}
+    for col, cs in col_settings.items():
+        if isinstance(cs, dict) and "counts_as" in cs:
+            counts_as_map[col] = int(cs["counts_as"])
+    if counts_as_map:
+        cfg["pool_counts_as"] = counts_as_map
+
+    # 9. service_combinations
+    combos = pool_cfg.get("service_combinations")
+    if combos is not None:
+        cfg["pool_service_combinations"] = combos
+
+    # 10. critical_services
+    critical = pool_cfg.get("critical_services")
+    if critical is not None:
+        cfg["pool_critical_services"] = critical
+
+    # 11. spacing_preferred_days per colonna
+    spacing_pref: dict[str, int] = {}
+    for col, cs in col_settings.items():
+        if isinstance(cs, dict) and "spacing_preferred_days" in cs:
+            spacing_pref[col] = int(cs["spacing_preferred_days"])
+    if spacing_pref:
+        cfg["pool_spacing_preferred"] = spacing_pref
+
+    # 12. university_doctors — aggiorna da pool_config
+    gc_uni: dict = dict(gc.get("university_doctors") or {})
+    for doc, dcfg in doctors.items():
+        uni = dcfg.get("university_doctor")
+        if uni and isinstance(uni, dict):
+            ratio = float(uni.get("ratio", gc.get("university_ratio", 0.6)))
+            night_double = "J" in (dcfg.get("columns") or [])
+            gc_uni[doc] = {
+                "type": "university",
+                "night_counts_double": night_double,
+            }
+            gc["university_ratio"] = ratio
+        elif doc in gc_uni and uni is None:
+            # Rimosso da pool_config → rimuovi anche da gc_uni
+            del gc_uni[doc]
+    gc["university_doctors"] = gc_uni
+
+    return cfg
+
+
 def _strip_festivi_unavailability(
     unav_map: Dict[str, Dict[dt.date, Set[str]]],
     tf_fixed: List[dict],
@@ -4049,12 +4226,14 @@ def generate_schedule(
     v_double_overrides: Optional[List[str]] = None,
     j_blank_week_overrides: Optional[Dict[str, Optional[str]]] = None,
     historical_stats: Optional[dict] = None,
+    pool_config: Optional[dict] = None,
 ):
     """Generate schedules without Tkinter.
 
     This is the function used by Streamlit (and can be used programmatically).
     fixed_assignments: [{"doctor":str,"date":"YYYY-MM-DD","column":str}, ...]
     availability_preferences: [{"doctor":str,"date":"YYYY-MM-DD","shift":str}, ...]
+    pool_config: dict caricato da pool_config_store (overlay JSON su YAML).
     """
     template = Path(template_xlsx)
     rules = Path(rules_yml)
@@ -4062,6 +4241,8 @@ def generate_schedule(
     unav = Path(unavailability_path) if unavailability_path else None
 
     cfg = load_rules(rules)
+    if pool_config:
+        cfg = apply_pool_config(cfg, pool_config)
 
     # Merge pre-assigned holiday shifts from data/turni_festivi.yml
     tf = load_turni_festivi()

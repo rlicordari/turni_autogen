@@ -328,6 +328,10 @@ def _build_col_to_doctors(rules: dict, all_doctors: list[str]) -> dict[str, set[
         for k in FIXED_KEYS:
             if rule.get(k):
                 pool.add(norm_name(rule[k]))
+        # Per J: includi anche chi ha monthly_quotas (entra nel pool via quota)
+        if col == "J":
+            mq = rule.get("monthly_quotas") or {}
+            pool |= {norm_name(d) for d in mq if d}
         # Includi solo medici riconosciuti da collect_doctors
         col_to_docs[col] = pool & dn_all
 
