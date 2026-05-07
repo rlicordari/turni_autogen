@@ -119,9 +119,100 @@ starttls = true
 - [x] Task 4: UI admin Streamlit — upload, tabella, grafici Plotly, eliminazione mese
 - [x] Task 5: Test end-to-end e push
 
+**Modifiche sessione 22 aprile 2026:**
+- Parser dinamico colonne: `_map_columns_from_header()` legge riga 1 del foglio Excel e mappa header → tag logico (non più posizioni fisse). Supporta layout diversi tra mesi.
+- `_HEADER_TO_TAG` in `shift_history.py`: ordine importante — pattern specifici (es. "emodinamica notte") prima di generici ("notte").
+- Filtro medici validi: `compute_doctor_stats(parsed, valid_doctors=set)` accetta whitelist da pool YAML per escludere nomi spuri (note, testo libero nelle celle).
+- `_EXCLUDED_NAMES` in `shift_history.py`: nomi esclusi a priori dal conteggio (Recupero, De Luca, Saporito, Virga, Carciotto, Andò, D'Angelo).
+- `_WEEKEND_COLUMNS = {"C", "D", "E", "H", "I", "J"}` — solo queste colonne per conteggio domeniche/festivi.
+- Pasquetta calcolata con `_easter_monday()` (algoritmo Meeus/Jones/Butcher).
+- Dedup festivi D/E e H/I: stesso medico in D+E o H+I nello stesso giorno festivo conta 1 volta, non 2.
+- H/I nel riepilogo mostrano solo feriali (`.get("feriali", 0)`), non totali.
+- Grafici Plotly: menu a tendina (`st.selectbox`) per scegliere il grafico, non tutti visibili insieme.
+- Tab "Per mese" nella tabella riepilogativa storica.
+- Default indisponibilità: cambiato a "Usa archivio (privacy)" (`index=2` nel radio widget).
+- Auto-carryover da storico: all'importazione del mese, salva `_meta.last_day_night_doctors` nel JSON. Il multiselect carryover nel pannello admin viene pre-compilato con chi ha fatto notte l'ultimo giorno del mese più recente nello storico.
+- Nota: la reperibilità (C) è assegnata dal greedy `assign_reperibilita_C`, NON dal CP-SAT. Non può avere soft-constraints storici nel solver.
+
 **Moduli coinvolti:**
 | File | Modifica |
 |---|---|
-| `shift_history.py` | NUOVO — parser + aggregazione + storage GitHub |
-| `turni_generator.py` | Aggiunto parametro `historical_stats` al solver |
-| `streamlit_app.py` | Nuova sezione admin "Memoria Storica" |
+| `shift_history.py` | NUOVO — parser dinamico + aggregazione + storage GitHub + easter + valid_doctors |
+| `turni_generator.py` | Aggiunto parametro `historical_stats` al solver con soft-constraints (HIST_NIGHT_PENALTY, HIST_FEST_PENALTY, HIST_DEHI_PENALTY) |
+| `streamlit_app.py` | Nuova sezione admin "Memoria Storica" + auto-carryover + default archivio |
+| `requirements.txt` | Aggiunto `plotly>=5.18.0` |
+
+**TODO futuri (da dove ripartire):**
+- [ ] Ri-importare i mesi già caricati nello storico per popolare `_meta.last_day_night_doctors` (i mesi importati prima di questa modifica non hanno `_meta`)
+- [ ] Aggiungere soft-constraint storico anche per le domeniche/festivi D/E/H/I (oggi solo notti J e festivi generici)
+- [ ] Verificare che il solver usi effettivamente `historical_stats` quando si genera da Streamlit (passaggio del parametro alla pipeline completa)
+- [ ] Considerare un riepilogo visivo del carryover nella UI (es. "Da storico: Licordari ha fatto notte il 31/03")
+- [ ] Test automatici per `shift_history.py` (parsing, conteggi, edge cases layout diversi)
+- [ ] Gestione del caso in cui il mese nello storico non è il mese immediatamente precedente (es. manca un mese intermedio)
+
+## Feature in sviluppo: Gestione Pool Medici da GUI (pool_config)
+
+**Spec completa:** `docs/superpowers/specs/2026-05-07-pool-config-design.md` *(da creare)*
+
+**Decisioni di design confermate (sessione 7 maggio 2026):**
+
+### Approccio: Overlay JSON su YAML (Approccio A)
+- `data/pool_config.json` su GitHub sovrascrive pool e quote al momento della generazione
+- `Regole_Turni.yml` rimane immutato come template avanzato (spacing, penalità, relief_valves)
+- Il merge avviene in `streamlit_app.py` prima di invocare il solver
+- La GUI admin (PIN-protetta) legge/scrive solo `pool_config.json`
+
+### Funzionalità previste
+1. **Gestione medici** — aggiungere/rimuovere medici, attivo/inattivo
+2. **Assegnazione colonne** — per ogni medico: quali colonne può fare normalmente
+3. **Festivi** — due toggle per medico: `festivi_diurni` (D/E/H/I) e `festivi_notti` (J nei festivi)
+4. **Limiti** — quote min/max globali per colonna + override per singolo medico
+5. **Combinazioni same-day** — coppie di servizi che lo stesso medico può coprire nello stesso giorno (es. K+T), estende il meccanismo `df_pair`
+6. **Servizi critici** — servizi che non possono mai rimanere scoperti: usa pool primario, fallback su qualsiasi medico attivo se il pool primario è esaurito
+
+### Schema `pool_config.json`
+```json
+{
+  "doctors": {
+    "Licordari": {
+      "active": true,
+      "columns": ["D", "E", "J", "K", "T", "Q"],
+      "festivi_diurni": true,
+      "festivi_notti": true,
+      "column_overrides": { "J": {"quota_min": 2, "quota_max": 4} }
+    }
+  },
+  "column_defaults": {
+    "J": {"quota_min": 1, "quota_max": 6},
+    "D": {"quota_min": 0, "quota_max": 5}
+  },
+  "service_combinations": [
+    {"columns": ["K", "T"], "same_day": true}
+  ],
+  "critical_services": ["D", "E", "J", "H"],
+  "updated_at": "...",
+  "updated_by": "admin"
+}
+```
+
+### Integrazione solver
+- `pool_config.json` viene caricato in `streamlit_app.py` prima della generazione
+- La funzione `apply_pool_config(cfg_yaml, pool_config)` in `turni_generator.py` produce il cfg effettivo
+- Per i servizi critici: il solver riceve un `emergency_pool` per colonna (tutti i medici attivi) usato solo se il pool primario è esaurito
+- Per le combinazioni same-day: il meccanismo `df_pair` viene generalizzato a `service_pairs` con lista configurabile
+
+### File coinvolti
+| File | Modifica |
+|---|---|
+| `streamlit_app.py` | Nuova sezione admin "Gestione Pool" + load/save pool_config.json |
+| `turni_generator.py` | Nuova funzione `apply_pool_config()` + generalizzazione `df_pair` → `service_pairs` + logica `critical_services` |
+| `pool_config_store.py` | NUOVO — funzioni pure per load/save/validate del pool_config JSON |
+| `github_utils.py` | Nessuna modifica (usa `get_file`/`put_file` esistenti) |
+
+### Secrets aggiuntivi (opzionale)
+```toml
+[github_unavailability]
+pool_config_path = "data/pool_config.json"  # default se non presente
+```
+
+**Stato:** pianificazione in corso — spec non ancora scritta
