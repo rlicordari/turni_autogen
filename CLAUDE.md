@@ -170,27 +170,56 @@ starttls = true
 5. **Combinazioni same-day** — coppie di servizi che lo stesso medico può coprire nello stesso giorno (es. K+T), estende il meccanismo `df_pair`
 6. **Servizi critici** — servizi che non possono mai rimanere scoperti: usa pool primario, fallback su qualsiasi medico attivo se il pool primario è esaurito
 
-### Schema `pool_config.json`
+### Schema `pool_config.json` (v1 — aggiornato 7 maggio 2026)
 ```json
 {
+  "schema_version": 1,
   "doctors": {
     "Licordari": {
       "active": true,
       "columns": ["D", "E", "J", "K", "T", "Q"],
       "festivi_diurni": true,
       "festivi_notti": true,
-      "column_overrides": { "J": {"quota_min": 2, "quota_max": 4} }
+      "excluded_from_reperibilita": false,
+      "university_doctor": null,
+      "column_overrides": {
+        "J": { "quota_min": 2, "quota_max": 4 }
+      }
+    },
+    "Zito": {
+      "active": true,
+      "columns": ["D", "E", "J"],
+      "festivi_diurni": false,
+      "festivi_notti": false,
+      "excluded_from_reperibilita": true,
+      "university_doctor": { "night_counts_double": true, "ratio": 0.6 },
+      "column_overrides": {}
+    },
+    "Grimaldi": {
+      "active": true,
+      "columns": ["D", "F"],
+      "festivi_diurni": false,
+      "festivi_notti": false,
+      "excluded_from_reperibilita": true,
+      "university_doctor": null,
+      "column_overrides": {}
     }
   },
-  "column_defaults": {
-    "J": {"quota_min": 1, "quota_max": 6},
-    "D": {"quota_min": 0, "quota_max": 5}
+  "column_settings": {
+    "J": { "quota_min": 1, "quota_max": 6, "spacing_min_days": 5, "balance_weight": 300 },
+    "D": { "quota_min": 0, "quota_max": 5, "spacing_min_days": 0, "balance_weight": 200 }
   },
   "service_combinations": [
-    {"columns": ["K", "T"], "same_day": true}
+    { "columns": ["K", "T"], "same_day": true },
+    { "columns": ["Q", "R"], "same_day": true }
   ],
-  "critical_services": ["D", "E", "J", "H"],
-  "updated_at": "...",
+  "critical_services": {
+    "J": { "fallback": "any" },
+    "D": { "fallback": "any" },
+    "E": { "fallback": "any" },
+    "H": { "fallback": ["Licordari", "Allegra", "Cimino"] }
+  },
+  "updated_at": "2026-05-07T10:00:00Z",
   "updated_by": "admin"
 }
 ```
