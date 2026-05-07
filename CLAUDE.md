@@ -152,9 +152,9 @@ starttls = true
 
 ## Feature in sviluppo: Gestione Pool Medici da GUI (pool_config)
 
-**Spec completa:** `docs/superpowers/specs/2026-05-07-pool-config-design.md` ✅ SCRITTA  
+**Spec completa:** `docs/superpowers/specs/2026-05-07-pool-config-design.md` ✅ rev. 2026-05-07b  
 **Mockup interattivo:** `docs/superpowers/mockup_pool_config.html` ✅ (aprire in browser)  
-**Stato:** Spec approvata — **prossimo passo: scrivere il piano di implementazione** (`superpowers:writing-plans`)
+**Stato:** ✅ IMPLEMENTATA E DEPLOYATA (commit df8933e → 6a2962a)
 
 ### Approccio: Overlay JSON su YAML (Approccio A)
 - `data/pool_config.json` su GitHub sovrascrive pool e quote al momento della generazione
