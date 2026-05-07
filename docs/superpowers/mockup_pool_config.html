@@ -234,72 +234,69 @@ label { font-size:0.82rem; color:#888; }
 
 <!-- TAB LIMITI -->
 <div class="tab-content" id="tab-limiti">
-  <div class="section-title">Quote globali per colonna</div>
-  <p class="note" style="margin-bottom:10px">⚠️ <strong>Conta come</strong> = peso del turno nel conteggio quote mensili. J vale 2 per tutti (ospedalieri e universitari).</p>
+  <div class="section-title">Impostazioni per colonna</div>
+  <p class="note" style="margin-bottom:10px">
+    <strong>Quota mensile</strong> = target di turni al mese per ciascun medico del pool. Il solver distribuisce equamente cercando di raggiungerlo.
+    Lascia vuoto per distribuzione automatica senza target fisso.
+    <strong>Conta come</strong> = peso nel conteggio totale turni (J vale 2 per tutti).
+  </p>
   <div class="limit-row">
     <span class="limit-col-letter">J</span><span class="limit-col-name">Notte</span>
-    <div class="limit-field"><label>Min/mese</label><input type="number" value="1" min="0" max="20"></div>
-    <div class="limit-field"><label>Max/mese</label><input type="number" value="6" min="0" max="30"></div>
+    <div class="limit-field"><label>Quota mensile (default)</label><input type="number" value="2" min="1" max="20" style="width:65px" title="Tutti fanno 2 notti, salvo override"></div>
     <div class="limit-field"><label>Spacing (gg)</label><input type="number" value="5" min="0" max="14"></div>
-    <div class="limit-field"><label>Balance</label><input type="number" value="300" min="0" step="50"></div>
-    <div class="limit-field"><label>Conta come</label><input type="number" value="2" min="1" max="3" style="width:55px" title="J vale 2 turni per tutti"></div>
+    <div class="limit-field"><label>Conta come</label><input type="number" value="2" min="1" max="3" style="width:55px"></div>
     <button class="btn btn-danger btn-sm">🗑</button>
   </div>
   <div class="limit-row">
     <span class="limit-col-letter">D</span><span class="limit-col-name">UTIC mattina</span>
-    <div class="limit-field"><label>Min/mese</label><input type="number" value="0"></div>
-    <div class="limit-field"><label>Max/mese</label><input type="number" value="5"></div>
+    <div class="limit-field"><label>Quota mensile (default)</label><input type="number" placeholder="auto" style="width:65px" title="Lascia vuoto = distribuzione automatica"></div>
     <div class="limit-field"><label>Spacing (gg)</label><input type="number" value="0"></div>
-    <div class="limit-field"><label>Balance</label><input type="number" value="200" step="50"></div>
     <div class="limit-field"><label>Conta come</label><input type="number" value="1" min="1" max="3" style="width:55px"></div>
     <button class="btn btn-danger btn-sm">🗑</button>
   </div>
   <div class="limit-row">
     <span class="limit-col-letter">C</span><span class="limit-col-name">Reperibilità</span>
-    <div class="limit-field"><label>Min/mese</label><input type="number" value="0"></div>
-    <div class="limit-field"><label>Max/mese</label><input type="number" value="8"></div>
+    <div class="limit-field"><label>Quota mensile (default)</label><input type="number" placeholder="auto" style="width:65px"></div>
     <div class="limit-field"><label>Spacing (gg)</label><input type="number" value="0"></div>
-    <div class="limit-field"><label>Balance</label><input type="number" value="200" step="50"></div>
     <div class="limit-field"><label>Conta come</label><input type="number" value="1" min="1" max="3" style="width:55px"></div>
     <button class="btn btn-danger btn-sm">🗑</button>
   </div>
   <button class="btn btn-secondary" style="margin-top:12px" onclick="showToast('Aggiungi colonna: selezionane una dalla lista')">➕ Aggiungi colonna</button>
 
-  <div class="section-title">Override quota per singolo medico</div>
-  <p class="note" style="margin-bottom:10px">Qualsiasi medico può avere min/max personalizzati su qualsiasi colonna. Sovrascrivono i valori globali sopra.</p>
+  <div class="section-title">Override per singolo medico</div>
+  <p class="note" style="margin-bottom:10px">Sovrascrive la quota mensile o le notti weekend per uno specifico medico. Valido per qualsiasi medico, non solo universitari.</p>
 
   <table style="margin-bottom:10px">
     <thead>
-      <tr><th>Medico</th><th>Colonna</th><th>Min/mese</th><th>Max/mese</th><th></th></tr>
+      <tr><th>Medico</th><th>Colonna</th><th>Quota mensile</th><th>Notti weekend</th><th></th></tr>
     </thead>
     <tbody>
       <tr>
         <td><strong>Licordari</strong></td>
         <td><span class="chip">J</span> Notte</td>
-        <td><input type="number" value="3" min="0" max="20" style="width:55px"></td>
-        <td><input type="number" value="4" min="0" max="30" style="width:55px"></td>
+        <td><input type="number" value="3" min="1" max="20" style="width:55px" title="3 invece del default 2"></td>
+        <td><span class="badge-gray">–</span></td>
         <td><button class="btn btn-danger btn-sm" onclick="showToast('Override Licordari·J rimosso')">🗑</button></td>
       </tr>
       <tr>
         <td><strong>Colarusso</strong></td>
         <td><span class="chip">J</span> Notte</td>
-        <td><input type="number" value="3" min="0" max="20" style="width:55px"></td>
-        <td><input type="number" value="4" min="0" max="30" style="width:55px"></td>
+        <td><input type="number" value="3" min="1" max="20" style="width:55px"></td>
+        <td><span class="badge-gray">–</span></td>
         <td><button class="btn btn-danger btn-sm" onclick="showToast('Override Colarusso·J rimosso')">🗑</button></td>
       </tr>
       <tr>
         <td><strong>Zito</strong></td>
         <td><span class="chip">J</span> Notte</td>
-        <td><input type="number" value="1" min="0" max="20" style="width:55px"></td>
-        <td><input type="number" value="2" min="0" max="30" style="width:55px"></td>
+        <td><input type="number" value="1" min="1" max="20" style="width:55px" title="Universitario: quota ridotta dal ratio"></td>
+        <td><span class="badge-gray">–</span></td>
         <td><button class="btn btn-danger btn-sm" onclick="showToast('Override Zito·J rimosso')">🗑</button></td>
       </tr>
       <tr>
         <td><strong>Calabrò</strong></td>
         <td><span class="chip">J</span> Notte</td>
-        <td colspan="2" style="color:#888;font-size:.82rem">
-          Notti weekend: <span class="badge-off">❌ escluso sab/dom</span>
-        </td>
+        <td><span class="badge-gray">– (default)</span></td>
+        <td><span class="badge-off">❌ escluso sab/dom</span></td>
         <td><button class="btn btn-danger btn-sm" onclick="showToast('Override Calabrò·J rimosso')">🗑</button></td>
       </tr>
     </tbody>

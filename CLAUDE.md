@@ -183,7 +183,7 @@ starttls = true
       "excluded_from_reperibilita": false,
       "university_doctor": null,
       "column_overrides": {
-        "J": { "quota_min": 2, "quota_max": 4 }
+        "J": { "monthly_target": 3 }
       }
     },
     "Zito": {
@@ -215,10 +215,12 @@ starttls = true
     }
   },
   "column_settings": {
-    "J": { "quota_min": 1, "quota_max": 6, "spacing_min_days": 5, "balance_weight": 300, "counts_as": 2 },
-    "D": { "quota_min": 0, "quota_max": 5, "spacing_min_days": 0, "balance_weight": 200, "counts_as": 1 }
+    "J": { "monthly_target": 2, "spacing_min_days": 5, "balance_weight": 300, "counts_as": 2 },
+    "D": { "monthly_target": null, "spacing_min_days": 0, "balance_weight": 200, "counts_as": 1 },
+    "C": { "monthly_target": null, "spacing_min_days": 0, "balance_weight": 200, "counts_as": 1 }
   },
-  "_note_column_overrides": "column_overrides è disponibile per QUALSIASI medico, non solo universitari. Es: Licordari e Colarusso fanno 3 notti invece di 2. weekend_nights:false esclude il medico dalle notti di sabato e domenica (es. Calabrò).",
+  "_note_column_settings": "monthly_target=null significa distribuzione automatica equa senza target fisso. counts_as=2 per J vale per tutti.",
+  "_note_column_overrides": "column_overrides disponibile per QUALSIASI medico. Licordari e Colarusso: J monthly_target=3 (tutti gli altri fanno 2). weekend_nights:false esclude il medico dalle notti di sabato e domenica (es. Calabrò).",
   "service_combinations": [
     {
       "columns": ["K", "T"],
