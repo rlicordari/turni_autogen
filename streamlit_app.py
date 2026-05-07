@@ -299,6 +299,7 @@ def _github_cfg() -> dict:
         "doctor_auth_dir": _get_secret(("GITHUB_DOCTOR_AUTH_DIR",), "data/doctor_auth"),
         "contacts_path": _get_secret(("GITHUB_DOCTOR_CONTACTS_PATH",), "data/doctor_contacts.yml"),
         "availability_path": _get_secret(("GITHUB_AVAIL_PATH",), "data/availability_store.csv"),
+        "pool_config_path": _get_secret(("GITHUB_POOL_CONFIG_PATH",), "data/pool_config.json"),
     }
 
 # ---------------- Shift history helpers ----------------
@@ -1447,6 +1448,51 @@ def save_app_settings_to_github(settings: dict, sha: str | None, message: str):
         message=message,
         text=text,
     )
+
+def load_pool_config_from_github_st() -> tuple[dict, str | None]:
+    """Carica pool_config.json da GitHub. Ritorna ({}, None) se assente."""
+    import pool_config_store as _pcs
+    g = _github_cfg()
+    path = g.get("pool_config_path") or _pcs.POOL_CONFIG_PATH_DEFAULT
+    return _pcs.load_pool_config_from_github(
+        owner=g["owner"],
+        repo=g["repo"],
+        token=g["token"],
+        branch=g.get("branch", "main"),
+        path=path,
+    )
+
+
+def save_pool_config_with_retry(cfg: dict, sha: str | None, max_retries: int = 3) -> tuple[bool, str]:
+    """Salva pool_config su GitHub con retry in caso di conflitto SHA.
+
+    Ritorna (ok: bool, message: str).
+    """
+    import pool_config_store as _pcs
+    g = _github_cfg()
+    path = g.get("pool_config_path") or _pcs.POOL_CONFIG_PATH_DEFAULT
+    current_sha = sha
+    for attempt in range(max_retries):
+        try:
+            _pcs.save_pool_config_to_github(
+                cfg=cfg,
+                owner=g["owner"],
+                repo=g["repo"],
+                token=g["token"],
+                branch=g.get("branch", "main"),
+                sha=current_sha,
+                path=path,
+            )
+            return True, "Configurazione pool salvata."
+        except Exception as e:
+            if _is_sha_conflict_error(e) and attempt < max_retries - 1:
+                # Ricarica SHA aggiornato e riprova
+                fresh, fresh_sha = load_pool_config_from_github_st()
+                current_sha = fresh_sha
+                continue
+            return False, f"Errore salvataggio pool config: {e}"
+    return False, "Impossibile salvare dopo i tentativi massimi."
+
 
 def _audit_path_for_month(mk: str) -> str:
     g = _github_cfg()
@@ -3542,6 +3588,326 @@ else:
 
     st.divider()
 
+    # ── Gestione Pool Medici ──────────────────────────────────────────────────
+    st.markdown("### 🩺 Gestione Pool Medici (avanzato)")
+    st.info(
+        "Configura pool, quote e combinazioni di servizi senza modificare il file YAML. "
+        "Le modifiche vengono salvate su GitHub e applicate alla prossima generazione.",
+        icon="⚙️",
+    )
+
+    _pool_cfg_loaded, _pool_cfg_sha = load_pool_config_from_github_st()
+    _pool_cfg_exists = bool(_pool_cfg_loaded)
+
+    if not _pool_cfg_exists:
+        st.warning("Nessuna configurazione pool trovata su GitHub. Inizializza dal YAML attuale per cominciare.", icon="⚠️")
+        if st.button("🔧 Inizializza da YAML attuale", key="btn_init_pool_cfg"):
+            import pool_config_store as _pcs_init
+            _migrated = _pcs_init.migrate_from_yaml(cfg_admin)
+            _ok, _msg = save_pool_config_with_retry(_migrated, None)
+            if _ok:
+                st.success("Configurazione pool inizializzata dal YAML. Ricarica la pagina per modificarla.", icon="✅")
+                st.rerun()
+            else:
+                st.error(_msg)
+    else:
+        # Draft modificabile in session_state (isolato da altri mesi/sessioni)
+        _pool_draft_key = "pool_cfg_draft"
+        if _pool_draft_key not in st.session_state:
+            import copy as _copy_pool
+            st.session_state[_pool_draft_key] = _copy_pool.deepcopy(_pool_cfg_loaded)
+
+        _draft = st.session_state[_pool_draft_key]
+        _draft_doctors: dict = _draft.get("doctors", {})
+        _all_cols = sorted(cfg_admin.get("columns", {}).keys())
+        _all_docs_list = sorted(_draft_doctors.keys(), key=lambda s: (s == "Recupero", s.lower()))
+
+        import pool_config_store as _pcs_ui
+        _tab_med, _tab_col, _tab_lim, _tab_serv = st.tabs(
+            ["👨‍⚕️ Medici", "📋 Colonne", "⚖️ Limiti", "🔗 Servizi"]
+        )
+
+        # ── Tab 1: Medici ─────────────────────────────────────────────────────
+        with _tab_med:
+            st.markdown("**Stato e flag per ogni medico**")
+            import pandas as _pd_pool
+            _med_rows = []
+            for _dname in _all_docs_list:
+                _dc = _draft_doctors[_dname]
+                _med_rows.append({
+                    "Medico": _dname,
+                    "Attivo": bool(_dc.get("active", True)),
+                    "Reperibilità": not bool(_dc.get("excluded_from_reperibilita", False)),
+                    "Festivi diurni": bool(_dc.get("festivi_diurni", True)),
+                    "Festivi notti": bool(_dc.get("festivi_notti", True)),
+                    "Universitario": bool(_dc.get("university_doctor")),
+                    "Ratio uni": float((_dc.get("university_doctor") or {}).get("ratio", 0.6) or 0.6)
+                    if _dc.get("university_doctor") else 0.0,
+                })
+            _med_df = _pd_pool.DataFrame(_med_rows)
+            _edited_med = st.data_editor(
+                _med_df,
+                column_config={
+                    "Medico": st.column_config.TextColumn("Medico", disabled=True),
+                    "Attivo": st.column_config.CheckboxColumn("Attivo"),
+                    "Reperibilità": st.column_config.CheckboxColumn("Reperibilità C"),
+                    "Festivi diurni": st.column_config.CheckboxColumn("Festivi diurni"),
+                    "Festivi notti": st.column_config.CheckboxColumn("Festivi notti"),
+                    "Universitario": st.column_config.CheckboxColumn("Universitario"),
+                    "Ratio uni": st.column_config.NumberColumn("Ratio", min_value=0.0, max_value=1.0, step=0.05, format="%.2f"),
+                },
+                hide_index=True,
+                use_container_width=True,
+                key="pool_med_editor",
+                num_rows="fixed",
+            )
+            # Applica modifiche al draft
+            for _, _row in _edited_med.iterrows():
+                _dn = _row["Medico"]
+                if _dn not in _draft_doctors:
+                    continue
+                _draft_doctors[_dn]["active"] = bool(_row["Attivo"])
+                _draft_doctors[_dn]["excluded_from_reperibilita"] = not bool(_row["Reperibilità"])
+                _draft_doctors[_dn]["festivi_diurni"] = bool(_row["Festivi diurni"])
+                _draft_doctors[_dn]["festivi_notti"] = bool(_row["Festivi notti"])
+                _is_uni = bool(_row["Universitario"])
+                if _is_uni:
+                    _draft_doctors[_dn]["university_doctor"] = {"ratio": float(_row["Ratio uni"] or 0.6)}
+                else:
+                    _draft_doctors[_dn]["university_doctor"] = None
+
+            st.divider()
+            with st.expander("📌 Vincoli strutturali fissi (sola lettura — modificabili solo da YAML)", expanded=False):
+                st.info(
+                    "Questi vincoli sono hardcoded nel YAML e non modificabili da questa GUI:\n\n"
+                    "- **Cimino** esatto 2 turni U al mese\n"
+                    "- **Crea** unico medico per i sabati AB (2/mese)\n"
+                    "- **Allegra** vincolo lunedì V+U (stessa giornata)\n"
+                    "- **De Gregorio** max 3 giorni feriali su I\n"
+                    "- **Grimaldi e Calabrò** esenti dal vincolo 'min 2 weekend liberi/mese'\n"
+                    "- **Pugliatti** fisso martedì su W",
+                    icon="🔒",
+                )
+
+        # ── Tab 2: Colonne ────────────────────────────────────────────────────
+        with _tab_col:
+            _sel_doc = st.selectbox("Seleziona medico", _all_docs_list, key="pool_col_doc_sel")
+            if _sel_doc and _sel_doc in _draft_doctors:
+                _doc_cols = set(_draft_doctors[_sel_doc].get("columns") or [])
+                st.markdown(f"**Colonne assegnate a {_sel_doc}** — clicca per aggiungere/rimuovere")
+                _col_names = cfg_admin.get("columns", {})
+                _cols_per_row = 4
+                _col_items = sorted(_col_names.items())
+                for _ci in range(0, len(_col_items), _cols_per_row):
+                    _chunk = _col_items[_ci:_ci + _cols_per_row]
+                    _gcols = st.columns(len(_chunk))
+                    for _gci, ((_col_letter, _col_name), _gc) in enumerate(zip(_chunk, _gcols)):
+                        _is_on = _col_letter in _doc_cols
+                        _locked = _col_letter == "C"
+                        _label = f"**{_col_letter}** — {_col_name}"
+                        if _locked:
+                            _gc.markdown(f"{'🔵' if _is_on else '⚫'} {_label}  \n*(C gestita da Reperibilità)*")
+                        else:
+                            if _gc.checkbox(f"{_col_letter} · {_col_name}", value=_is_on,
+                                            key=f"pool_col_{_sel_doc}_{_col_letter}"):
+                                _doc_cols.add(_col_letter)
+                            else:
+                                _doc_cols.discard(_col_letter)
+                _draft_doctors[_sel_doc]["columns"] = sorted(_doc_cols)
+
+        # ── Tab 3: Limiti ─────────────────────────────────────────────────────
+        with _tab_lim:
+            # Globali per colonna
+            st.markdown("**Impostazioni globali per colonna**")
+            _col_settings: dict = _draft.setdefault("column_settings", {})
+            _cs_rows = []
+            for _cl in _all_cols:
+                _cs = _col_settings.get(_cl) or {}
+                _cs_rows.append({
+                    "Colonna": _cl,
+                    "Nome": (cfg_admin.get("columns") or {}).get(_cl, ""),
+                    "Target mensile": _cs.get("monthly_target"),
+                    "Spacing min (gg)": int(_cs.get("spacing_min_days", 0) or 0),
+                    "Spacing pref (gg)": int(_cs.get("spacing_preferred_days", 0) or 0),
+                    "Conta come": int(_cs.get("counts_as", 1) if _cl != "C" else 0),
+                })
+            _cs_df = _pd_pool.DataFrame(_cs_rows)
+            _edited_cs = st.data_editor(
+                _cs_df,
+                column_config={
+                    "Colonna": st.column_config.TextColumn("Col", disabled=True),
+                    "Nome": st.column_config.TextColumn("Nome", disabled=True),
+                    "Target mensile": st.column_config.NumberColumn("Target", min_value=0, max_value=31, step=1),
+                    "Spacing min (gg)": st.column_config.NumberColumn("Spacing min", min_value=0, max_value=30, step=1),
+                    "Spacing pref (gg)": st.column_config.NumberColumn("Spacing pref", min_value=0, max_value=30, step=1,
+                                                                        help="Solo per J — soft preference"),
+                    "Conta come": st.column_config.NumberColumn("Conta come", min_value=0, max_value=4, step=1,
+                                                                 help="C=0 (bloccato), J=2, altri=1"),
+                },
+                hide_index=True,
+                use_container_width=True,
+                key="pool_cs_editor",
+                num_rows="fixed",
+            )
+            for _, _row in _edited_cs.iterrows():
+                _cl = _row["Colonna"]
+                _csd = _col_settings.setdefault(_cl, {})
+                _mt = _row["Target mensile"]
+                _csd["monthly_target"] = int(_mt) if _mt is not None and not _pd_pool.isna(_mt) else None
+                _csd["spacing_min_days"] = int(_row["Spacing min (gg)"] or 0)
+                _csd["spacing_preferred_days"] = int(_row["Spacing pref (gg)"] or 0)
+                _csd["counts_as"] = 0 if _cl == "C" else int(_row["Conta come"] or 1)
+
+            st.divider()
+            # Override per medico
+            st.markdown("**Override quota per singolo medico**")
+            _ov_rows = []
+            for _dname, _dc in _draft_doctors.items():
+                for _col, _ov in (_dc.get("column_overrides") or {}).items():
+                    if not isinstance(_ov, dict):
+                        continue
+                    _ov_rows.append({
+                        "Medico": _dname,
+                        "Colonna": _col,
+                        "Quota mensile": _ov.get("monthly_quota"),
+                        "Tipo": _ov.get("quota_type", "fixed"),
+                        "Notti weekend": _ov.get("weekend_nights", True) if _col == "J" else None,
+                    })
+            _ov_df = _pd_pool.DataFrame(_ov_rows) if _ov_rows else _pd_pool.DataFrame(
+                columns=["Medico", "Colonna", "Quota mensile", "Tipo", "Notti weekend"]
+            )
+            _edited_ov = st.data_editor(
+                _ov_df,
+                column_config={
+                    "Medico": st.column_config.SelectboxColumn("Medico", options=_all_docs_list),
+                    "Colonna": st.column_config.SelectboxColumn("Colonna", options=_all_cols),
+                    "Quota mensile": st.column_config.NumberColumn("Quota", min_value=0, max_value=31),
+                    "Tipo": st.column_config.SelectboxColumn("Tipo", options=["fixed", "max", "min"]),
+                    "Notti weekend": st.column_config.CheckboxColumn("Notti weekend (J)", help="Solo per col. J"),
+                },
+                hide_index=True,
+                use_container_width=True,
+                key="pool_ov_editor",
+                num_rows="dynamic",
+            )
+            # Ricostruisce column_overrides da tabella
+            _new_overrides: dict[str, dict] = {}
+            for _, _row in _edited_ov.iterrows():
+                _dname = _row.get("Medico")
+                _col = _row.get("Colonna")
+                if not _dname or not _col or _dname not in _draft_doctors:
+                    continue
+                _ov_entry: dict = {}
+                _mq = _row.get("Quota mensile")
+                if _mq is not None and not _pd_pool.isna(_mq):
+                    _ov_entry["monthly_quota"] = int(_mq)
+                    _ov_entry["quota_type"] = str(_row.get("Tipo") or "fixed")
+                if _col == "J":
+                    _wn = _row.get("Notti weekend")
+                    if _wn is not None and not _pd_pool.isna(_wn):
+                        _ov_entry["weekend_nights"] = bool(_wn)
+                if _ov_entry:
+                    _new_overrides.setdefault(_dname, {})[_col] = _ov_entry
+            # Aggiorna column_overrides di tutti i medici (reset prima)
+            for _dname in _draft_doctors:
+                _draft_doctors[_dname]["column_overrides"] = _new_overrides.get(_dname, {})
+
+        # ── Tab 4: Servizi ────────────────────────────────────────────────────
+        with _tab_serv:
+            st.markdown("**Combinazioni same-day**")
+            _combos: list = _draft.setdefault("service_combinations", [])
+            _combo_rows = [
+                {"Col 1": c["columns"][0], "Col 2": c["columns"][1], "Modalità": c["mode"]}
+                for c in _combos if len(c.get("columns", [])) == 2
+            ]
+            _combo_df = _pd_pool.DataFrame(_combo_rows) if _combo_rows else _pd_pool.DataFrame(
+                columns=["Col 1", "Col 2", "Modalità"]
+            )
+            _edited_combo = st.data_editor(
+                _combo_df,
+                column_config={
+                    "Col 1": st.column_config.SelectboxColumn("Col 1", options=_all_cols),
+                    "Col 2": st.column_config.SelectboxColumn("Col 2", options=_all_cols),
+                    "Modalità": st.column_config.SelectboxColumn("Modalità", options=["always", "fallback", "preferred"]),
+                },
+                hide_index=True,
+                use_container_width=True,
+                key="pool_combo_editor",
+                num_rows="dynamic",
+            )
+            _new_combos = []
+            for _, _row in _edited_combo.iterrows():
+                _c1, _c2, _mode = _row.get("Col 1"), _row.get("Col 2"), _row.get("Modalità")
+                if _c1 and _c2 and _mode:
+                    _new_combos.append({"columns": [str(_c1), str(_c2)], "same_day": True, "mode": str(_mode)})
+            _draft["service_combinations"] = _new_combos
+
+            st.divider()
+            st.markdown("**Servizi critici** — fallback se pool primario esaurito")
+            _critical: dict = _draft.setdefault("critical_services", {})
+            _crit_rows = []
+            for _col, _spec in _critical.items():
+                _fb = _spec.get("fallback", "any")
+                _crit_rows.append({
+                    "Colonna": _col,
+                    "Fallback": "any" if _fb == "any" else ", ".join(_fb),
+                })
+            _crit_df = _pd_pool.DataFrame(_crit_rows) if _crit_rows else _pd_pool.DataFrame(
+                columns=["Colonna", "Fallback"]
+            )
+            _edited_crit = st.data_editor(
+                _crit_df,
+                column_config={
+                    "Colonna": st.column_config.SelectboxColumn("Colonna", options=_all_cols),
+                    "Fallback": st.column_config.TextColumn("Fallback", help="'any' oppure nomi separati da virgola"),
+                },
+                hide_index=True,
+                use_container_width=True,
+                key="pool_crit_editor",
+                num_rows="dynamic",
+            )
+            _new_crit: dict = {}
+            for _, _row in _edited_crit.iterrows():
+                _col = _row.get("Colonna")
+                _fb_raw = str(_row.get("Fallback") or "any").strip()
+                if not _col:
+                    continue
+                if _fb_raw.lower() == "any":
+                    _new_crit[str(_col)] = {"fallback": "any"}
+                else:
+                    _fb_list = [x.strip() for x in _fb_raw.split(",") if x.strip()]
+                    if _fb_list:
+                        _new_crit[str(_col)] = {"fallback": _fb_list}
+            _draft["critical_services"] = _new_crit
+
+        # ── Salvataggio ──────────────────────────────────────────────────────
+        st.divider()
+        _col_save, _col_reset = st.columns([3, 1])
+        with _col_reset:
+            if st.button("↩️ Reset draft", key="btn_pool_reset"):
+                del st.session_state["pool_cfg_draft"]
+                st.rerun()
+        with _col_save:
+            if st.button("💾 Salva configurazione pool", type="primary", key="btn_pool_save"):
+                import copy as _copy_save
+                from datetime import datetime as _dt_save, timezone as _tz_save
+                _to_save = _copy_save.deepcopy(_draft)
+                _to_save["updated_at"] = _dt_save.now(_tz_save.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                _to_save["updated_by"] = "admin"
+                _errs = _pcs_ui.validate_pool_config(_to_save)
+                if _errs:
+                    st.error("Configurazione non valida:\n\n" + "\n".join(f"- {e}" for e in _errs))
+                else:
+                    _ok_save, _msg_save = save_pool_config_with_retry(_to_save, _pool_cfg_sha)
+                    if _ok_save:
+                        st.success(_msg_save, icon="✅")
+                        del st.session_state["pool_cfg_draft"]
+                        st.rerun()
+                    else:
+                        st.error(_msg_save)
+
+    st.divider()
+
     # ── Step 4: Assegnazioni fisse ────────────────────────────────────────────
     st.markdown("### 4) Assegnazioni fisse (opzionale)")
     st.info(
@@ -3898,6 +4264,9 @@ else:
                 _hist_data2, _ = _load_shift_history()
                 _hist_agg_for_solver = sh.aggregate_multi_month(_hist_data2) if _hist_data2 else None
 
+                # Pool config overlay (se presente su GitHub)
+                _pool_cfg_for_solver, _ = load_pool_config_from_github_st()
+
                 stats, log_path = tg.generate_schedule(
                     template_xlsx=template_path,
                     rules_yml=rules_path_use,
@@ -3910,6 +4279,7 @@ else:
                     v_double_overrides=_v_double_overrides_list if _v_double_overrides_list else None,
                     j_blank_week_overrides=_j_blank_week_overrides if _j_blank_week_overrides else None,
                     historical_stats=_hist_agg_for_solver,
+                    pool_config=_pool_cfg_for_solver if _pool_cfg_for_solver else None,
                 )
 
                 status.update(label="Completato ✅", state="complete")
