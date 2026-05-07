@@ -3168,10 +3168,12 @@ else:
 
     # Step 2: Indisponibilità
     st.markdown("### 2) Indisponibilità")
+    if "admin_unav_mode" not in st.session_state:
+        st.session_state["admin_unav_mode"] = "Usa archivio (privacy)"
     unav_mode = st.radio(
         "Fonte indisponibilità",
         ["Nessuna", "Carica file manuale", "Usa archivio (privacy)"],
-        index=2,
+        key="admin_unav_mode",
         horizontal=True,
         help="Puoi caricare un file manuale, oppure usare l’archivio compilato dai medici.",
     )
@@ -3665,7 +3667,7 @@ else:
 
         # ── Tab 1: Medici ─────────────────────────────────────────────────────
         with _tab_med:
-            st.markdown("**Stato e flag per ogni medico**")
+            st.markdown("**Stato e flag per ogni medico** — aggiungi righe con ＋, elimina con ✕")
             import pandas as _pd_pool
             _med_rows = []
             for _dname in _all_docs_list:
@@ -3684,7 +3686,7 @@ else:
             _edited_med = st.data_editor(
                 _med_df,
                 column_config={
-                    "Medico": st.column_config.TextColumn("Medico", disabled=True),
+                    "Medico": st.column_config.TextColumn("Medico", help="Cognome esatto (maiuscola iniziale)"),
                     "Attivo": st.column_config.CheckboxColumn("Attivo"),
                     "Reperibilità": st.column_config.CheckboxColumn("Reperibilità C"),
                     "Festivi diurni": st.column_config.CheckboxColumn("Festivi diurni"),
@@ -3695,13 +3697,23 @@ else:
                 hide_index=True,
                 use_container_width=True,
                 key="pool_med_editor",
-                num_rows="fixed",
+                num_rows="dynamic",
             )
-            # Applica modifiche al draft
+            # Sincronizza il draft: aggiunte, modifiche e rimozioni
+            _edited_names: set[str] = set()
             for _, _row in _edited_med.iterrows():
-                _dn = _row["Medico"]
-                if _dn not in _draft_doctors:
+                _dn = (_row.get("Medico") or "").strip()
+                if not _dn:
                     continue
+                _edited_names.add(_dn)
+                if _dn not in _draft_doctors:
+                    # Nuovo medico: crea entry con valori di default
+                    _draft_doctors[_dn] = {
+                        "active": True, "columns": [],
+                        "festivi_diurni": True, "festivi_notti": True,
+                        "excluded_from_reperibilita": False,
+                        "university_doctor": None, "column_overrides": {},
+                    }
                 _draft_doctors[_dn]["active"] = bool(_row["Attivo"])
                 _draft_doctors[_dn]["excluded_from_reperibilita"] = not bool(_row["Reperibilità"])
                 _draft_doctors[_dn]["festivi_diurni"] = bool(_row["Festivi diurni"])
@@ -3711,6 +3723,10 @@ else:
                     _draft_doctors[_dn]["university_doctor"] = {"ratio": float(_row["Ratio uni"] or 0.6)}
                 else:
                     _draft_doctors[_dn]["university_doctor"] = None
+            # Rimuovi medici eliminati dalla tabella
+            for _dn_old in list(_draft_doctors.keys()):
+                if _dn_old not in _edited_names:
+                    del _draft_doctors[_dn_old]
 
             st.divider()
             with st.expander("📌 Vincoli strutturali fissi (sola lettura — modificabili solo da YAML)", expanded=False):
