@@ -218,10 +218,18 @@ starttls = true
     "J": { "quota_min": 1, "quota_max": 6, "spacing_min_days": 5, "balance_weight": 300, "counts_as": 2 },
     "D": { "quota_min": 0, "quota_max": 5, "spacing_min_days": 0, "balance_weight": 200, "counts_as": 1 }
   },
-  "_note_column_overrides": "column_overrides è disponibile per QUALSIASI medico, non solo universitari. Es: Licordari e Colarusso fanno 3 notti invece di 2.",
+  "_note_column_overrides": "column_overrides è disponibile per QUALSIASI medico, non solo universitari. Es: Licordari e Colarusso fanno 3 notti invece di 2. weekend_nights:false esclude il medico dalle notti di sabato e domenica (es. Calabrò).",
   "service_combinations": [
-    { "columns": ["K", "T"], "same_day": true },
-    { "columns": ["Q", "R"], "same_day": true }
+    {
+      "columns": ["K", "T"],
+      "same_day": true,
+      "mode": "always"
+    },
+    {
+      "columns": ["Q", "R"],
+      "same_day": true,
+      "mode": "fallback"
+    }
   ],
   "critical_services": {
     "J": { "fallback": "any" },
@@ -238,7 +246,11 @@ starttls = true
 - `pool_config.json` viene caricato in `streamlit_app.py` prima della generazione
 - La funzione `apply_pool_config(cfg_yaml, pool_config)` in `turni_generator.py` produce il cfg effettivo
 - Per i servizi critici: il solver riceve un `emergency_pool` per colonna (tutti i medici attivi) usato solo se il pool primario è esaurito
-- Per le combinazioni same-day: il meccanismo `df_pair` viene generalizzato a `service_pairs` con lista configurabile
+- Per le combinazioni same-day: il meccanismo `df_pair` viene generalizzato a `service_pairs` con tre modalità:
+  - `always`: vincolo HARD — stesso medico obbligatorio per entrambe le colonne nello stesso giorno
+  - `fallback`: vincolo SOFT ad alta penalità — il solver preferisce medici separati, li accoppia solo se pool esaurito (comportamento attuale di `enable_kt_share` in `relief_valves`)
+  - `preferred`: vincolo SOFT a bassa penalità — il solver preferisce accoppiarli ma non è obbligatorio
+- Per `weekend_nights: false` in `column_overrides.J`: il medico viene escluso dal pool J nei giorni sabato e domenica (sostituisce `weekend_excluded_doctors` hardcoded nel YAML)
 
 ### File coinvolti
 | File | Modifica |

@@ -294,6 +294,14 @@ label { font-size:0.82rem; color:#888; }
         <td><input type="number" value="2" min="0" max="30" style="width:55px"></td>
         <td><button class="btn btn-danger btn-sm" onclick="showToast('Override Zito·J rimosso')">🗑</button></td>
       </tr>
+      <tr>
+        <td><strong>Calabrò</strong></td>
+        <td><span class="chip">J</span> Notte</td>
+        <td colspan="2" style="color:#888;font-size:.82rem">
+          Notti weekend: <span class="badge-off">❌ escluso sab/dom</span>
+        </td>
+        <td><button class="btn btn-danger btn-sm" onclick="showToast('Override Calabrò·J rimosso')">🗑</button></td>
+      </tr>
     </tbody>
   </table>
 
@@ -309,38 +317,84 @@ label { font-size:0.82rem; color:#888; }
     </div>
     <div class="field-group">
       <label>Colonna</label>
-      <select id="override-col">
+      <select id="override-col" onchange="toggleWeekendNightsRow()">
         <option>J – Notte</option><option>D – UTIC mattina</option><option>E – Cardio mattina</option>
         <option>C – Reperibilità</option><option>H – UTIC pomeriggio</option>
       </select>
     </div>
     <div class="limit-field"><label>Min</label><input type="number" value="0" min="0" max="20" style="width:55px"></div>
     <div class="limit-field"><label>Max</label><input type="number" value="5" min="0" max="30" style="width:55px"></div>
+    <div class="field-group" id="weekend-nights-field">
+      <label>Notti weekend</label>
+      <select id="override-weekend" style="width:120px">
+        <option value="true">✅ Sì</option>
+        <option value="false">❌ No (escluso sab/dom)</option>
+      </select>
+    </div>
     <button class="btn btn-primary btn-sm" onclick="showToast('Override aggiunto — premi Salva configurazione in fondo per persistere')">➕ Aggiungi override</button>
   </div>
+  <p class="note" style="margin-top:8px">⚠️ Il campo <strong>Notti weekend</strong> appare solo per la colonna J. Con "No" il medico è escluso dalle notti di sabato e domenica.</p>
 </div>
 
 <!-- TAB SERVIZI -->
 <div class="tab-content" id="tab-servizi">
   <div class="section-title">Combinazioni same-day</div>
   <p class="note" style="margin-bottom:12px">Lo stesso medico copre entrambi i servizi nello stesso giorno.</p>
-  <div class="service-row">
-    <span class="service-tag">K</span><span style="color:#666">+</span><span class="service-tag">T</span>
-    <div class="spacer"></div>
-    <span class="note">Letto + Interni</span>
-    <button class="btn btn-danger btn-sm" onclick="showToast('Combinazione K+T rimossa')">🗑</button>
-  </div>
-  <div class="service-row">
-    <span class="service-tag">Q</span><span style="color:#666">+</span><span class="service-tag">R</span>
-    <div class="spacer"></div>
-    <span class="note">ECO base + ECOSTRESS</span>
-    <button class="btn btn-danger btn-sm" onclick="showToast('Combinazione Q+R rimossa')">🗑</button>
-  </div>
-  <div class="row" style="margin-top:10px;gap:8px">
-    <select style="width:90px"><option>K</option><option>Q</option><option>D</option><option>L</option></select>
-    <span style="color:#666">+</span>
-    <select style="width:90px"><option>T</option><option>R</option><option>H</option><option>I</option></select>
-    <button class="btn btn-secondary btn-sm" onclick="showToast('Combinazione aggiunta')">➕ Aggiungi</button>
+  <table style="margin-bottom:10px">
+    <thead>
+      <tr><th>Colonne</th><th>Descrizione</th><th>Modalità</th><th></th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><span class="service-tag">K</span> + <span class="service-tag">T</span></td>
+        <td class="note">Letto + Interni</td>
+        <td>
+          <select style="font-size:.82rem">
+            <option selected>🔒 Sempre (vincolo fisso)</option>
+            <option>⚠️ Solo se pool esaurito</option>
+            <option>💡 Preferito (soft)</option>
+          </select>
+        </td>
+        <td><button class="btn btn-danger btn-sm" onclick="showToast('Combinazione K+T rimossa')">🗑</button></td>
+      </tr>
+      <tr>
+        <td><span class="service-tag">Q</span> + <span class="service-tag">R</span></td>
+        <td class="note">ECO base + ECOSTRESS</td>
+        <td>
+          <select style="font-size:.82rem">
+            <option>🔒 Sempre (vincolo fisso)</option>
+            <option selected>⚠️ Solo se pool esaurito</option>
+            <option>💡 Preferito (soft)</option>
+          </select>
+        </td>
+        <td><button class="btn btn-danger btn-sm" onclick="showToast('Combinazione Q+R rimossa')">🗑</button></td>
+      </tr>
+    </tbody>
+  </table>
+  <p class="note" style="margin-bottom:10px">
+    🔒 <strong>Sempre</strong>: vincolo obbligatorio, lo stesso medico fa entrambi ogni giorno ·
+    ⚠️ <strong>Solo se pool esaurito</strong>: come ora (relief valve) ·
+    💡 <strong>Preferito</strong>: il solver tende ad accoppiarli ma può separarli
+  </p>
+  <div class="row" style="margin-top:10px;gap:8px;flex-wrap:wrap;align-items:flex-end">
+    <div class="field-group">
+      <label>Colonna A</label>
+      <select style="width:90px"><option>K</option><option>Q</option><option>D</option><option>L</option></select>
+    </div>
+    <span style="color:#666;align-self:flex-end;padding-bottom:6px">+</span>
+    <div class="field-group">
+      <label>Colonna B</label>
+      <select style="width:90px"><option>T</option><option>R</option><option>H</option><option>I</option></select>
+    </div>
+    <div class="field-group">
+      <label>Modalità</label>
+      <select style="width:180px">
+        <option>🔒 Sempre (vincolo fisso)</option>
+        <option selected>⚠️ Solo se pool esaurito</option>
+        <option>💡 Preferito (soft)</option>
+      </select>
+    </div>
+    <button class="btn btn-secondary btn-sm" style="align-self:flex-end" onclick="showToast('Combinazione aggiunta')">➕ Aggiungi</button>
   </div>
 
   <div class="section-title" style="margin-top:22px">Servizi critici (mai scoperti)</div>
@@ -503,6 +557,15 @@ function showToast(msg) {
 }
 
 renderColGrid();
+
+function toggleWeekendNightsRow() {
+  var col = document.getElementById('override-col');
+  var field = document.getElementById('weekend-nights-field');
+  if (col && field) {
+    field.style.display = (col.value.indexOf('J') === 0) ? 'flex' : 'none';
+  }
+}
+toggleWeekendNightsRow();
 </script>
 </body>
 </html>
