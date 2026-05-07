@@ -3064,10 +3064,11 @@ else:
                         app_settings_sha,
                         message=f"Update settings: open={bool(new_open)} max_unav={int(new_max)} max_avail={int(new_max_avail)} max_weekend={int(new_max_weekend)}",
                     )
-                    st.success("Impostazioni salvate ✅")
+                    st.session_state["_cfg_flash"] = ("success", "Impostazioni salvate ✅")
                     st.rerun()
                 except Exception as e:
-                    st.error(f"Errore salvataggio impostazioni su GitHub: {e}")
+                    st.session_state["_cfg_flash"] = ("error", f"Errore salvataggio impostazioni su GitHub: {e}")
+                    st.rerun()
 
         # ── Gestione Pool Medici ──────────────────────────────────────────
         with st.expander("🩺 Gestione Pool Medici", expanded=False):
