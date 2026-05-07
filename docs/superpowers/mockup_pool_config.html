@@ -1,0 +1,466 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="UTF-8">
+<title>Mockup — Gestione Pool Medici</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: 'Segoe UI', Arial, sans-serif; background: #0e1117; color: #fafafa; padding: 20px; }
+h1 { color: #fff; font-size: 1.4rem; margin-bottom: 4px; }
+.subtitle { color: #888; font-size: 0.85rem; margin-bottom: 20px; }
+.tabs { display: flex; gap: 4px; border-bottom: 2px solid #262730; }
+.tab { padding: 10px 20px; cursor: pointer; border-radius: 6px 6px 0 0; font-size: 0.9rem;
+       color: #888; background: #1a1d27; border: 1px solid transparent; border-bottom: none; }
+.tab:hover { color: #fff; background: #262730; }
+.tab.active { color: #fff; background: #262730; border-color: #3d4060; font-weight: 600; }
+.panel { background: #1a1d27; border: 1px solid #262730; border-top: none;
+         border-radius: 0 6px 6px 6px; padding: 20px; min-height: 380px; }
+.tab-content { display: none; }
+.tab-content.active { display: block; }
+table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
+th { text-align: left; padding: 8px 12px; color: #888; font-weight: 500;
+     border-bottom: 1px solid #262730; font-size: 0.8rem; text-transform: uppercase; }
+td { padding: 9px 12px; border-bottom: 1px solid #1e2030; vertical-align: middle; }
+tr:last-child td { border-bottom: none; }
+tr.doctor-row:hover td { background: #20243a; cursor: pointer; }
+.badge-on  { background:#1c4a2e; color:#4ade80; border-radius:4px; padding:2px 8px; font-size:.78rem; display:inline-block; }
+.badge-off { background:#2e1c1c; color:#f87171; border-radius:4px; padding:2px 8px; font-size:.78rem; display:inline-block; }
+.badge-uni { background:#1c2e4a; color:#60a5fa; border-radius:4px; padding:2px 8px; font-size:.78rem; display:inline-block; }
+.badge-gray{ background:#2a2a2a; color:#666; border-radius:4px; padding:2px 8px; font-size:.78rem; display:inline-block; }
+.chip { background:#1c2e4a; color:#60a5fa; border-radius:12px; padding:2px 9px; font-size:0.75rem; margin:2px; display:inline-block; }
+.chip-red { background:#2e1a1a; color:#f87171; border-radius:12px; padding:2px 9px; font-size:0.75rem; margin:2px; display:inline-block; }
+.btn { display:inline-flex; align-items:center; gap:6px; padding:7px 14px; border-radius:6px;
+       border:none; cursor:pointer; font-size:0.85rem; font-weight:500; }
+.btn-primary { background:#ff4b4b; color:#fff; }
+.btn-primary:hover { background:#ff6b6b; }
+.btn-secondary { background:#262730; color:#ccc; border:1px solid #3d4060; }
+.btn-secondary:hover { background:#2e3044; color:#fff; }
+.btn-sm { padding:4px 9px; font-size:0.78rem; }
+.btn-danger { background:#3d1c1c; color:#f87171; border:1px solid #7f1d1d; }
+select, input[type=number], input[type=text] {
+  background:#0e1117; color:#fafafa; border:1px solid #3d4060; border-radius:5px;
+  padding:5px 9px; font-size:0.85rem; }
+label { font-size:0.82rem; color:#888; }
+.row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+.spacer { flex:1; }
+.section-title { font-size:0.82rem; text-transform:uppercase; letter-spacing:.08em;
+                 color:#666; margin:18px 0 10px; border-bottom:1px solid #262730; padding-bottom:6px; }
+.note { font-size:0.78rem; color:#666; }
+.save-bar { display:flex; align-items:center; gap:12px; margin-top:22px;
+            padding:14px 18px; background:#1e2030; border-radius:8px; border:1px solid #262730; }
+.detail-panel { background:#20243a; border:1px solid #2e3250; border-radius:8px; padding:16px; margin-top:14px; }
+.detail-grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-top:10px; }
+.field-group { display:flex; flex-direction:column; gap:4px; }
+.col-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(200px,1fr)); gap:10px; margin-top:14px; }
+.col-card { background:#20243a; border:1px solid #2e3250; border-radius:8px; padding:11px 14px;
+            display:flex; align-items:center; gap:10px; cursor:pointer; }
+.col-card:hover { border-color:#4c5285; }
+.col-card.on { border-color:#ff4b4b; background:#2e1a1a; }
+.col-letter { font-size:1.1rem; font-weight:700; color:#ff4b4b; min-width:28px; }
+.col-name { font-size:0.82rem; color:#ccc; flex:1; }
+.toggle { width:34px; height:20px; border-radius:10px; position:relative; flex-shrink:0; }
+.toggle.on { background:#ff4b4b; }
+.toggle.off { background:#3d4060; }
+.toggle-dot { position:absolute; top:3px; width:14px; height:14px; border-radius:50%; background:#fff; }
+.toggle.on .toggle-dot { left:17px; }
+.toggle.off .toggle-dot { left:3px; }
+.limit-row { display:flex; align-items:center; gap:10px; padding:10px 0; border-bottom:1px solid #1e2030; flex-wrap:wrap; }
+.limit-row:last-child { border-bottom:none; }
+.limit-col-letter { font-weight:700; color:#ff4b4b; min-width:28px; font-size:1rem; }
+.limit-col-name { color:#ccc; font-size:0.82rem; min-width:130px; }
+.limit-field { display:flex; flex-direction:column; gap:2px; }
+.limit-field label { font-size:0.72rem; color:#666; }
+.limit-field input { width:64px; }
+.service-row { display:flex; align-items:center; gap:10px; padding:10px 0; border-bottom:1px solid #1e2030; flex-wrap:wrap; }
+.service-row:last-child { border-bottom:none; }
+.service-tag { background:#20243a; border:1px solid #3d4060; border-radius:5px;
+               padding:3px 10px; font-size:0.85rem; color:#60a5fa; font-weight:600; }
+.critical-row { display:flex; align-items:center; gap:10px; padding:10px 0; border-bottom:1px solid #1e2030; flex-wrap:wrap; }
+.critical-row:last-child { border-bottom:none; }
+.critical-badge { background:#2e1a00; color:#fb923c; border:1px solid #92400e;
+                  border-radius:5px; padding:3px 10px; font-size:0.85rem; font-weight:600; min-width:36px; text-align:center; }
+.tag-area { display:flex; flex-wrap:wrap; gap:4px; padding:5px; background:#0e1117;
+            border:1px solid #3d4060; border-radius:5px; min-height:32px; align-items:center; }
+#toast { display:none; position:fixed; bottom:30px; right:30px; background:#1c4a2e; color:#4ade80;
+         padding:12px 20px; border-radius:8px; border:1px solid #4ade80; font-size:.88rem; z-index:999; }
+</style>
+</head>
+<body>
+
+<h1>🏥 Gestione Pool Medici</h1>
+<p class="subtitle">Configurazione pool, limiti, combinazioni e servizi critici · Admin only</p>
+
+<div class="tabs">
+  <div class="tab active" id="tab-btn-medici" onclick="showTab('medici')">👨‍⚕️ Medici</div>
+  <div class="tab" id="tab-btn-colonne" onclick="showTab('colonne')">📋 Colonne</div>
+  <div class="tab" id="tab-btn-limiti" onclick="showTab('limiti')">⚖️ Limiti</div>
+  <div class="tab" id="tab-btn-servizi" onclick="showTab('servizi')">🔗 Servizi</div>
+</div>
+
+<div class="panel">
+
+<!-- TAB MEDICI -->
+<div class="tab-content active" id="tab-medici">
+  <div class="row" style="margin-bottom:14px">
+    <button class="btn btn-primary" onclick="showToast('Aggiungi medico: inserisci nome e configura le colonne nel tab Colonne')">➕ Aggiungi medico</button>
+    <div class="spacer"></div>
+    <span class="note">Clicca un medico per vedere i dettagli</span>
+  </div>
+  <table>
+    <thead>
+      <tr>
+        <th>Medico</th><th>Attivo</th><th>Reperibilità</th>
+        <th>Fest. Diurni</th><th>Fest. Notti</th><th>Università</th><th>Colonne</th><th></th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr class="doctor-row" onclick="openDetail('Licordari','✅','✅','✅','✅','–','D E J K T Q')">
+        <td><strong>Licordari</strong></td>
+        <td><span class="badge-on">✅ Attivo</span></td>
+        <td><span class="badge-on">✅</span></td>
+        <td><span class="badge-on">✅</span></td>
+        <td><span class="badge-on">✅</span></td>
+        <td><span class="badge-gray">–</span></td>
+        <td><span class="chip">D</span><span class="chip">E</span><span class="chip">J</span><span class="chip">K</span><span class="chip">T</span><span class="chip">Q</span></td>
+        <td><button class="btn btn-danger btn-sm" onclick="event.stopPropagation();showToast('Licordari impostato come inattivo')">🗑</button></td>
+      </tr>
+      <tr class="doctor-row" onclick="openDetail('Allegra','✅','✅','✅','✅','–','D E J H I')">
+        <td><strong>Allegra</strong></td>
+        <td><span class="badge-on">✅ Attivo</span></td>
+        <td><span class="badge-on">✅</span></td>
+        <td><span class="badge-on">✅</span></td>
+        <td><span class="badge-on">✅</span></td>
+        <td><span class="badge-gray">–</span></td>
+        <td><span class="chip">D</span><span class="chip">E</span><span class="chip">J</span><span class="chip">H</span><span class="chip">I</span></td>
+        <td><button class="btn btn-danger btn-sm" onclick="event.stopPropagation();showToast('Allegra impostato come inattivo')">🗑</button></td>
+      </tr>
+      <tr class="doctor-row" onclick="openDetail('Zito','✅','❌','❌','❌','🎓 ratio 0.6','D E J')">
+        <td><strong>Zito</strong></td>
+        <td><span class="badge-on">✅ Attivo</span></td>
+        <td><span class="badge-off">❌</span></td>
+        <td><span class="badge-off">❌</span></td>
+        <td><span class="badge-off">❌</span></td>
+        <td><span class="badge-uni">🎓 ratio 0.6</span></td>
+        <td><span class="chip">D</span><span class="chip">E</span><span class="chip">J</span></td>
+        <td><button class="btn btn-danger btn-sm" onclick="event.stopPropagation()">🗑</button></td>
+      </tr>
+      <tr class="doctor-row" onclick="openDetail('De Gregorio','✅','✅','✅','❌','🎓 ratio 0.6','D E H I')">
+        <td><strong>De Gregorio</strong></td>
+        <td><span class="badge-on">✅ Attivo</span></td>
+        <td><span class="badge-on">✅</span></td>
+        <td><span class="badge-on">✅</span></td>
+        <td><span class="badge-off">❌</span></td>
+        <td><span class="badge-uni">🎓 ratio 0.6</span></td>
+        <td><span class="chip">D</span><span class="chip">E</span><span class="chip">H</span><span class="chip">I</span><span style="color:#555;font-size:.75rem"> (no J)</span></td>
+        <td><button class="btn btn-danger btn-sm" onclick="event.stopPropagation()">🗑</button></td>
+      </tr>
+      <tr class="doctor-row" onclick="openDetail('Grimaldi','✅','❌','❌','❌','–','D F')">
+        <td><strong>Grimaldi</strong></td>
+        <td><span class="badge-on">✅ Attivo</span></td>
+        <td><span class="badge-off">❌</span></td>
+        <td><span class="badge-off">❌</span></td>
+        <td><span class="badge-off">❌</span></td>
+        <td><span class="badge-gray">–</span></td>
+        <td><span class="chip">D</span><span class="chip">F</span></td>
+        <td><button class="btn btn-danger btn-sm" onclick="event.stopPropagation()">🗑</button></td>
+      </tr>
+      <tr class="doctor-row" onclick="openDetail('De Luca','❌','–','–','–','–','nessuna')">
+        <td><strong style="color:#555">De Luca</strong></td>
+        <td><span class="badge-off">❌ Inattivo</span></td>
+        <td><span class="badge-gray">–</span></td>
+        <td><span class="badge-gray">–</span></td>
+        <td><span class="badge-gray">–</span></td>
+        <td><span class="badge-gray">–</span></td>
+        <td><span style="color:#444;font-size:.8rem">nessuna</span></td>
+        <td><button class="btn btn-danger btn-sm" onclick="event.stopPropagation()">🗑</button></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="detail-panel" id="detail-panel" style="display:none">
+    <div class="row">
+      <strong id="detail-name" style="font-size:1rem"></strong>
+      <div class="spacer"></div>
+      <button class="btn btn-secondary btn-sm" onclick="document.getElementById('detail-panel').style.display='none'">✖ Chiudi</button>
+    </div>
+    <div class="detail-grid" style="margin-top:12px">
+      <div class="field-group">
+        <label>Attivo nel sistema</label>
+        <select id="d-active"><option>✅ Sì</option><option>❌ No</option></select>
+      </div>
+      <div class="field-group">
+        <label>Reperibilità (C)</label>
+        <select id="d-rep"><option>✅ Sì</option><option>❌ Escluso</option></select>
+      </div>
+      <div class="field-group">
+        <label>Festivi diurni (D/E/H/I)</label>
+        <select id="d-festd"><option>✅ Sì</option><option>❌ No</option></select>
+      </div>
+      <div class="field-group">
+        <label>Festivi notturni (J nei festivi)</label>
+        <select id="d-festn"><option>✅ Sì</option><option>❌ No</option></select>
+      </div>
+      <div class="field-group">
+        <label>Medico universitario</label>
+        <select id="d-uni" onchange="document.getElementById('d-ratio-group').style.display=this.selectedIndex>0?'flex':'none'">
+          <option>– No (ospedaliero)</option><option>🎓 Sì (universitario)</option>
+        </select>
+      </div>
+      <div class="field-group" id="d-ratio-group" style="display:none">
+        <label>Ratio universitario (0–1)</label>
+        <input type="number" id="d-ratio" value="0.6" min="0" max="1" step="0.05" style="width:80px">
+        <span class="note">es. 0.6 = 60% dei turni rispetto agli ospedalieri</span>
+      </div>
+    </div>
+    <div style="margin-top:12px">
+      <button class="btn btn-primary btn-sm" onclick="showToast('Modifiche medico salvate (buffer locale — premi Salva configurazione in fondo)')">💾 Applica modifiche</button>
+    </div>
+  </div>
+</div>
+
+<!-- TAB COLONNE -->
+<div class="tab-content" id="tab-colonne">
+  <div class="row" style="margin-bottom:4px">
+    <label style="color:#ccc">Medico:</label>
+    <select id="col-select" onchange="renderColGrid()">
+      <option>Licordari</option><option>Allegra</option><option>Zito</option>
+      <option>Grimaldi</option><option>Cusmà</option><option>Cimino</option><option>Pugliatti</option>
+    </select>
+    <div class="spacer"></div>
+    <span class="note">Clicca per aggiungere/rimuovere la colonna dal pool del medico</span>
+  </div>
+  <div class="col-grid" id="col-grid"></div>
+</div>
+
+<!-- TAB LIMITI -->
+<div class="tab-content" id="tab-limiti">
+  <div class="section-title">Quote globali per colonna</div>
+  <p class="note" style="margin-bottom:10px">⚠️ <strong>Conta come</strong> = peso del turno nel conteggio quote mensili. J vale 2 per tutti (ospedalieri e universitari).</p>
+  <div class="limit-row">
+    <span class="limit-col-letter">J</span><span class="limit-col-name">Notte</span>
+    <div class="limit-field"><label>Min/mese</label><input type="number" value="1" min="0" max="20"></div>
+    <div class="limit-field"><label>Max/mese</label><input type="number" value="6" min="0" max="30"></div>
+    <div class="limit-field"><label>Spacing (gg)</label><input type="number" value="5" min="0" max="14"></div>
+    <div class="limit-field"><label>Balance</label><input type="number" value="300" min="0" step="50"></div>
+    <div class="limit-field"><label>Conta come</label><input type="number" value="2" min="1" max="3" style="width:55px" title="J vale 2 turni per tutti"></div>
+    <button class="btn btn-danger btn-sm">🗑</button>
+  </div>
+  <div class="limit-row">
+    <span class="limit-col-letter">D</span><span class="limit-col-name">UTIC mattina</span>
+    <div class="limit-field"><label>Min/mese</label><input type="number" value="0"></div>
+    <div class="limit-field"><label>Max/mese</label><input type="number" value="5"></div>
+    <div class="limit-field"><label>Spacing (gg)</label><input type="number" value="0"></div>
+    <div class="limit-field"><label>Balance</label><input type="number" value="200" step="50"></div>
+    <div class="limit-field"><label>Conta come</label><input type="number" value="1" min="1" max="3" style="width:55px"></div>
+    <button class="btn btn-danger btn-sm">🗑</button>
+  </div>
+  <div class="limit-row">
+    <span class="limit-col-letter">C</span><span class="limit-col-name">Reperibilità</span>
+    <div class="limit-field"><label>Min/mese</label><input type="number" value="0"></div>
+    <div class="limit-field"><label>Max/mese</label><input type="number" value="8"></div>
+    <div class="limit-field"><label>Spacing (gg)</label><input type="number" value="0"></div>
+    <div class="limit-field"><label>Balance</label><input type="number" value="200" step="50"></div>
+    <div class="limit-field"><label>Conta come</label><input type="number" value="1" min="1" max="3" style="width:55px"></div>
+    <button class="btn btn-danger btn-sm">🗑</button>
+  </div>
+  <button class="btn btn-secondary" style="margin-top:12px" onclick="showToast('Aggiungi colonna: selezionane una dalla lista')">➕ Aggiungi colonna</button>
+
+  <div class="section-title">Override per singolo medico</div>
+  <div class="row" style="margin-bottom:10px;gap:8px">
+    <label style="color:#ccc">Medico:</label>
+    <select><option>Zito</option><option>Dattilo</option><option>De Gregorio</option></select>
+    <label style="color:#ccc">Colonna:</label>
+    <select><option>J – Notte</option><option>D – UTIC mattina</option></select>
+    <div class="limit-field"><label>Min</label><input type="number" value="2" style="width:55px"></div>
+    <div class="limit-field"><label>Max</label><input type="number" value="3" style="width:55px"></div>
+    <button class="btn btn-primary btn-sm" onclick="showToast('Override salvato nel buffer locale')">Salva override</button>
+  </div>
+  <p class="note">Override attivi: <span class="chip">Zito · J · 2–3</span> <span class="chip">De Gregorio · J · 1–4</span></p>
+</div>
+
+<!-- TAB SERVIZI -->
+<div class="tab-content" id="tab-servizi">
+  <div class="section-title">Combinazioni same-day</div>
+  <p class="note" style="margin-bottom:12px">Lo stesso medico copre entrambi i servizi nello stesso giorno.</p>
+  <div class="service-row">
+    <span class="service-tag">K</span><span style="color:#666">+</span><span class="service-tag">T</span>
+    <div class="spacer"></div>
+    <span class="note">Letto + Interni</span>
+    <button class="btn btn-danger btn-sm" onclick="showToast('Combinazione K+T rimossa')">🗑</button>
+  </div>
+  <div class="service-row">
+    <span class="service-tag">Q</span><span style="color:#666">+</span><span class="service-tag">R</span>
+    <div class="spacer"></div>
+    <span class="note">ECO base + ECOSTRESS</span>
+    <button class="btn btn-danger btn-sm" onclick="showToast('Combinazione Q+R rimossa')">🗑</button>
+  </div>
+  <div class="row" style="margin-top:10px;gap:8px">
+    <select style="width:90px"><option>K</option><option>Q</option><option>D</option><option>L</option></select>
+    <span style="color:#666">+</span>
+    <select style="width:90px"><option>T</option><option>R</option><option>H</option><option>I</option></select>
+    <button class="btn btn-secondary btn-sm" onclick="showToast('Combinazione aggiunta')">➕ Aggiungi</button>
+  </div>
+
+  <div class="section-title" style="margin-top:22px">Servizi critici (mai scoperti)</div>
+  <p class="note" style="margin-bottom:12px">Prima il pool normale; se esaurito, qualsiasi medico attivo compatibile.</p>
+  <div class="critical-row">
+    <span class="critical-badge">J</span><span class="note">Notte</span>
+    <div class="spacer"></div>
+    <label style="color:#888;font-size:.8rem">Fallback:</label>
+    <select style="font-size:.82rem"><option>Qualsiasi medico attivo</option><option>Pool personalizzato</option></select>
+    <button class="btn btn-danger btn-sm" onclick="showToast('J rimosso dai servizi critici')">🗑</button>
+  </div>
+  <div class="critical-row">
+    <span class="critical-badge">D</span><span class="note">UTIC mattina</span>
+    <div class="spacer"></div>
+    <label style="color:#888;font-size:.8rem">Fallback:</label>
+    <select style="font-size:.82rem"><option>Qualsiasi medico attivo</option><option>Pool personalizzato</option></select>
+    <button class="btn btn-danger btn-sm">🗑</button>
+  </div>
+  <div class="critical-row">
+    <span class="critical-badge">H</span><span class="note">UTIC pomeriggio</span>
+    <div class="spacer"></div>
+    <label style="color:#888;font-size:.8rem">Fallback:</label>
+    <select style="font-size:.82rem"><option>Pool personalizzato</option><option>Qualsiasi medico attivo</option></select>
+    <div class="tag-area">
+      <span class="chip-red">Licordari ✖</span><span class="chip-red">Allegra ✖</span>
+      <span style="font-size:.75rem;color:#666">+ aggiungi</span>
+    </div>
+    <button class="btn btn-danger btn-sm">🗑</button>
+  </div>
+  <div class="row" style="margin-top:10px;gap:8px">
+    <select style="width:160px"><option>E – Cardio mattina</option><option>H – UTIC pom</option><option>L – Padiglioni</option></select>
+    <button class="btn btn-secondary btn-sm" onclick="showToast('Servizio critico aggiunto')">➕ Aggiungi</button>
+  </div>
+</div>
+
+</div><!-- /panel -->
+
+<div class="save-bar">
+  <div>
+    <div style="font-size:.88rem;color:#ccc">💾 <strong>Salva configurazione pool</strong></div>
+    <div style="font-size:.78rem;color:#666">Scrive pool_config.json su GitHub · applicato alla prossima generazione turni</div>
+  </div>
+  <div class="spacer"></div>
+  <button class="btn btn-secondary btn-sm" style="margin-right:6px" onclick="showToast('Ripristinata la configurazione salvata su GitHub')">↩ Ripristina</button>
+  <button class="btn btn-primary" onclick="showToast('✅ pool_config.json salvato su GitHub con successo!')">Salva configurazione</button>
+</div>
+
+<div id="toast"></div>
+
+<script>
+var DOCTOR_COLS = {
+  'Licordari': ['D','E','J','K','T','Q'],
+  'Allegra': ['D','E','J','H','I'],
+  'Zito': ['D','E','J'],
+  'Grimaldi': ['D','F'],
+  'Cusmà': ['D','E','H','I'],
+  'Cimino': ['D','E','J','K'],
+  'Pugliatti': ['D','E','J','H']
+};
+
+var COLUMNS = [
+  ['C','Reperibilità'],['D','UTIC mattina'],['E','Cardio mattina'],
+  ['F','Supporto 118'],['H','UTIC pomeriggio'],['I','Cardio pomeriggio'],
+  ['J','Notte'],['K','Letto'],['L','Padiglioni'],['Q','ECO base'],
+  ['R','ECOSTRESS'],['S','Ecosala'],['T','Interni'],['U','Contr.PM'],
+  ['V','Sala PM'],['W','Ergometria'],['Y','Ambulatori'],['Z','Vascolare'],
+  ['AB','Holter'],['AC','Scintigrafia']
+];
+
+function showTab(name) {
+  var contents = document.querySelectorAll('.tab-content');
+  for (var i = 0; i < contents.length; i++) {
+    contents[i].classList.remove('active');
+  }
+  var tabs = document.querySelectorAll('.tab');
+  for (var i = 0; i < tabs.length; i++) {
+    tabs[i].classList.remove('active');
+  }
+  document.getElementById('tab-' + name).classList.add('active');
+  document.getElementById('tab-btn-' + name).classList.add('active');
+  if (name === 'colonne') renderColGrid();
+}
+
+function renderColGrid() {
+  var doc = document.getElementById('col-select').value;
+  var active = DOCTOR_COLS[doc] || [];
+  var grid = document.getElementById('col-grid');
+  while (grid.firstChild) grid.removeChild(grid.firstChild);
+
+  for (var i = 0; i < COLUMNS.length; i++) {
+    var col = COLUMNS[i];
+    var letter = col[0];
+    var name = col[1];
+    var isOn = active.indexOf(letter) >= 0;
+
+    var card = document.createElement('div');
+    card.className = 'col-card' + (isOn ? ' on' : '');
+    card.setAttribute('data-col', letter);
+    card.setAttribute('data-doc', doc);
+
+    var span1 = document.createElement('span');
+    span1.className = 'col-letter';
+    span1.textContent = letter;
+
+    var span2 = document.createElement('span');
+    span2.className = 'col-name';
+    span2.textContent = name;
+
+    var tog = document.createElement('div');
+    tog.className = 'toggle ' + (isOn ? 'on' : 'off');
+    var dot = document.createElement('div');
+    dot.className = 'toggle-dot';
+    tog.appendChild(dot);
+
+    card.appendChild(span1);
+    card.appendChild(span2);
+    card.appendChild(tog);
+
+    card.addEventListener('click', (function(c, l, d) {
+      return function() {
+        var cols = DOCTOR_COLS[d] || [];
+        var idx = cols.indexOf(l);
+        if (idx >= 0) {
+          cols.splice(idx, 1);
+          c.classList.remove('on');
+          c.querySelector('.toggle').className = 'toggle off';
+          showToast(d + ': colonna ' + l + ' rimossa');
+        } else {
+          cols.push(l);
+          c.classList.add('on');
+          c.querySelector('.toggle').className = 'toggle on';
+          showToast(d + ': colonna ' + l + ' aggiunta');
+        }
+        DOCTOR_COLS[d] = cols;
+      };
+    })(card, letter, doc));
+
+    grid.appendChild(card);
+  }
+}
+
+function openDetail(name, active, rep, festd, festn, uni, cols) {
+  document.getElementById('detail-name').textContent = '✏️ ' + name;
+  document.getElementById('d-active').value = active === '✅' ? '✅ Sì' : '❌ No';
+  document.getElementById('d-rep').value = rep === '✅' ? '✅ Sì' : '❌ Escluso';
+  document.getElementById('d-festd').value = festd === '✅' ? '✅ Sì' : '❌ No';
+  document.getElementById('d-festn').value = festn === '✅' ? '✅ Sì' : '❌ No';
+  document.getElementById('d-uni').value = uni.indexOf('2') >= 0 ? '🎓 notte conta ×2' :
+                                            uni.indexOf('1') >= 0 ? '🎓 notte conta ×1' : '– No';
+  document.getElementById('detail-panel').style.display = 'block';
+}
+
+var toastTimer = null;
+function showToast(msg) {
+  var t = document.getElementById('toast');
+  t.textContent = msg;
+  t.style.display = 'block';
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(function() { t.style.display = 'none'; }, 2800);
+}
+
+renderColGrid();
+</script>
+</body>
+</html>

@@ -192,7 +192,16 @@ starttls = true
       "festivi_diurni": false,
       "festivi_notti": false,
       "excluded_from_reperibilita": true,
-      "university_doctor": { "night_counts_double": true, "ratio": 0.6 },
+      "university_doctor": { "ratio": 0.6 },
+      "column_overrides": {}
+    },
+    "De Gregorio": {
+      "active": true,
+      "columns": ["D", "E", "H", "I"],
+      "festivi_diurni": true,
+      "festivi_notti": false,
+      "excluded_from_reperibilita": false,
+      "university_doctor": { "ratio": 0.6 },
       "column_overrides": {}
     },
     "Grimaldi": {
@@ -206,8 +215,8 @@ starttls = true
     }
   },
   "column_settings": {
-    "J": { "quota_min": 1, "quota_max": 6, "spacing_min_days": 5, "balance_weight": 300 },
-    "D": { "quota_min": 0, "quota_max": 5, "spacing_min_days": 0, "balance_weight": 200 }
+    "J": { "quota_min": 1, "quota_max": 6, "spacing_min_days": 5, "balance_weight": 300, "counts_as": 2 },
+    "D": { "quota_min": 0, "quota_max": 5, "spacing_min_days": 0, "balance_weight": 200, "counts_as": 1 }
   },
   "service_combinations": [
     { "columns": ["K", "T"], "same_day": true },
