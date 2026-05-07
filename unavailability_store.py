@@ -36,6 +36,8 @@ def norm_shift(s: str) -> str:
         return "Diurno"
     if low.startswith("tutto"):
         return "Tutto il giorno"
+    if low == "ferie":
+        return "Ferie"
     return s0
 
 def parse_iso_date(s: str) -> dt.date:

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import math
-from datetime import datetime, timedelta
+from datetime import datetime, date, timedelta
 from typing import Any, Optional, Tuple
 
 import openpyxl
@@ -313,8 +313,10 @@ def parse_finalized_xlsx(xlsx_path: str, sheet_name: str | None = None) -> dict:
             date_val = ws.cell(row_idx, 1).value  # Colonna A
             if date_val is None:
                 break
-            if not isinstance(date_val, datetime):
+            if not isinstance(date_val, (datetime, date)):
                 continue
+            if isinstance(date_val, date) and not isinstance(date_val, datetime):
+                date_val = datetime(date_val.year, date_val.month, date_val.day)
 
             if year is None:
                 year = date_val.year
@@ -459,7 +461,11 @@ def aggregate_multi_month(all_months: dict[str, dict]) -> dict:
     special_keys = {"_festivi_DE_HI", "_domeniche", "_sabati", "_months_counted"}
 
     for month_label, month_stats in all_months.items():
+        if not month_label or not isinstance(month_stats, dict):
+            continue
         for doc, ds in month_stats.items():
+            if doc == "_meta":
+                continue
             if doc not in agg:
                 agg[doc] = {
                     "_festivi_DE_HI": 0,

@@ -317,9 +317,16 @@ def _save_shift_history(history: dict, sha: str | None = None) -> bool:
     """Salva lo storico turni su GitHub. Ritorna True se successo."""
     try:
         sec = st.secrets["github_unavailability"]
+        # Ricarica lo SHA corrente per evitare conflitti da SHA stale
+        try:
+            _, current_sha = sh.load_history_from_github(
+                sec["owner"], sec["repo"], sec["token"], sec.get("branch", "main"),
+            )
+        except Exception:
+            current_sha = sha
         sh.save_history_to_github(
             history, sec["owner"], sec["repo"], sec["token"],
-            sec.get("branch", "main"), sha,
+            sec.get("branch", "main"), current_sha,
         )
         return True
     except Exception as e:
@@ -455,6 +462,8 @@ def load_store_from_github() -> tuple[list[dict], str | None]:
 
 def save_store_to_github(rows: list[dict], sha: str | None, message: str) -> str | None:
     g = _github_cfg()
+    if not g.get("path"):
+        raise RuntimeError("Chiave 'path' non configurata in github_unavailability secrets (legacy store).")
     text = ustore.to_csv(rows)
     resp = github_utils.put_file(
         owner=g["owner"],
@@ -475,12 +484,89 @@ def save_store_to_github(rows: list[dict], sha: str | None, message: str) -> str
     return None
 
 
-def load_avail_store_from_github() -> tuple[list[dict], str | None]:
-    """Carica il CSV delle preferenze di disponibilità da GitHub."""
+# ── Per-doctor availability file helpers ───────────────────────────────────
+
+def _avail_per_doctor_dir() -> str:
+    """GitHub directory path for per-doctor availability CSV files."""
     g = _github_cfg()
-    path = g.get("availability_path", "data/availability_store.csv")
+    return str(g.get("per_doctor_avail_dir") or "data/availability").rstrip("/")
+
+
+def _doctor_avail_path(doctor: str) -> str:
+    """Full GitHub path for a single doctor's availability CSV."""
+    return f"{_avail_per_doctor_dir()}/avail_{_doctor_slug(doctor)}.csv"
+
+
+def load_doctor_avail_from_github(doctor: str) -> tuple[list[dict], str | None]:
+    """Load ONLY the given doctor's availability rows from their personal CSV file."""
+    g = _github_cfg()
     if not (g.get("token") and g.get("owner") and g.get("repo")):
         raise RuntimeError("GitHub non configurato (availability store).")
+    gf = github_utils.get_file(
+        owner=g["owner"], repo=g["repo"],
+        path=_doctor_avail_path(doctor),
+        token=g["token"], branch=g.get("branch", "main"),
+    )
+    if gf is None:
+        return [], None
+    return ustore.load_store(gf.text), gf.sha
+
+
+def save_doctor_avail_to_github(
+    doctor: str,
+    rows: list[dict],
+    sha: str | None,
+    message: str,
+) -> str | None:
+    """Write ONLY the given doctor's rows to their personal availability CSV file."""
+    g = _github_cfg()
+    text = ustore.to_csv(rows)
+    resp = github_utils.put_file(
+        owner=g["owner"], repo=g["repo"],
+        path=_doctor_avail_path(doctor),
+        token=g["token"], branch=g.get("branch", "main"),
+        sha=sha, message=message, text=text,
+    )
+    try:
+        content = resp.get("content") if isinstance(resp, dict) else None
+        if isinstance(content, dict) and content.get("sha"):
+            return str(content["sha"])
+    except Exception:
+        pass
+    return None
+
+
+def load_avail_store_from_github() -> tuple[list[dict], str | None]:
+    """Load all availability rows.
+
+    Primary source: per-doctor CSV files in per_doctor_avail_dir.
+    Fallback: legacy aggregate CSV (availability_path key in secrets).
+    Returns (rows, sha_or_None). SHA is None when aggregating multiple files.
+    """
+    g = _github_cfg()
+    if not (g.get("token") and g.get("owner") and g.get("repo")):
+        raise RuntimeError("GitHub non configurato (availability store).")
+
+    per_dir = _avail_per_doctor_dir()
+    files = github_utils.list_dir(
+        owner=g["owner"], repo=g["repo"], path=per_dir,
+        token=g["token"], branch=g.get("branch", "main"),
+    )
+    csv_files = [f for f in files if f.get("name", "").endswith(".csv")]
+
+    if csv_files:
+        all_rows: list[dict] = []
+        for file_meta in csv_files:
+            gf = github_utils.get_file(
+                owner=g["owner"], repo=g["repo"], path=file_meta["path"],
+                token=g["token"], branch=g.get("branch", "main"),
+            )
+            if gf:
+                all_rows.extend(ustore.load_store(gf.text))
+        return all_rows, None
+
+    # Fallback: legacy single-file CSV
+    path = g.get("availability_path", "data/availability_store.csv")
     gf = github_utils.get_file(
         owner=g["owner"], repo=g["repo"], path=path,
         token=g["token"], branch=g.get("branch", "main"),
@@ -491,7 +577,7 @@ def load_avail_store_from_github() -> tuple[list[dict], str | None]:
 
 
 def save_avail_store_to_github(rows: list[dict], sha: str | None, message: str) -> str | None:
-    """Salva il CSV delle preferenze di disponibilità su GitHub."""
+    """Legacy writer — kept for backward compatibility. Prefer save_doctor_avail_to_github."""
     g = _github_cfg()
     path = g.get("availability_path", "data/availability_store.csv")
     text = ustore.to_csv(rows)
@@ -519,23 +605,30 @@ def save_doctor_availability_with_retry(
     initial_sha: str | None = None,
     max_retries: int = 6,
 ) -> str | None:
-    """Salvataggio concurrency-safe del CSV preferenze su GitHub."""
+    """Concurrency-safe save using per-doctor availability CSV files.
+
+    Each doctor writes only their own file — no cross-doctor SHA conflicts.
+    Returns: final_sha (or None)
+    """
     last_err: Exception | None = None
     months = sorted(entries_by_month.items())
+
     for attempt in range(max_retries):
         if attempt == 0 and initial_rows is not None:
-            store_rows = list(initial_rows)
-            store_sha = initial_sha
+            doctor_rows = [r for r in initial_rows if r.get("doctor", "") == doctor]
+            doctor_sha = initial_sha
         else:
-            store_rows, store_sha = load_avail_store_from_github()
-        new_rows = list(store_rows)
+            doctor_rows, doctor_sha = load_doctor_avail_from_github(doctor)
+
+        new_rows = list(doctor_rows)
         for (yy, mm), entries in months:
             new_rows = ustore.replace_doctor_month(
                 new_rows, doctor, int(yy), int(mm), entries, updated_at=updated_at
             )
+
         try:
-            _new_sha = save_avail_store_to_github(new_rows, store_sha, message=message)
-            latest_rows, latest_sha = load_avail_store_from_github()
+            _new_sha = save_doctor_avail_to_github(doctor, new_rows, doctor_sha, message)
+            verified_rows, latest_sha = load_doctor_avail_from_github(doctor)
             return latest_sha or _new_sha
         except Exception as e:
             last_err = e
@@ -544,6 +637,7 @@ def save_doctor_availability_with_retry(
                 time.sleep(sleep_s)
                 continue
             raise
+
     if last_err:
         raise last_err
     raise RuntimeError("Errore salvataggio preferenze: tentativi esauriti.")
@@ -1229,6 +1323,10 @@ def save_doctor_unavailability_with_retry(
                 sleep_s = min(3.0, 0.35 * (2 ** attempt) + random.random() * 0.25)
                 time.sleep(sleep_s)
                 continue
+            # Retry anche per lag GitHub nella verifica post-save
+            if "non verificato" in str(e) and attempt < max_retries - 1:
+                time.sleep(min(2.0, 0.5 * (attempt + 1)))
+                continue
             raise
 
     if last_err:
@@ -1471,7 +1569,11 @@ def append_unavailability_audit_log(mk: str, row: dict, max_retries: int = 3):
                 buf = io.StringIO()
                 w = csv.DictWriter(buf, fieldnames=AUDIT_FIELDS)
                 w.writeheader()
-                buf.write(existing_text.strip("\n") + "\n")
+                # Salta il vecchio header (prima riga), riscrivi solo le righe dati
+                body_lines = existing_text.splitlines()[1:]
+                for line in body_lines:
+                    if line.strip():
+                        buf.write(line + "\n")
                 buf.write(row_line + "\n")
                 new_text = buf.getvalue()
             else:
@@ -1616,6 +1718,7 @@ def _logout_doctor(reason: str):
     st.session_state["doctor_name"] = None
     st.session_state["doctor_logout_msg"] = reason
     st.rerun()
+    st.stop()
 
 
 def _doctor_session_state_key(doctor: str) -> str:
@@ -2088,11 +2191,11 @@ if mode == "📋 Le mie indisponibilità":
         st.error(f"Errore accesso archivio indisponibilità: {e}")
         st.stop()
 
-    # Carica archivio preferenze (availability) da GitHub — cachato in sessione
+    # Carica archivio preferenze (availability) da GitHub — solo il file del medico corrente
     _avail_base_key = f"avail_store_baseline_{doctor}"
     if _avail_base_key not in st.session_state or refresh_baseline:
         try:
-            _avail_rows, _avail_sha = load_avail_store_from_github()
+            _avail_rows, _avail_sha = load_doctor_avail_from_github(doctor)
             st.session_state[_avail_base_key] = {"rows": _avail_rows, "sha": _avail_sha}
         except Exception:
             st.session_state[_avail_base_key] = {"rows": [], "sha": None}
@@ -2442,7 +2545,9 @@ if mode == "📋 Le mie indisponibilità":
                     d = _x.get("Data")
                     sh = str(_x.get("Fascia") or "").strip()
                     note = str(_x.get("Note") or "").strip()
-                    return (not d) and (not sh) and (not note)
+                    # Una riga è "vuota" se ha la data di default (primo del mese) e nessuna nota
+                    is_default_date = isinstance(d, date) and d.day == 1
+                    return is_default_date and sh in ("Mattina", "") and not note
 
                 _cleaned = [r for r in (st.session_state.get(rows_key) or []) if not _is_empty(r)]
                 if not _cleaned:
@@ -2498,7 +2603,7 @@ if mode == "📋 Le mie indisponibilità":
                                 "Data",
                                 value=av_r.get("Data") or date(yy, mm, 1),
                                 min_value=date(yy, mm, 1),
-                                max_value=date(yy, mm, 1) if mm == 12 else date(yy, mm + 1, 1) - timedelta(days=1),
+                                max_value=date(yy + 1, 1, 1) - timedelta(days=1) if mm == 12 else date(yy, mm + 1, 1) - timedelta(days=1),
                                 key=f"{avail_key}_{av_r['id']}_d",
                                 format="DD/MM/YYYY",
                             )
@@ -2594,9 +2699,11 @@ if mode == "📋 Le mie indisponibilità":
                                 initial_rows=avail_store_rows,
                                 initial_sha=avail_store_sha,
                             )
+                            # Ricarica il file del medico per aggiornare SHA e rows
+                            _avail_fresh_rows, _avail_fresh_sha = load_doctor_avail_from_github(doctor)
                             st.session_state[f"avail_store_baseline_{doctor}"] = {
-                                "rows": load_avail_store_from_github()[0],
-                                "sha": _new_avail_sha,
+                                "rows": _avail_fresh_rows,
+                                "sha": _avail_fresh_sha or _new_avail_sha,
                             }
                             st.success(f"Preferenze salvate ({len(_avail_entries)} voci).")
                         except Exception as _e:
@@ -3142,17 +3249,23 @@ else:
                     _tmp.write_bytes(_hist_upload.getvalue())
                     _parsed = sh.parse_finalized_xlsx(str(_tmp))
                     _ml = _parsed["month_label"]
-                    _valid_docs = set(doctors) if doctors else None
-                    _ms = sh.compute_doctor_stats(_parsed, valid_doctors=_valid_docs)
-                    # Salva metadata: chi ha fatto notte l'ultimo giorno
-                    _last_night = []
-                    if _parsed["days"]:
-                        _last_night = _parsed["days"][-1].get("assignments", {}).get("J", [])
-                    _ms["_meta"] = {"last_day_night_doctors": _last_night}
-                    _hist_data[_ml] = _ms
-                    if _save_shift_history(_hist_data, _hist_sha):
-                        st.success(f"✅ Mese **{_ml}** importato ({len(_parsed['days'])} giorni)")
-                        st.rerun()
+                    if not _ml:
+                        st.error(
+                            "Impossibile determinare il mese dal file Excel: la colonna A non contiene date valide. "
+                            "Verifica che il foglio selezionato sia quello corretto."
+                        )
+                    else:
+                        _valid_docs = set(doctors) if doctors else None
+                        _ms = sh.compute_doctor_stats(_parsed, valid_doctors=_valid_docs)
+                        # Salva metadata: chi ha fatto notte l'ultimo giorno
+                        _last_night = []
+                        if _parsed["days"]:
+                            _last_night = _parsed["days"][-1].get("assignments", {}).get("J", [])
+                        _ms["_meta"] = {"last_day_night_doctors": _last_night}
+                        _hist_data[_ml] = _ms
+                        if _save_shift_history(_hist_data, _hist_sha):
+                            st.success(f"✅ Mese **{_ml}** importato ({len(_parsed['days'])} giorni)")
+                            st.rerun()
                 except Exception as _e:
                     st.error(f"Errore parsing: {_e}")
                 finally:
@@ -3371,6 +3484,61 @@ else:
                     )
             except Exception as _me:
                 st.error(f"Errore migrazione: {_me}")
+
+    # ── Migrazione preferenze disponibilità → file per-medico ─────────────
+    st.markdown("#### Migrazione preferenze disponibilità al nuovo formato")
+    st.warning(
+        "**Azione richiesta (una-tantum).** Divide `availability_store.csv` in file per-medico "
+        f"nella directory `{_avail_per_doctor_dir()}/`, eliminando i conflitti concorrenti.",
+        icon="⚠️",
+    )
+    _mg2_col1, _mg2_col2 = st.columns([1, 3])
+    with _mg2_col1:
+        _do_migrate_avail = st.button("Esegui migrazione disponibilità", key="btn_migrate_avail", type="primary", use_container_width=True)
+    with _mg2_col2:
+        st.caption(
+            f"Legge `availability_store.csv` → scrive file per-medico in `{_avail_per_doctor_dir()}/`. "
+            "Il vecchio file resta intatto come backup."
+        )
+    if _do_migrate_avail:
+        _mga = _github_cfg()
+        try:
+            _avail_legacy_path = _mga.get("availability_path", "data/availability_store.csv")
+            _leg_avail_gf = github_utils.get_file(
+                owner=_mga["owner"], repo=_mga["repo"], path=_avail_legacy_path,
+                token=_mga["token"], branch=_mga.get("branch", "main"),
+            )
+            if _leg_avail_gf is None or not (_leg_avail_gf.text or "").strip():
+                st.warning("CSV aggregato disponibilità vuoto o non trovato — nessun dato da migrare.")
+            else:
+                from collections import defaultdict as _dd2
+                _all_avail = ustore.load_store(_leg_avail_gf.text)
+                _by_doc_avail: dict[str, list[dict]] = _dd2(list)
+                for _r in _all_avail:
+                    _by_doc_avail[_r["doctor"]].append(_r)
+                _prog2 = st.progress(0)
+                _docs2 = list(_by_doc_avail.keys())
+                _ok2 = 0
+                for _i2, _doc2 in enumerate(_docs2):
+                    _dp = _doctor_avail_path(_doc2)
+                    _ex2 = github_utils.get_file(
+                        owner=_mga["owner"], repo=_mga["repo"], path=_dp,
+                        token=_mga["token"], branch=_mga.get("branch", "main"),
+                    )
+                    github_utils.put_file(
+                        owner=_mga["owner"], repo=_mga["repo"], path=_dp,
+                        token=_mga["token"], branch=_mga.get("branch", "main"),
+                        sha=_ex2.sha if _ex2 else None,
+                        message=f"migrate: availability for {_doc2}",
+                        text=ustore.to_csv(_by_doc_avail[_doc2]),
+                    )
+                    _ok2 += 1
+                    _prog2.progress((_i2 + 1) / len(_docs2))
+                st.success(
+                    f"Migrazione disponibilità completata: {_ok2} medici → `{_avail_per_doctor_dir()}/`."
+                )
+        except Exception as _me2:
+            st.error(f"Errore migrazione disponibilità: {_me2}")
 
     st.divider()
 
@@ -3700,12 +3868,13 @@ else:
                     unav_path = td / "unavailability_from_store.xlsx"
                     xlsx_utils.build_unavailability_xlsx(rows_month, DEFAULT_UNAV_TEMPLATE, unav_path)
 
-                    store_rows_2, sha2 = load_store_from_github()
-                    if sha1 and sha2 and sha2 != sha1:
-                        # Archive changed during preparation: rebuild from latest.
-                        rows_month = ustore.filter_month(store_rows_2, int(year), int(month))
-                        xlsx_utils.build_unavailability_xlsx(rows_month, DEFAULT_UNAV_TEMPLATE, unav_path)
-                        st.caption("Archivio indisponibilità aggiornato durante la preparazione: ricaricata l’ultima versione.")
+                    # Double-check solo in modalità legacy (SHA disponibile)
+                    if sha1 is not None:
+                        store_rows_2, sha2 = load_store_from_github()
+                        if sha1 and sha2 and sha2 != sha1:
+                            rows_month = ustore.filter_month(store_rows_2, int(year), int(month))
+                            xlsx_utils.build_unavailability_xlsx(rows_month, DEFAULT_UNAV_TEMPLATE, unav_path)
+                            st.caption("Archivio indisponibilità aggiornato durante la preparazione: ricaricata l’ultima versione.")
 
                     st.caption(f"Archivio indisponibilità: {len(rows_month)} righe per {mk}")
 

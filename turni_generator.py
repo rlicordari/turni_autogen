@@ -521,15 +521,14 @@ def assign_reperibilita_C(cfg: dict, days: List[DayRow], slots: List[Slot],
     remaining = total_days - cur
     # Prefer target=2 if min_per==0; otherwise distribute evenly
     order_docs = pool[:]  # stable
-    i = 0
     while remaining > 0:
-        doc = order_docs[i % len(order_docs)]
-        if desired[doc] < max_per:
-            desired[doc] += 1
-            remaining -= 1
-        i += 1
-        # safety break
-        if i > 100000:
+        progress = False
+        for doc in order_docs:
+            if desired[doc] < max_per and remaining > 0:
+                desired[doc] += 1
+                remaining -= 1
+                progress = True
+        if not progress:
             break
     if sum(desired.values()) != total_days:
         raise ValueError("C_reperibilita internal error: desired counts do not match total days.")
@@ -2353,7 +2352,7 @@ def solve_with_ortools(
             # Medici senza quota fissa: imponiamo min=2, max=3 hard.
             free_docs = [d for d in sorted(night_pool) if d not in mq_fixed]
             fixed_total = sum(mq_fixed.values())
-            free_total = pool_available_nights - fixed_total
+            free_total = max(0, pool_available_nights - fixed_total)
 
             # Calcola min/max bilanciati per i medici liberi
             if free_docs:
@@ -2363,6 +2362,7 @@ def solve_with_ortools(
                 remainder = free_total - min_per * n_free
                 # max_per = min_per se il resto è 0, altrimenti min_per+1
                 max_per = min_per + (1 if remainder > 0 else 0)
+                max_per = max(max_per, 0)  # sicurezza: mai negativo
 
                 for doc in free_docs:
                     vars_ = [night_var_by_day_doc.get((d.date, doc)) for d in days
@@ -2393,7 +2393,8 @@ def solve_with_ortools(
 
         # Weekend nights: ogni dottore al massimo 2 weekend nights (Sat+Sun)
         # e distribuzione equa (minimizza massimo)
-        weekend_docs = night_pool - {norm_name("Calabrò")}  # Calabrò escluso sabato/domenica
+        _j_wex = {norm_name(d) for d in (rJ.get("weekend_excluded_doctors") or ["Calabrò"])}
+        weekend_docs = night_pool - _j_wex
         # Calcola il cap minimo feasible: ceil(notti_weekend_totali / medici_disponibili)
         import math as _math
         total_we_nights = sum(
@@ -4085,10 +4086,7 @@ def generate_schedule(
         availability_preferences=availability_preferences,
         historical_stats=historical_stats,
     )
-    # Safety net: enforce definitive C rules even if an older solver path skipped it
-    assignment, cdiag = assign_reperibilita_C(cfg, days, slots, assignment)
-    if isinstance(cdiag, dict):
-        stats.update(cdiag)
+    # REMOVED: terza chiamata ridondante a assign_reperibilita_C (sovrascriveva C già ottimizzata)
     write_output(wb, ws, days, slots, assignment, cfg=cfg, out_path=outp, unav_map=unav_map)
     logp = write_solver_log(outp, stats)
     return stats, str(logp) if logp else None
