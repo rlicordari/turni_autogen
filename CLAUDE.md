@@ -152,23 +152,38 @@ starttls = true
 
 ## Feature in sviluppo: Gestione Pool Medici da GUI (pool_config)
 
-**Spec completa:** `docs/superpowers/specs/2026-05-07-pool-config-design.md` *(da creare)*
-
-**Decisioni di design confermate (sessione 7 maggio 2026):**
+**Spec completa:** `docs/superpowers/specs/2026-05-07-pool-config-design.md` ✅ SCRITTA  
+**Mockup interattivo:** `docs/superpowers/mockup_pool_config.html` ✅ (aprire in browser)  
+**Stato:** Spec approvata — **prossimo passo: scrivere il piano di implementazione** (`superpowers:writing-plans`)
 
 ### Approccio: Overlay JSON su YAML (Approccio A)
 - `data/pool_config.json` su GitHub sovrascrive pool e quote al momento della generazione
 - `Regole_Turni.yml` rimane immutato come template avanzato (spacing, penalità, relief_valves)
-- Il merge avviene in `streamlit_app.py` prima di invocare il solver
+- Il merge avviene tramite `apply_pool_config(cfg_yaml, pool_config)` in `turni_generator.py`
 - La GUI admin (PIN-protetta) legge/scrive solo `pool_config.json`
 
-### Funzionalità previste
-1. **Gestione medici** — aggiungere/rimuovere medici, attivo/inattivo
-2. **Assegnazione colonne** — per ogni medico: quali colonne può fare normalmente
-3. **Festivi** — due toggle per medico: `festivi_diurni` (D/E/H/I) e `festivi_notti` (J nei festivi)
-4. **Limiti** — quote min/max globali per colonna + override per singolo medico
-5. **Combinazioni same-day** — coppie di servizi che lo stesso medico può coprire nello stesso giorno (es. K+T), estende il meccanismo `df_pair`
-6. **Servizi critici** — servizi che non possono mai rimanere scoperti: usa pool primario, fallback su qualsiasi medico attivo se il pool primario è esaurito
+### Funzionalità — design finalizzato
+1. **Gestione medici** — aggiungere/rimuovere medici, attivo/inattivo, festivi diurni/notturni, reperibilità, universitario+ratio
+2. **Assegnazione colonne** — per ogni medico: griglia di tutti i servizi con toggle
+3. **Quote** — `monthly_target` per colonna (default per tutti) + override per singolo medico con tipo `fixed` (sempre esattamente N) o `max` (mai più di N). Nessun min/max separato.
+4. **Notti weekend** — override `weekend_nights: false` per J (es. Calabrò escluso sab/dom)
+5. **Combinazioni same-day** — servizi che lo stesso medico può coprire nello stesso giorno con modalità `always`/`fallback`/`preferred`
+6. **Servizi critici** — mai scoperti: fallback `any` (qualsiasi medico attivo) o lista esplicita
+
+### Logica quote notti J — CONFERMATA
+| Medico | Override | Comportamento |
+|---|---|---|
+| Licordari, Colarusso | `quota: 3, type: fixed` | Sempre esattamente 3 — vincolo hard |
+| Zito, Dattilo | `quota: 2, type: max` | Mai più di 2 — vincolo hard; ratio universitario già applicato |
+| De Gregorio | J non in `columns` | Escluso dalle notti (non nel pool) |
+| Calabrò | `weekend_nights: false` | Notti feriali sì, sab/dom no |
+| Tutti gli altri | nessuno | Target flessibile 2; fanno 3 a rotazione se necessario |
+
+### Regole chiave chiarite
+- **J vale 2 turni per tutti** (ospedalieri e universitari) → `counts_as: 2` in `column_settings`
+- **`university_doctor.ratio`** → il solver lo applica già al workload mensile Mon-Sat esclusi festivi; la GUI espone solo il numero
+- **K+T**: mode `always` (stesso medico obbligatorio ogni giorno — già fanno le stesse cose fisicamente)
+- **Q+R**: mode `fallback` (separati se possibile, accoppiati solo se pool esaurito)
 
 ### Schema `pool_config.json` (v1 — aggiornato 7 maggio 2026)
 ```json
