@@ -183,7 +183,7 @@ starttls = true
       "excluded_from_reperibilita": false,
       "university_doctor": null,
       "column_overrides": {
-        "J": { "monthly_target": 3 }
+        "J": { "monthly_quota": 3, "quota_type": "fixed" }
       }
     },
     "Zito": {
@@ -219,8 +219,9 @@ starttls = true
     "D": { "monthly_target": null, "spacing_min_days": 0, "balance_weight": 200, "counts_as": 1 },
     "C": { "monthly_target": null, "spacing_min_days": 0, "balance_weight": 200, "counts_as": 1 }
   },
-  "_note_column_settings": "monthly_target=null significa distribuzione automatica equa senza target fisso. counts_as=2 per J vale per tutti.",
-  "_note_column_overrides": "column_overrides disponibile per QUALSIASI medico. Licordari e Colarusso: J monthly_target=3 (tutti gli altri fanno 2). weekend_nights:false esclude il medico dalle notti di sabato e domenica (es. Calabrò).",
+  "_note_column_settings": "monthly_target = quota di default per il turno J per tutti i medici senza override. counts_as=2 per J vale per tutti.",
+  "_note_column_overrides": "Tre tipi di override quota per colonna J: fixed (sempre esattamente N), max (mai più di N, ma può fare meno), nessun override (default flessibile, può fare +1 in rotazione se necessario). weekend_nights:false esclude sab/dom.",
+  "_note_notti_logic": "Licordari e Colarusso: fixed=3 (sempre 3). Zito e Dattilo: max=2 (MAI 3). Tutti gli altri: default flessibile (di solito 2, fanno 3 a turno se serve).",
   "service_combinations": [
     {
       "columns": ["K", "T"],
