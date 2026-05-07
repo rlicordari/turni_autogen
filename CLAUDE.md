@@ -218,6 +218,7 @@ starttls = true
     "J": { "quota_min": 1, "quota_max": 6, "spacing_min_days": 5, "balance_weight": 300, "counts_as": 2 },
     "D": { "quota_min": 0, "quota_max": 5, "spacing_min_days": 0, "balance_weight": 200, "counts_as": 1 }
   },
+  "_note_column_overrides": "column_overrides è disponibile per QUALSIASI medico, non solo universitari. Es: Licordari e Colarusso fanno 3 notti invece di 2.",
   "service_combinations": [
     { "columns": ["K", "T"], "same_day": true },
     { "columns": ["Q", "R"], "same_day": true }
