@@ -769,13 +769,26 @@ def apply_pool_config(cfg_yaml: dict, pool_cfg: Optional[dict]) -> dict:
     if critical is not None:
         cfg["pool_critical_services"] = critical
 
-    # 11. spacing_preferred_days per colonna
-    spacing_pref: dict[str, int] = {}
-    for col, cs in col_settings.items():
-        if isinstance(cs, dict) and "spacing_preferred_days" in cs:
-            spacing_pref[col] = int(cs["spacing_preferred_days"])
-    if spacing_pref:
-        cfg["pool_spacing_preferred"] = spacing_pref
+    # 11. Spacing J: scrive direttamente nei global_constraints già letti dal solver
+    j_cs = col_settings.get("J", {})
+    if isinstance(j_cs, dict):
+        if "spacing_min_days" in j_cs:
+            gc["night_spacing_days_min"] = int(j_cs["spacing_min_days"])
+        if "spacing_preferred_days" in j_cs:
+            gc["night_spacing_days_preferred"] = int(j_cs["spacing_preferred_days"])
+
+    # 11b. service_combinations → mappa alle chiavi relief_valves esistenti
+    combos = pool_cfg.get("service_combinations") or []
+    relief = gc.setdefault("relief_valves", {})
+    for combo in combos:
+        cols = tuple(sorted(combo.get("columns") or []))
+        mode = combo.get("mode", "fallback")
+        if cols == ("K", "T"):
+            if mode in ("fallback", "always"):
+                relief["enable_kt_share"] = True
+            elif mode == "preferred":
+                relief["enable_kt_share"] = False  # preferred = soft, solver gestisce a bassa penalità
+        # Q+R: già gestito da allow_blank_columns.R — nessuna modifica necessaria
 
     # 12. university_doctors — aggiorna da pool_config
     gc_uni: dict = dict(gc.get("university_doctors") or {})
@@ -1347,6 +1360,11 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                     wex = [norm_name(x) for x in (rJ.get('weekend_excluded_doctors') or [])]
                     if day.dow in ['Sat','Sun'] and wex:
                         allowed = [d for d in allowed if norm_name(d) not in set(wex)]
+                    # festivi_notti filter: rimuove medici esclusi da J nei giorni festivi
+                    if is_festivo(day, cfg):
+                        _fest_notti_excl = cfg.get("pool_festivi_notti_excluded") or set()
+                        if _fest_notti_excl:
+                            allowed = [d for d in allowed if norm_name(d) not in _fest_notti_excl]
                     allowed = apply_unavailability(allowed, day, "Notte", unav)
                 slots.append(Slot(day, f"{day.date}-J", ["J"], allowed, required=True, shift="Notte", rule_tag="J"))
         # ---- K Letto (daily, but blank on Sundays/festivi)
@@ -2446,6 +2464,24 @@ def solve_with_ortools(
             vars_ = [v for v in vars_ if v is not None]
             if vars_:
                 model.Add(sum(vars_) == int(q))
+    # Pool quota overrides max/min — da pool_config (tutti i tipi e colonne)
+    qov = cfg.get("pool_quota_overrides") or {}
+    for (doc_n, col), spec in qov.items():
+        col_slots = [s for s in slots if col in (s.columns or [])]
+        vars_ = [x.get((s.slot_id, doc_n)) for s in col_slots]
+        vars_ = [v for v in vars_ if v is not None]
+        if not vars_:
+            continue
+        sv = sum(vars_)
+        qt = spec.get("type", "max")
+        val = int(spec.get("value", 0))
+        if qt == "max":
+            model.Add(sv <= val)
+        elif qt == "min":
+            model.Add(sv >= val)
+        elif qt == "fixed":
+            model.Add(sv == val)
+
     # Monthly quotas (hard) — Festivi DE+HI
     if "rules" in cfg and "Festivi" in cfg["rules"]:
         rFest = cfg["rules"]["Festivi"]
@@ -2851,16 +2887,25 @@ def solve_with_ortools(
             if doc not in doctors:
                 continue
             night_double = bool((doc_cfg or {}).get("night_counts_double", False))
+            counts_as_map = cfg.get("pool_counts_as") or {}
             weighted_terms = []
             for s in slots:
                 v = x.get((s.slot_id, doc))
                 if v is None:
                     continue
-                # Escludi C dal conteggio
-                if any(c in UNIV_EXCLUDE_COLS for c in (s.columns or [])):
+                col_letters = s.columns or []
+                if counts_as_map:
+                    # counts_as da pool_config: C=0 (non conta), J=2 (vale doppio), altri=1
+                    weight = max((counts_as_map.get(c, 1) for c in col_letters), default=1)
+                else:
+                    # Retrocompatibilità: escludi C, usa night_counts_double per J
+                    if any(c in UNIV_EXCLUDE_COLS for c in col_letters):
+                        weight = 0
+                    else:
+                        is_night = "J" in col_letters
+                        weight = 2 if (night_double and is_night) else 1
+                if weight == 0:
                     continue
-                is_night = "J" in (s.columns or [])
-                weight = 2 if (night_double and is_night) else 1
                 weighted_terms.append(weight * v)
             if not weighted_terms:
                 continue
