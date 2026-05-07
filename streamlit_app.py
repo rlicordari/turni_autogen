@@ -3106,8 +3106,6 @@ else:
                             "Festivi diurni": bool(_dc.get("festivi_diurni", True)),
                             "Festivi notti": bool(_dc.get("festivi_notti", True)),
                             "Universitario": bool(_dc.get("university_doctor")),
-                            "Ratio uni": float((_dc.get("university_doctor") or {}).get("ratio", 0.6) or 0.6)
-                            if _dc.get("university_doctor") else 0.0,
                         })
                     _med_df = _pd_pool.DataFrame(_med_rows)
                     _edited_med = st.data_editor(
@@ -3119,7 +3117,6 @@ else:
                             "Festivi diurni": st.column_config.CheckboxColumn("Festivi diurni"),
                             "Festivi notti": st.column_config.CheckboxColumn("Festivi notti"),
                             "Universitario": st.column_config.CheckboxColumn("Universitario"),
-                            "Ratio uni": st.column_config.NumberColumn("Ratio", min_value=0.0, max_value=1.0, step=0.05, format="%.2f"),
                         },
                         hide_index=True,
                         use_container_width=True,
@@ -3145,7 +3142,7 @@ else:
                         _draft_doctors[_dn]["festivi_notti"] = bool(_row["Festivi notti"])
                         _is_uni = bool(_row["Universitario"])
                         if _is_uni:
-                            _draft_doctors[_dn]["university_doctor"] = {"ratio": float(_row["Ratio uni"] or 0.6)}
+                            _draft_doctors[_dn]["university_doctor"] = {"ratio": 0.6}
                         else:
                             _draft_doctors[_dn]["university_doctor"] = None
                     for _dn_old in list(_draft_doctors.keys()):
