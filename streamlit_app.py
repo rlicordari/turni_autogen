@@ -2955,6 +2955,14 @@ else:
     if mode == "🔧 Admin — Configurazione":
         st.markdown("### 🔧 Configurazione sistema")
 
+        # Flash messages da operazioni precedenti (es. salvataggio pool)
+        if "_cfg_flash" in st.session_state:
+            _fk, _fm = st.session_state.pop("_cfg_flash")
+            if _fk == "success":
+                st.success(_fm, icon="✅")
+            else:
+                st.error(_fm)
+
         with st.expander("⚙️ Impostazioni indisponibilità", expanded=False):
             try:
                 app_settings, app_settings_sha = load_app_settings_from_github()
@@ -3343,11 +3351,12 @@ else:
                         else:
                             _ok_save, _msg_save = save_pool_config_with_retry(_to_save, _pool_cfg_sha)
                             if _ok_save:
-                                st.success(_msg_save, icon="✅")
                                 del st.session_state["pool_cfg_draft"]
+                                st.session_state["_cfg_flash"] = ("success", _msg_save)
                                 st.rerun()
                             else:
-                                st.error(_msg_save)
+                                st.session_state["_cfg_flash"] = ("error", _msg_save)
+                                st.rerun()
 
         # ── Memoria storica turni ────────────────────────────────────────
         with st.expander("📊 Memoria storica turni", expanded=False):
