@@ -2612,11 +2612,12 @@ def solve_with_ortools(
             model.Add(_jsup >= sum(vars_) - q_eff)
             model.Add(_jsup >= 0)
             extra_obj.append(J_QUOTA_DEV_PENALTY * _jsup)
-            # Soft PURA: fortissima penalità per ogni notte mancante (no hard lower bound
-            # per evitare infeasibility combinatoria con university cap + spacing)
-            _jsum = model.NewIntVar(0, q_eff, f"jsum_{hash(doc)%10**6}")
+            # Soft: penalità per ogni notte mancante rispetto alla quota
+            # _jsum bounded [0, n_avail] (NON q_eff) per evitare infeasibility
+            # se il solver assegna più di q_eff notti (non c'è hard upper bound)
+            _jsum = model.NewIntVar(0, n_avail, f"jsum_{hash(doc)%10**6}")
             model.Add(_jsum == sum(vars_))
-            _jdef = model.NewIntVar(0, q_eff, f"jdef_{hash(doc)%10**6}")
+            _jdef = model.NewIntVar(0, n_avail, f"jdef_{hash(doc)%10**6}")
             model.Add(_jdef >= q_eff - _jsum)
             model.Add(_jdef >= 0)
             extra_obj.append(J_QUOTA_DEV_PENALTY * _jdef)
