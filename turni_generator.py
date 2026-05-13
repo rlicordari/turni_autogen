@@ -2567,7 +2567,7 @@ def solve_with_ortools(
             n_avail = len(vars_)
             if n_avail < q_int:
                 # Quota irraggiungibile per indisponibilità — vincolo rilassato per evitare INFEASIBLE
-                stats.setdefault("warnings", []).append(
+                pre_solve_warnings.append(
                     f"J quota {doc}: richieste {q_int} notti ma solo {n_avail} disponibili "
                     f"(indisponibilità). Quota ridotta a {n_avail}."
                 )
@@ -2589,19 +2589,18 @@ def solve_with_ortools(
         if qt == "max":
             model.Add(sv <= val)
         elif qt == "min":
-            # Rilassa se non ci sono abbastanza variabili
             effective_min = min(val, n_avail)
             if effective_min > 0:
                 model.Add(sv >= effective_min)
             if effective_min < val:
-                stats.setdefault("warnings", []).append(
+                pre_solve_warnings.append(
                     f"Quota min {doc_n}/{col}: richiesto min {val} ma solo {n_avail} slot disponibili."
                 )
         elif qt == "fixed":
             effective_val = min(val, n_avail)
             model.Add(sv == effective_val)
             if effective_val < val:
-                stats.setdefault("warnings", []).append(
+                pre_solve_warnings.append(
                     f"Quota fixed {doc_n}/{col}: richiesto {val} ma solo {n_avail} slot disponibili, ridotto a {effective_val}."
                 )
 
@@ -2620,7 +2619,7 @@ def solve_with_ortools(
                     q_eff = min(q, len(vars_))
                     model.Add(sum(vars_) == q_eff)
                     if q_eff < q:
-                        stats.setdefault("warnings", []).append(
+                        pre_solve_warnings.append(
                             f"Festivi quota {doc}: richiesti {q} ma solo {len(vars_)} slot disponibili."
                         )
     # Soft balance festivi — minimizza il massimo carico tra i medici del pool
