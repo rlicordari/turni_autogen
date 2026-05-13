@@ -3976,15 +3976,18 @@ def write_output(
     except Exception:
         pass
 
-    # Highlight "relief" blanks in yellow:
-    # - slots that ended up with an empty allowed domain after applying unavailability
-    # - penalized optional slots left blank by the solver (blank_penalty > 0)
+    # Highlight blanks in yellow:
+    # - optional slots with blank_penalty > 0 (relief valves, empty domains)
+    # - ALL blank slots for non-indispensable columns (se critical_services configurato)
     yellow_fill = PatternFill(fill_type="solid", start_color="FFFFF2CC", end_color="FFFFF2CC")
+    _critical_cols = set((cfg.get("pool_critical_services") or {}).keys()) if cfg else set()
+    _indispensable_mode = bool(_critical_cols)  # attivo solo se l'utente ha configurato critical_services
     for s in slots:
         if assignment.get(s.slot_id) is not None:
             continue
         bp = int(getattr(s, "blank_penalty", 0) or 0)
-        if bp <= 0:
+        _non_indispensable = _indispensable_mode and not any(c in _critical_cols for c in (s.columns or []))
+        if bp <= 0 and not _non_indispensable:
             continue
         for col in (s.columns or []):
             cell = ws[f"{col}{s.day.row_idx}"]
