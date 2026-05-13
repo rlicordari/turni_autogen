@@ -4175,6 +4175,11 @@ else:
         st.success(
             f"Creato ✅ in {last.get('elapsed_s')}s | status={_stats.get('status')} | {last.get('generated_at','')}"
         )
+        # Mostra solver_error se INFEASIBLE (per diagnostica)
+        if str(_stats.get("status","")).upper() == "INFEASIBLE":
+            _month_stats = (_stats.get("months") or {}).get(mk, {}) or {}
+            _serr = _month_stats.get("solver_error") or _stats.get("solver_error") or "(nessun dettaglio)"
+            st.error(f"**Errore solver:** {_serr}")
 
         # If the month fell back to GREEDY, shout it loudly (otherwise users
         # may think all HARD constraints were respected).

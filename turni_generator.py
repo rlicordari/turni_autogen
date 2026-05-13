@@ -2868,7 +2868,12 @@ def solve_with_ortools(
                 if s.columns == ["U"] and (s.slot_id, "Cimino") in x:
                     vars_.append(x[(s.slot_id, "Cimino")])
             if vars_:
-                model.Add(sum(vars_) == exact)
+                effective_exact = min(exact, len(vars_))
+                model.Add(sum(vars_) == effective_exact)
+                if effective_exact < exact:
+                    pre_solve_warnings.append(
+                        f"Cimino U: richiesti esattamente {exact} ma solo {len(vars_)} slot disponibili, ridotto a {effective_exact}."
+                    )
             else:
                 pre_solve_warnings.append(
                     f"Cimino non ha slot U disponibili questo mese: vincolo cimino_exact_per_month ignorato"
@@ -2932,7 +2937,12 @@ def solve_with_ortools(
                 cnt = model.NewIntVar(0, len(vars_), "T_rec_cnt")
                 model.Add(cnt == sum(vars_))
                 if min_rec > 0:
-                    model.Add(cnt >= min_rec)
+                    effective_min_rec = min(min_rec, len(vars_))
+                    model.Add(cnt >= effective_min_rec)
+                    if effective_min_rec < min_rec:
+                        pre_solve_warnings.append(
+                            f"Recupero T min: richiesto min {min_rec} ma solo {len(vars_)} slot T disponibili, ridotto a {effective_min_rec}."
+                        )
                 if target_rec > 0:
                     short = model.NewIntVar(0, target_rec, "T_rec_target_short")
                     model.Add(cnt + short >= target_rec)
