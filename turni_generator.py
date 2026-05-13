@@ -2604,12 +2604,11 @@ def solve_with_ortools(
                 )
             # Hard: non più di q_eff notti (rispetta il contratto)
             model.Add(sum(vars_) <= q_eff)
-            # Hard: almeno q_eff-1 notti (tollera 1 mancanza in casi impossibili)
-            model.Add(sum(vars_) >= max(0, q_eff - 1))
-            # Soft: fortissima penalità per ogni notte mancante rispetto alla quota
+            # Soft PURA: fortissima penalità per ogni notte mancante (no hard lower bound
+            # per evitare infeasibility combinatoria con university cap + spacing)
             _jsum = model.NewIntVar(0, q_eff, f"jsum_{hash(doc)%10**6}")
             model.Add(_jsum == sum(vars_))
-            _jdef = model.NewIntVar(0, 1, f"jdef_{hash(doc)%10**6}")
+            _jdef = model.NewIntVar(0, q_eff, f"jdef_{hash(doc)%10**6}")
             model.Add(_jdef >= q_eff - _jsum)
             model.Add(_jdef >= 0)
             extra_obj.append(J_QUOTA_DEV_PENALTY * _jdef)
@@ -2637,10 +2636,9 @@ def solve_with_ortools(
                 )
         elif qt == "fixed":
             effective_val = min(val, n_avail)
-            # Range [val-1, val] per evitare infeasibility combinatoria
+            # Hard upper bound + soft lower (no hard lower per evitare infeasibility)
             model.Add(sv <= effective_val)
-            model.Add(sv >= max(0, effective_val - 1))
-            _fdef = model.NewIntVar(0, 1, f"fdef_{hash((doc_n,col))%10**6}")
+            _fdef = model.NewIntVar(0, effective_val, f"fdef_{hash((doc_n,col))%10**6}")
             model.Add(_fdef >= effective_val - sv)
             model.Add(_fdef >= 0)
             extra_obj.append(J_QUOTA_DEV_PENALTY * _fdef)
@@ -2662,10 +2660,9 @@ def solve_with_ortools(
                 vars_ = [v for v in vars_ if v is not None]
                 if vars_:
                     q_eff = min(q, len(vars_))
-                    # Range [q-1, q] per evitare infeasibility combinatoria
+                    # Hard upper bound + soft lower
                     model.Add(sum(vars_) <= q_eff)
-                    model.Add(sum(vars_) >= max(0, q_eff - 1))
-                    _fqdef = model.NewIntVar(0, 1, f"fqdef_{hash(doc)%10**6}")
+                    _fqdef = model.NewIntVar(0, q_eff, f"fqdef_{hash(doc)%10**6}")
                     model.Add(_fqdef >= q_eff - sum(vars_))
                     model.Add(_fqdef >= 0)
                     extra_obj.append(J_QUOTA_DEV_PENALTY * _fqdef)
@@ -2920,10 +2917,9 @@ def solve_with_ortools(
                     vars_.append(x[(s.slot_id, "Cimino")])
             if vars_:
                 effective_exact = min(exact, len(vars_))
-                # Range [exact-1, exact] per evitare infeasibility
+                # Hard upper bound + soft lower
                 model.Add(sum(vars_) <= effective_exact)
-                model.Add(sum(vars_) >= max(0, effective_exact - 1))
-                _cudef = model.NewIntVar(0, 1, f"cudef_{effective_exact}")
+                _cudef = model.NewIntVar(0, effective_exact, f"cudef_{effective_exact}")
                 model.Add(_cudef >= effective_exact - sum(vars_))
                 model.Add(_cudef >= 0)
                 extra_obj.append(J_QUOTA_DEV_PENALTY * _cudef)
@@ -3110,8 +3106,8 @@ def solve_with_ortools(
             max_possible = len(weighted_terms) * 2
             uni_cnt = model.NewIntVar(0, max_possible, f"uni_cnt_{hash(doc)%10**6}")
             model.Add(uni_cnt == sum(weighted_terms))
-            # CAP HARD: mai più di target+1 (contratto)
-            model.Add(uni_cnt <= target + 1)
+            # CAP HARD: mai più di target+3 (tolleranza +2 per evitare infeasibility combinatoria)
+            model.Add(uni_cnt <= target + 3)
             # FLOOR SOFT: penalizza se sotto target
             under = model.NewIntVar(0, target, f"uni_under_{hash(doc)%10**6}")
             model.Add(under >= target - uni_cnt)
