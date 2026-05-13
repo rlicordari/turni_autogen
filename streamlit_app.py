@@ -1463,6 +1463,64 @@ def load_pool_config_from_github_st() -> tuple[dict, str | None]:
     )
 
 
+def sync_pool_contacts_to_github(pool_cfg: dict) -> tuple[bool, str]:
+    """Aggiorna doctor_contacts.yml su GitHub con le email definite nel pool_config.
+
+    Per ogni medico attivo con email valorizzata nel pool_config, aggiunge/aggiorna
+    la voce corrispondente in doctor_contacts.yml. Non cancella voci esistenti.
+    Ritorna (ok, messaggio).
+    """
+    g = _github_cfg()
+    if not (g.get("token") and g.get("owner") and g.get("repo")):
+        return False, "GitHub non configurato — impossibile sincronizzare i contatti."
+
+    contacts_path = g.get("contacts_path") or "data/doctor_contacts.yml"
+
+    gf = github_utils.get_file(
+        owner=g["owner"], repo=g["repo"], path=contacts_path,
+        token=g["token"], branch=g.get("branch", "main"),
+    )
+    existing: dict = {}
+    sha_contacts: str | None = None
+    if gf:
+        try:
+            existing = yaml.safe_load(gf.text) or {}
+        except Exception:
+            existing = {}
+        sha_contacts = gf.sha
+
+    changed = False
+    for doc, dcfg in (pool_cfg.get("doctors") or {}).items():
+        if not dcfg.get("active", True):
+            continue
+        email = str(dcfg.get("email") or "").strip()
+        if not email:
+            continue
+        if not isinstance(existing.get(doc), dict):
+            existing[doc] = {}
+        if existing[doc].get("email") != email:
+            existing[doc]["email"] = email
+            changed = True
+
+    if not changed:
+        return True, "Nessuna email nuova — doctor_contacts.yml già aggiornato."
+
+    content = yaml.dump(
+        {k: existing[k] for k in sorted(existing)},
+        allow_unicode=True, default_flow_style=False,
+    )
+    github_utils.put_file(
+        owner=g["owner"], repo=g["repo"], path=contacts_path,
+        token=g["token"],
+        message="Aggiornamento contatti medici da pool_config GUI",
+        content=content,
+        branch=g.get("branch", "main"),
+        sha=sha_contacts,
+    )
+    load_doctor_contacts_from_github.clear()  # invalida cache
+    return True, "Email medici sincronizzate con doctor_contacts.yml ✓"
+
+
 def save_pool_config_with_retry(cfg: dict, sha: str | None, max_retries: int = 3) -> tuple[bool, str]:
     """Salva pool_config su GitHub con retry in caso di conflitto SHA.
 
@@ -1866,6 +1924,26 @@ mode = st.sidebar.radio(
 # Load default rules (for doctor list)
 cfg_default = tg.load_rules(DEFAULT_RULES_PATH)
 doctors_default = doctors_from_cfg(cfg_default)
+
+# Aggiungi medici attivi dal pool_config non già presenti nel YAML
+# (permette di aggiungere nuovi medici dalla GUI senza toccare Regole_Turni.yml)
+try:
+    _pc_login, _ = load_pool_config_from_github_st()
+    if _pc_login:
+        _existing_dn = {tg.norm_name(d) for d in doctors_default}
+        _new_from_pc = [
+            d for d, dc in _pc_login.get("doctors", {}).items()
+            if dc.get("active", True)
+            and tg.norm_name(d) not in _existing_dn
+            and d != "Recupero"
+        ]
+        if _new_from_pc:
+            doctors_default = sorted(
+                doctors_default + _new_from_pc,
+                key=lambda s: (s == "Recupero", s.lower()),
+            )
+except Exception:
+    pass
 
 # =====================================================================
 #                        MEDICO – Indisponibilità
@@ -3095,7 +3173,9 @@ else:
                 _draft = st.session_state[_pool_draft_key]
                 _draft_doctors: dict = _draft.get("doctors", {})
                 _LIBRE_COLS = {"AD", "AE", "AF", "AG"}
-                _all_cols = sorted(k for k in cfg_admin.get("columns", {}).keys() if k not in _LIBRE_COLS)
+                # AA copia automaticamente K+T; AC è sempre Migliorato (fixed) — non esporre nella GUI
+                _AUTO_COLS = {"AA", "AC"}
+                _all_cols = sorted(k for k in cfg_admin.get("columns", {}).keys() if k not in _LIBRE_COLS and k not in _AUTO_COLS)
                 _all_docs_list = sorted(_draft_doctors.keys(), key=lambda s: (s == "Recupero", s.lower()))
 
                 import pool_config_store as _pcs_ui
@@ -3116,6 +3196,7 @@ else:
                             "Festivi diurni": bool(_dc.get("festivi_diurni", True)),
                             "Festivi notti": bool(_dc.get("festivi_notti", True)),
                             "Universitario": bool(_dc.get("university_doctor")),
+                            "Email": str(_dc.get("email") or ""),
                         })
                     _med_df = _pd_pool.DataFrame(_med_rows)
                     _edited_med = st.data_editor(
@@ -3127,6 +3208,7 @@ else:
                             "Festivi diurni": st.column_config.CheckboxColumn("Festivi diurni"),
                             "Festivi notti": st.column_config.CheckboxColumn("Festivi notti"),
                             "Universitario": st.column_config.CheckboxColumn("Universitario"),
+                            "Email": st.column_config.TextColumn("Email", help="Email per OTP/PIN (salvata in doctor_contacts.yml)"),
                         },
                         hide_index=True,
                         use_container_width=True,
@@ -3145,6 +3227,7 @@ else:
                                 "festivi_diurni": True, "festivi_notti": True,
                                 "excluded_from_reperibilita": False,
                                 "university_doctor": None, "column_overrides": {},
+                                "email": None,
                             }
                         _draft_doctors[_dn]["active"] = bool(_row["Attivo"])
                         _draft_doctors[_dn]["excluded_from_reperibilita"] = not bool(_row["Reperibilità"])
@@ -3155,6 +3238,8 @@ else:
                             _draft_doctors[_dn]["university_doctor"] = {"ratio": 0.6}
                         else:
                             _draft_doctors[_dn]["university_doctor"] = None
+                        _email_val = str(_row.get("Email") or "").strip()
+                        _draft_doctors[_dn]["email"] = _email_val if _email_val else None
                     for _dn_old in list(_draft_doctors.keys()):
                         if _dn_old not in _edited_names:
                             del _draft_doctors[_dn_old]
@@ -3352,6 +3437,10 @@ else:
                         else:
                             _ok_save, _msg_save = save_pool_config_with_retry(_to_save, _pool_cfg_sha)
                             if _ok_save:
+                                # Sincronizza email medici con doctor_contacts.yml
+                                _sync_ok, _sync_msg = sync_pool_contacts_to_github(_to_save)
+                                if not _sync_ok:
+                                    st.warning(f"Pool salvato, ma sync contatti fallita: {_sync_msg}")
                                 del st.session_state["pool_cfg_draft"]
                                 st.session_state["_cfg_flash"] = ("success", _msg_save)
                                 st.rerun()

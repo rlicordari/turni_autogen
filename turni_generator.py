@@ -807,6 +807,17 @@ def apply_pool_config(cfg_yaml: dict, pool_cfg: Optional[dict]) -> dict:
             del gc_uni[doc]
     gc["university_doctors"] = gc_uni
 
+    # 13. Soft balance per colonne senza balance nel YAML
+    # U (Contr.PM) non ha balance:true nel YAML — lo aggiungiamo quando pool_config
+    # definisce il pool, così il solver bilancia automaticamente il carico.
+    _u_pool = [
+        doc for doc, dcfg in doctors.items()
+        if dcfg.get("active", True) and "U" in (dcfg.get("columns") or [])
+    ]
+    if _u_pool:
+        rules.setdefault("U", {}).setdefault("balance", True)
+        rules["U"].setdefault("balance_weight", 200)
+
     return cfg
 
 
