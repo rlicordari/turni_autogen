@@ -3425,7 +3425,7 @@ def solve_with_ortools(
                 _ds2 = slots_by_day.get(_d2.date, [])
                 _uslots2 = [s2 for s2 in _ds2 if not _slot_is_exempt_daily(s2)]
                 for _doc2 in doctors:
-                    _dv2 = [_x2[(s2.slot_id, _doc2)] for s2 in _uslots2 if (_x2.get((s2.slot_id, _doc2)))]
+                    _dv2 = [_x2[(s2.slot_id, _doc2)] for s2 in _uslots2 if _x2.get((s2.slot_id, _doc2)) is not None]
                     if _dv2:
                         _model2.Add(sum(_dv2) <= 1)
             # fixed assignments (hard)
@@ -3437,7 +3437,7 @@ def solve_with_ortools(
                     if _fc2 == "J":
                         continue
                     _sf2 = next((s2 for s2 in slots_by_day.get(_fd2, []) if _fc2 in (s2.columns or [])), None)
-                    if _sf2 and (_x2.get((_sf2.slot_id, _fdc2))):
+                    if _sf2 and (_x2.get((_sf2.slot_id, _fdc2)) is not None):
                         _model2.Add(_x2[(_sf2.slot_id, _fdc2)] == 1)
                 except Exception:
                     pass
