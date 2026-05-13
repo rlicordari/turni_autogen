@@ -2459,15 +2459,17 @@ def solve_with_ortools(
                     vD_only = x.get((sD.slot_id, only_doc))
                     vF_only = x.get((sF.slot_id, only_doc))
 
-                    # HARD: il solo medico disponibile del pair DEVE stare in D
+                    # SOFT: forte preferenza che l'unico del pair stia in D e F
+                    # (no hard per evitare conflitto con night_off_next_day quando il medico ha fatto J ieri)
+                    _prefer_d_pen = int(rDF.get("d_not_available_penalty", 15000) or 15000)
                     if vD_only is not None:
-                        model.Add(vD_only == 1)
-
-                    # HARD: il solo medico disponibile del pair DEVE stare anche in F (D=F share)
-                    # Questo è il comportamento richiesto: se Grimaldi è indisponibile,
-                    # Calabrò deve coprire sia D che F.
+                        _nd = model.NewBoolVar(f"df_alone_d_miss_{day.date}")
+                        model.Add(_nd + vD_only >= 1)  # almeno uno dei due è 1
+                        extra_obj.append(_prefer_d_pen * _nd)
                     if vF_only is not None:
-                        model.Add(vF_only == 1)
+                        _nf = model.NewBoolVar(f"df_alone_f_miss_{day.date}")
+                        model.Add(_nf + vF_only >= 1)
+                        extra_obj.append(_prefer_d_pen * _nf)
 
                     # NON penalizzare altri medici in F (l'unico del pair li occupa entrambi)
 
