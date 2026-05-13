@@ -2579,11 +2579,11 @@ def solve_with_ortools(
                     eg_max_v = model.NewIntVar(0, n_eg, "eg_max_load")
                     model.AddMaxEquality(eg_max_v, eg_cnt_vars)
                     extra_obj.append(300 * eg_max_v)  # forte penalità per minimizzare il massimo
-    # Monthly quotas (hard) — J
-    # I fixed_assignments in J vengono applicati PRIMA (vedi sopra) e contano
-    # già come variabili x=1 nel solver. Quindi la quota rimane SEMPRE == q:
-    # se Calabrò ha quota=2 e 1 notte fissa, il solver trovera' esattamente 1
-    # altra notte libera per arrivare a 2 totali.
+    # Monthly quotas — J
+    # Range [q-1, q] con penalità 8M per ogni notte mancante rispetto alla quota.
+    # Evita infeasibility combinatoria (quota hard == + spacing + one_per_day + university)
+    # pur garantendo che il solver cerchi di rispettare la quota al massimo.
+    J_QUOTA_DEV_PENALTY = 8_000_000
     if "rules" in cfg and "J" in cfg["rules"]:
         mq = cfg["rules"]["J"].get("monthly_quotas") or {}
         for doc_raw, q in mq.items():
@@ -2596,15 +2596,23 @@ def solve_with_ortools(
                 continue
             q_int = int(q)
             n_avail = len(vars_)
+            q_eff = min(q_int, n_avail)
             if n_avail < q_int:
-                # Quota irraggiungibile per indisponibilità — vincolo rilassato per evitare INFEASIBLE
                 pre_solve_warnings.append(
-                    f"J quota {doc}: richieste {q_int} notti ma solo {n_avail} disponibili "
-                    f"(indisponibilità). Quota ridotta a {n_avail}."
+                    f"J quota {doc}: richieste {q_int} notti ma solo {n_avail} disponibili. "
+                    f"Quota adattata a {q_eff}."
                 )
-                model.Add(sum(vars_) == n_avail)
-            else:
-                model.Add(sum(vars_) == q_int)
+            # Hard: non più di q_eff notti (rispetta il contratto)
+            model.Add(sum(vars_) <= q_eff)
+            # Hard: almeno q_eff-1 notti (tollera 1 mancanza in casi impossibili)
+            model.Add(sum(vars_) >= max(0, q_eff - 1))
+            # Soft: fortissima penalità per ogni notte mancante rispetto alla quota
+            _jsum = model.NewIntVar(0, q_eff, f"jsum_{hash(doc)%10**6}")
+            model.Add(_jsum == sum(vars_))
+            _jdef = model.NewIntVar(0, 1, f"jdef_{hash(doc)%10**6}")
+            model.Add(_jdef >= q_eff - _jsum)
+            model.Add(_jdef >= 0)
+            extra_obj.append(J_QUOTA_DEV_PENALTY * _jdef)
     # Pool quota overrides max/min — da pool_config (tutti i tipi e colonne)
     qov = cfg.get("pool_quota_overrides") or {}
     for (doc_n, col), spec in qov.items():
@@ -2629,7 +2637,13 @@ def solve_with_ortools(
                 )
         elif qt == "fixed":
             effective_val = min(val, n_avail)
-            model.Add(sv == effective_val)
+            # Range [val-1, val] per evitare infeasibility combinatoria
+            model.Add(sv <= effective_val)
+            model.Add(sv >= max(0, effective_val - 1))
+            _fdef = model.NewIntVar(0, 1, f"fdef_{hash((doc_n,col))%10**6}")
+            model.Add(_fdef >= effective_val - sv)
+            model.Add(_fdef >= 0)
+            extra_obj.append(J_QUOTA_DEV_PENALTY * _fdef)
             if effective_val < val:
                 pre_solve_warnings.append(
                     f"Quota fixed {doc_n}/{col}: richiesto {val} ma solo {n_avail} slot disponibili, ridotto a {effective_val}."
@@ -2648,7 +2662,13 @@ def solve_with_ortools(
                 vars_ = [v for v in vars_ if v is not None]
                 if vars_:
                     q_eff = min(q, len(vars_))
-                    model.Add(sum(vars_) == q_eff)
+                    # Range [q-1, q] per evitare infeasibility combinatoria
+                    model.Add(sum(vars_) <= q_eff)
+                    model.Add(sum(vars_) >= max(0, q_eff - 1))
+                    _fqdef = model.NewIntVar(0, 1, f"fqdef_{hash(doc)%10**6}")
+                    model.Add(_fqdef >= q_eff - sum(vars_))
+                    model.Add(_fqdef >= 0)
+                    extra_obj.append(J_QUOTA_DEV_PENALTY * _fqdef)
                     if q_eff < q:
                         pre_solve_warnings.append(
                             f"Festivi quota {doc}: richiesti {q} ma solo {len(vars_)} slot disponibili."
@@ -2900,7 +2920,13 @@ def solve_with_ortools(
                     vars_.append(x[(s.slot_id, "Cimino")])
             if vars_:
                 effective_exact = min(exact, len(vars_))
-                model.Add(sum(vars_) == effective_exact)
+                # Range [exact-1, exact] per evitare infeasibility
+                model.Add(sum(vars_) <= effective_exact)
+                model.Add(sum(vars_) >= max(0, effective_exact - 1))
+                _cudef = model.NewIntVar(0, 1, f"cudef_{effective_exact}")
+                model.Add(_cudef >= effective_exact - sum(vars_))
+                model.Add(_cudef >= 0)
+                extra_obj.append(J_QUOTA_DEV_PENALTY * _cudef)
                 if effective_exact < exact:
                     pre_solve_warnings.append(
                         f"Cimino U: richiesti esattamente {exact} ma solo {len(vars_)} slot disponibili, ridotto a {effective_exact}."
@@ -2969,7 +2995,11 @@ def solve_with_ortools(
                 model.Add(cnt == sum(vars_))
                 if min_rec > 0:
                     effective_min_rec = min(min_rec, len(vars_))
-                    model.Add(cnt >= effective_min_rec)
+                    # Soft: fortissima penalità per mancanza (non hard per evitare infeasibility)
+                    _trecdef = model.NewIntVar(0, effective_min_rec, f"trecdef")
+                    model.Add(_trecdef >= effective_min_rec - cnt)
+                    model.Add(_trecdef >= 0)
+                    extra_obj.append(J_QUOTA_DEV_PENALTY * _trecdef)
                     if effective_min_rec < min_rec:
                         pre_solve_warnings.append(
                             f"Recupero T min: richiesto min {min_rec} ma solo {len(vars_)} slot T disponibili, ridotto a {effective_min_rec}."
