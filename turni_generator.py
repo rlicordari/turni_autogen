@@ -2521,16 +2521,21 @@ def solve_with_ortools(
                 if same_terms:
                     extra_obj.append(pen_split * sum(same_terms))
 
-        # E/G: bilanciamento hard — ogni medico può fare al massimo ceil(slots/pool_size)+1 blocchi
+        # E/G: bilanciamento hard — ogni medico può fare al massimo ceil(slots/pool_attivo)+1 blocchi
         eg_slots_all = list(eg_by_date.values())
         if eg_slots_all:
             rEG = cfg["rules"]["E_G"]
             eg_pool = [norm_name(d) for d in (rEG.get("allowed") or []) if norm_name(d) in doctors]
             if eg_pool:
                 n_eg = len(eg_slots_all)
-                n_pool = len(eg_pool)
                 import math
-                eg_max_hard = math.ceil(n_eg / n_pool) + 1  # mai più di questo
+                # Conta solo i medici con almeno una variabile disponibile (tiene conto delle indisponibilità)
+                eg_active_docs = [
+                    d for d in eg_pool
+                    if any(x.get((s.slot_id, d)) is not None for s in eg_slots_all)
+                ]
+                n_pool_active = max(len(eg_active_docs), 1)
+                eg_max_hard = math.ceil(n_eg / n_pool_active) + 1  # basato su pool attivo
                 eg_cnt_vars = []
                 for doc in eg_pool:
                     vars_ = [x.get((s.slot_id, doc)) for s in eg_slots_all if x.get((s.slot_id, doc)) is not None]
@@ -2556,8 +2561,19 @@ def solve_with_ortools(
                 continue
             vars_ = [night_var_by_day_doc.get((d.date, doc)) for d in days]
             vars_ = [v for v in vars_ if v is not None]
-            if vars_:
-                model.Add(sum(vars_) == int(q))
+            if not vars_:
+                continue
+            q_int = int(q)
+            n_avail = len(vars_)
+            if n_avail < q_int:
+                # Quota irraggiungibile per indisponibilità — vincolo rilassato per evitare INFEASIBLE
+                stats.setdefault("warnings", []).append(
+                    f"J quota {doc}: richieste {q_int} notti ma solo {n_avail} disponibili "
+                    f"(indisponibilità). Quota ridotta a {n_avail}."
+                )
+                model.Add(sum(vars_) == n_avail)
+            else:
+                model.Add(sum(vars_) == q_int)
     # Pool quota overrides max/min — da pool_config (tutti i tipi e colonne)
     qov = cfg.get("pool_quota_overrides") or {}
     for (doc_n, col), spec in qov.items():
@@ -2569,12 +2585,25 @@ def solve_with_ortools(
         sv = sum(vars_)
         qt = spec.get("type", "max")
         val = int(spec.get("value", 0))
+        n_avail = len(vars_)
         if qt == "max":
             model.Add(sv <= val)
         elif qt == "min":
-            model.Add(sv >= val)
+            # Rilassa se non ci sono abbastanza variabili
+            effective_min = min(val, n_avail)
+            if effective_min > 0:
+                model.Add(sv >= effective_min)
+            if effective_min < val:
+                stats.setdefault("warnings", []).append(
+                    f"Quota min {doc_n}/{col}: richiesto min {val} ma solo {n_avail} slot disponibili."
+                )
         elif qt == "fixed":
-            model.Add(sv == val)
+            effective_val = min(val, n_avail)
+            model.Add(sv == effective_val)
+            if effective_val < val:
+                stats.setdefault("warnings", []).append(
+                    f"Quota fixed {doc_n}/{col}: richiesto {val} ma solo {n_avail} slot disponibili, ridotto a {effective_val}."
+                )
 
     # Monthly quotas (hard) — Festivi DE+HI
     if "rules" in cfg and "Festivi" in cfg["rules"]:
@@ -2588,7 +2617,12 @@ def solve_with_ortools(
                 vars_ = [x.get((s.slot_id, doc)) for s in festivo_slots]
                 vars_ = [v for v in vars_ if v is not None]
                 if vars_:
-                    model.Add(sum(vars_) == q)
+                    q_eff = min(q, len(vars_))
+                    model.Add(sum(vars_) == q_eff)
+                    if q_eff < q:
+                        stats.setdefault("warnings", []).append(
+                            f"Festivi quota {doc}: richiesti {q} ma solo {len(vars_)} slot disponibili."
+                        )
     # Soft balance festivi — minimizza il massimo carico tra i medici del pool
     # senza quota fissa (evita Crea=3, Trio=0 ecc.)
     if "rules" in cfg and "Festivi" in cfg["rules"]:

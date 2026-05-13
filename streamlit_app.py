@@ -4228,6 +4228,13 @@ else:
                 unsafe_allow_html=True,
             )
 
+        # Avvisi quota rilassata (J, festivi, pool_quota_overrides)
+        if isinstance(_stats, dict) and _stats.get("warnings"):
+            st.warning(
+                "⚠️ **Quote rilassate per indisponibilità** — il solver ha adattato "
+                "alcune quote perché non erano raggiungibili:\n\n"
+                + "\n".join(f"- {w}" for w in _stats["warnings"]),
+            )
         if isinstance(_stats, dict) and _stats.get("C_reperibilita_diag"):
             _cdiag = _stats["C_reperibilita_diag"]
             _relax_warns = _cdiag.get("relaxation_warnings") if isinstance(_cdiag, dict) else None
@@ -4235,7 +4242,6 @@ else:
                 st.warning(
                     "⚠️ **Reperibilità (C) generata con vincoli rilassati** — "
                     "verifica il risultato:\n\n" + "\n".join(f"- {w}" for w in _relax_warns),
-                    icon="⚠️",
                 )
             with st.expander("Dettagli Reperibilità (C)"):
                 st.json(_cdiag)
