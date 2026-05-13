@@ -3519,13 +3519,73 @@ def solve_with_ortools(
                 if _st_t1 == cp_model.INFEASIBLE:
                     _groups.append("night_spacing")
 
+                # Test 2: university cap
+                _gc3 = cfg.get("global_constraints") or {}
+                _gc_uni3 = _gc3.get("university_doctors") or {}
+                _uni_ratio3 = float(_gc3.get("university_ratio", 0.6))
+                _working3 = sum(1 for d in days if d.dow in ["Mon","Tue","Wed","Thu","Fri","Sat"] and not is_festivo(d, cfg))
+                _counts_as3 = cfg.get("pool_counts_as") or {}
+                _uni_added = False
+                for _udoc3, _udcfg3 in _gc_uni3.items():
+                    _dn3 = norm_name(_udoc3)
+                    if _dn3 not in doctors:
+                        continue
+                    _wterms3 = []
+                    for _s3 in slots:
+                        _v3 = _x2.get((_s3.slot_id, _dn3))
+                        if _v3 is None:
+                            continue
+                        _w3 = max((_counts_as3.get(c, 1) for c in (_s3.columns or [])), default=1)
+                        if _w3 > 0:
+                            _wterms3.append(_w3 * _v3)
+                    if not _wterms3:
+                        continue
+                    _tgt3 = round(_working3 * _uni_ratio3)
+                    _uc3 = _model2.NewIntVar(0, len(_wterms3) * 2, f"uc3_{hash(_dn3)%10**6}")
+                    _model2.Add(_uc3 == sum(_wterms3))
+                    _model2.Add(_uc3 <= _tgt3 + 3)
+                    _uni_added = True
+                if _uni_added:
+                    _slv3 = cp_model.CpSolver()
+                    _slv3.parameters.max_time_in_seconds = 8.0
+                    _st3 = _slv3.Solve(_model2)
+                    if _st3 == cp_model.INFEASIBLE:
+                        _groups.append("university_cap(target+3)")
+
+                # Test 3: E/G hard cap
+                _eg3_by_date: Dict = {}
+                for _s3 in slots:
+                    if _s3.rule_tag == "E_G":
+                        _eg3_by_date.setdefault(_s3.day.date, _s3.slot_id)
+                _egsl3 = [_x2.get((_sid, _dn)) for _sid in _eg3_by_date.values() for _dn in doctors if _x2.get((_sid, _dn)) is not None]
+                # build per-doctor eg cap
+                _rEG3 = (cfg.get("rules") or {}).get("E_G", {})
+                _eg_pool3 = [norm_name(d) for d in (_rEG3.get("allowed") or []) if norm_name(d) in doctors]
+                _n_eg3 = len(_eg3_by_date)
+                if _eg_pool3 and _n_eg3 > 0:
+                    import math as _math3
+                    _n_act3 = max(sum(1 for d in _eg_pool3 if any(_x2.get((sid, d)) is not None for sid in _eg3_by_date.values())), 1)
+                    _emax3 = _math3.ceil(_n_eg3 / _n_act3) + 1
+                    for _d3 in _eg_pool3:
+                        _ev3 = [_x2[(sid, _d3)] for sid in _eg3_by_date.values() if _x2.get((sid, _d3)) is not None]
+                        if _ev3:
+                            _ec3 = _model2.NewIntVar(0, _n_eg3, f"ec3_{hash(_d3)%10**6}")
+                            _model2.Add(_ec3 == sum(_ev3))
+                            _model2.Add(_ec3 <= _emax3)
+                    _slv4 = cp_model.CpSolver()
+                    _slv4.parameters.max_time_in_seconds = 8.0
+                    _st4 = _slv4.Solve(_model2)
+                    if _st4 == cp_model.INFEASIBLE:
+                        _groups.append("EG_cap")
+
                 if _groups:
                     _diag_hints.append(
-                        f"Il modello BASE è FEASIBLE: gruppo [{'; '.join(_groups)}] causa infeasibility."
+                        f"Gruppo TROVATO [{'; '.join(_groups)}] causa infeasibility."
                     )
                 else:
                     _diag_hints.append(
-                        "Il modello BASE è FEASIBLE: night_spacing OK — la causa è in university/E_G cap o J lower bounds."
+                        f"night_spacing OK, university_cap OK, EG_cap OK — causa ignota. "
+                        f"Controlla Recupero T Monday, L Recupero equality, night_off constraints."
                     )
             elif _status2 == cp_model.INFEASIBLE:
                 _diag_hints.append(
