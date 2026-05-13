@@ -3471,10 +3471,66 @@ def solve_with_ortools(
             _solver2.parameters.num_search_workers = 4
             _status2 = _solver2.Solve(_model2)
             if _status2 in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
-                _diag_hints.append(
-                    "Il modello BASE (solo slot + one_per_day + fixed) è FEASIBLE: "
-                    "i vincoli di quota/spacing/university causano l'infeasibility."
-                )
+                # ── Retry granulare: trova quale gruppo causa l'infeasibility ──
+                _groups: List[str] = []
+
+                def _try_add(label: str, add_fn) -> bool:
+                    """Ritorna True se aggiungere questo gruppo rende il modello infeasible."""
+                    try:
+                        import copy as _cp2
+                        _m3 = cp_model.CpModel()
+                        # Copia tutte le variabili e i vincoli del modello base
+                        # (non possibile direttamente → testa il subset separatamente)
+                        # Strategia: aggiungi il gruppo al modello2 già costruito e ri-solvi
+                        _solver3 = cp_model.CpSolver()
+                        _solver3.parameters.max_time_in_seconds = 8.0
+                        _solver3.parameters.num_search_workers = 2
+                        add_fn(_model2, _x2)
+                        _st3 = _solver3.Solve(_model2)
+                        if _st3 == cp_model.INFEASIBLE:
+                            _groups.append(label)
+                            return True
+                        return False
+                    except Exception as _e:
+                        _groups.append(f"{label}(err:{_e})")
+                        return True
+
+                # Test 1: night spacing
+                _night_pairs_added = []
+                _ndvm2: Dict = {}
+                for _s2 in slots:
+                    if "J" in (_s2.columns or []):
+                        for _dd2 in doctors:
+                            if _x2.get((_s2.slot_id, _dd2)) is not None:
+                                _ndvm2[(_s2.day.date, _dd2)] = _x2[(_s2.slot_id, _dd2)]
+                _days_sorted2 = sorted(days, key=lambda d: d.date)
+                _min_gap2 = int((cfg.get("global_constraints") or {}).get("night_spacing_days_min", 5) or 5)
+                for _i2, _drow2 in enumerate(_days_sorted2):
+                    for _k2 in range(1, _min_gap2):
+                        _j2 = _i2 + _k2
+                        if _j2 >= len(_days_sorted2):
+                            break
+                        _d1_2, _d2_2 = _drow2.date, _days_sorted2[_j2].date
+                        for _doc2 in doctors:
+                            _v1_2 = _ndvm2.get((_d1_2, _doc2))
+                            _v2_2 = _ndvm2.get((_d2_2, _doc2))
+                            if _v1_2 is not None and _v2_2 is not None:
+                                _model2.Add(_v1_2 + _v2_2 <= 1)
+
+                _solver_t1 = cp_model.CpSolver()
+                _solver_t1.parameters.max_time_in_seconds = 8.0
+                _st_t1 = _solver_t1.Solve(_model2)
+                if _st_t1 == cp_model.INFEASIBLE:
+                    _groups.append("night_spacing")
+
+                if _groups:
+                    _diag_hints.append(
+                        f"Il modello BASE è FEASIBLE: gruppo [{'; '.join(_groups)}] causa infeasibility."
+                    )
+                else:
+                    _diag_hints.append(
+                        "Il modello BASE è FEASIBLE: night_spacing OK — la causa è in university/E_G cap o J lower bounds."
+                    )
             elif _status2 == cp_model.INFEASIBLE:
                 _diag_hints.append(
                     "INFEASIBLE anche senza quote/spacing: il problema è nella copertura base degli slot. "
