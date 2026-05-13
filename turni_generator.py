@@ -3356,21 +3356,87 @@ def solve_with_ortools(
     solver.parameters.num_search_workers = 8
     status = solver.Solve(model)
     if status not in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
-        # Diagnostica slot vuoti per giorno
-        _slots_by_day: dict = {}
+        # ── Diagnostica: retry senza vincoli di quota hard per identificare la causa ──
+        _diag_hints: List[str] = []
+        try:
+            _model2 = cp_model.CpModel()
+            _extra2: List = []
+            _BLANK_PEN2 = 5_000_000
+            _BLANK_CRIT2 = 50_000_000
+            _CRIT2 = {"H", "I", "J", "Festivo_HI"}
+            _x2: Dict = {}
+            for s2 in slots:
+                for d2 in (s2.allowed or []):
+                    if norm_name(d2) in doc_to_idx:
+                        _x2[(s2.slot_id, norm_name(d2))] = _model2.NewBoolVar(
+                            f"x2_{hash(s2.slot_id)%10**7}_{hash(d2)%10**7}"
+                        )
+            for s2 in slots:
+                _v2 = [_x2[(s2.slot_id, norm_name(d2))] for d2 in (s2.allowed or [])
+                       if (s2.slot_id, norm_name(d2)) in _x2]
+                if not _v2:
+                    continue
+                if s2.required:
+                    _bb2 = _model2.NewBoolVar(f"bb2_{hash(s2.slot_id)%10**7}")
+                    _model2.Add(sum(_v2) + _bb2 == 1)
+                    _pen2 = _BLANK_CRIT2 if s2.rule_tag in _CRIT2 else _BLANK_PEN2
+                    _extra2.append(_pen2 * _bb2)
+                else:
+                    _model2.Add(sum(_v2) <= 1)
+            # one_per_day (semplificato, senza share slack)
+            for _d2 in days:
+                _ds2 = slots_by_day.get(_d2.date, [])
+                _uslots2 = [s2 for s2 in _ds2 if not _slot_is_exempt_daily(s2)]
+                for _doc2 in doctors:
+                    _dv2 = [_x2[(s2.slot_id, _doc2)] for s2 in _uslots2 if (_x2.get((s2.slot_id, _doc2)))]
+                    if _dv2:
+                        _model2.Add(sum(_dv2) <= 1)
+            # fixed assignments (hard)
+            for _fa2 in (fixed_assignments or []):
+                try:
+                    _fc2 = str(_fa2.get("column","")).strip().upper()
+                    _fd2 = date.fromisoformat(str(_fa2.get("date","")).strip())
+                    _fdc2 = norm_name(str(_fa2.get("doctor","")).strip())
+                    if _fc2 == "J":
+                        continue
+                    _sf2 = next((s2 for s2 in slots_by_day.get(_fd2, []) if _fc2 in (s2.columns or [])), None)
+                    if _sf2 and (_x2.get((_sf2.slot_id, _fdc2))):
+                        _model2.Add(_x2[(_sf2.slot_id, _fdc2)] == 1)
+                except Exception:
+                    pass
+            _model2.Minimize(sum(_extra2) if _extra2 else _model2.NewIntVar(0, 0, "z2"))
+            _solver2 = cp_model.CpSolver()
+            _solver2.parameters.max_time_in_seconds = 15.0
+            _solver2.parameters.num_search_workers = 4
+            _status2 = _solver2.Solve(_model2)
+            if _status2 in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
+                _diag_hints.append(
+                    "Il modello BASE (solo slot + one_per_day + fixed) è FEASIBLE: "
+                    "i vincoli di quota/spacing/university causano l'infeasibility."
+                )
+            elif _status2 == cp_model.INFEASIBLE:
+                _diag_hints.append(
+                    "INFEASIBLE anche senza quote/spacing: il problema è nella copertura base degli slot. "
+                    "Controlla pool vuoti o fixed_assignments impossibili."
+                )
+            else:
+                _diag_hints.append(f"Retry diagnostico: status={_status2} (timeout o unknown).")
+        except Exception as _de:
+            _diag_hints.append(f"Retry diagnostico fallito: {_de}")
+        # Slot summary
+        _slots_by_day_d: dict = {}
         for _s in slots:
-            _slots_by_day.setdefault(_s.day.date.isoformat(), []).append(_s)
+            _slots_by_day_d.setdefault(_s.day.date.isoformat(), []).append(_s)
         _tight_days = []
-        for _day_str, _day_slots in sorted(_slots_by_day.items()):
+        for _day_str, _day_slots in sorted(_slots_by_day_d.items()):
             _req = [_s for _s in _day_slots if _s.required]
             _empty = [_s for _s in _req if not _s.allowed]
             _very_small = [f"{'+'.join(_s.columns)}({len(_s.allowed)})" for _s in _req if 0 < len(_s.allowed) <= 2]
             if _empty or _very_small:
                 _tight_days.append(f"{_day_str}: vuoti={['+'.join(_s.columns) for _s in _empty]} ristretti={_very_small}")
-        _diag = "; ".join(_tight_days) if _tight_days else "nessun slot vuoto rilevato"
+        _slots_diag = "; ".join(_tight_days) if _tight_days else "nessun slot vuoto"
         raise RuntimeError(
-            f"INFEASIBLE — slot critici: {_diag}. "
-            "Controlla vincoli hard (quotas J, university cap, uniqueness) e indisponibilità."
+            f"{'; '.join(_diag_hints)} | Slot critici: {_slots_diag}"
         )
     # Identify required slots left blank (b_blank == 1) for diagnostics
     forced_blank_slots: List[str] = []
