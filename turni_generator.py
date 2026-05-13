@@ -2573,7 +2573,11 @@ def solve_with_ortools(
                     if vars_:
                         eg_cnt = model.NewIntVar(0, n_eg, f"eg_cnt_{hash(doc)%10**6}")
                         model.Add(eg_cnt == sum(vars_))
-                        model.Add(eg_cnt <= eg_max_hard)  # HARD cap
+                        # Soft: penalizza eccesso (no hard per evitare infeasibility)
+                        _eg_over = model.NewIntVar(0, n_eg, f"eg_over_{hash(doc)%10**6}")
+                        model.Add(_eg_over >= eg_cnt - eg_max_hard)
+                        model.Add(_eg_over >= 0)
+                        extra_obj.append(300_000 * _eg_over)
                         eg_cnt_vars.append(eg_cnt)
                 if eg_cnt_vars:
                     eg_max_v = model.NewIntVar(0, n_eg, "eg_max_load")
@@ -2602,8 +2606,12 @@ def solve_with_ortools(
                     f"J quota {doc}: richieste {q_int} notti ma solo {n_avail} disponibili. "
                     f"Quota adattata a {q_eff}."
                 )
-            # Hard: non più di q_eff notti (rispetta il contratto)
-            model.Add(sum(vars_) <= q_eff)
+            # Soft: penalizza se sopra quota (no hard per evitare infeasibility combinatoria)
+            # Nota: il solver difficilmente supera la quota dato il costo elevato
+            _jsup = model.NewIntVar(0, n_avail, f"jsup_{hash(doc)%10**6}")
+            model.Add(_jsup >= sum(vars_) - q_eff)
+            model.Add(_jsup >= 0)
+            extra_obj.append(J_QUOTA_DEV_PENALTY * _jsup)
             # Soft PURA: fortissima penalità per ogni notte mancante (no hard lower bound
             # per evitare infeasibility combinatoria con university cap + spacing)
             _jsum = model.NewIntVar(0, q_eff, f"jsum_{hash(doc)%10**6}")
@@ -2847,7 +2855,11 @@ def solve_with_ortools(
                         if sH and (sH.slot_id, doc) in x:
                             vars_.append(x[(sH.slot_id, doc)])
                 if vars_:
-                    model.Add(sum(vars_) <= cap)
+                    # Soft: penalizza eccesso rispetto al cap (no hard per evitare infeasibility)
+                    _hcap_over = model.NewIntVar(0, len(vars_), f"hcap_over_{hash(doc)%10**6}")
+                    model.Add(_hcap_over >= sum(vars_) - cap)
+                    model.Add(_hcap_over >= 0)
+                    extra_obj.append(500_000 * _hcap_over)
     # L quota Recupero
     if "rules" in cfg and "L" in cfg["rules"]:
         qrec = cfg["rules"]["L"].get("quota_recupero_per_month")
@@ -3108,8 +3120,11 @@ def solve_with_ortools(
             max_possible = len(weighted_terms) * 2
             uni_cnt = model.NewIntVar(0, max_possible, f"uni_cnt_{hash(doc)%10**6}")
             model.Add(uni_cnt == sum(weighted_terms))
-            # CAP HARD: mai più di target+3 (tolleranza +2 per evitare infeasibility combinatoria)
-            model.Add(uni_cnt <= target + 3)
+            # Soft: penalizza se sopra target+1 (no hard per evitare infeasibility combinatoria)
+            _uni_over = model.NewIntVar(0, max_possible, f"uni_over_{hash(doc)%10**6}")
+            model.Add(_uni_over >= uni_cnt - (target + 1))
+            model.Add(_uni_over >= 0)
+            extra_obj.append(500_000 * _uni_over)
             # FLOOR SOFT: penalizza se sotto target
             under = model.NewIntVar(0, target, f"uni_under_{hash(doc)%10**6}")
             model.Add(under >= target - uni_cnt)
