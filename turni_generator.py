@@ -2857,13 +2857,15 @@ def solve_with_ortools(
                 if s.columns == ["L"] and (s.slot_id, "Recupero") in x:
                     vars_.append(x[(s.slot_id, "Recupero")])
             if vars_:
-                # Hard cap (<=) and soft preference to reach the target.
                 qrec_int = int(qrec)
                 model.Add(sum(vars_) <= qrec_int)
-                # soft: minimize shortfall (qrec_int - sum(vars_))
-                short = model.NewIntVar(0, qrec_int, f"L_rec_short")
-                model.Add(sum(vars_) + short == qrec_int)
-                extra_obj.append(5 * short)
+                # Soft: penalizza shortfall senza hard equality (evita infeasibility)
+                _lrec_sum = model.NewIntVar(0, qrec_int, f"L_rec_sum")
+                model.Add(_lrec_sum == sum(vars_))
+                _lrec_short = model.NewIntVar(0, qrec_int, f"L_rec_short")
+                model.Add(_lrec_short >= qrec_int - _lrec_sum)
+                model.Add(_lrec_short >= 0)
+                extra_obj.append(5 * _lrec_short)
 
     
     # ------------------------------------------------------------
@@ -2890,21 +2892,21 @@ def solve_with_ortools(
             MonT_need_rec = len(target_mondays)
             MonT_target_dates = [d.date for d in target_mondays]
 
-            # Force T=Recupero on target Mondays
+            # Soft: forte preferenza T=Recupero sui primi 2 lunedì (no hard per evitare infeasibility)
+            _REC_T_MON_PENALTY = 6_000_000
             for d in target_mondays:
                 sT = next((s for s in slots_by_day[d.date] if s.columns == ["T"]), None)
                 if sT and (sT.slot_id, "Recupero") in x:
-                    model.Add(x[(sT.slot_id, "Recupero")] == 1)
-                else:
-                    pre_solve_warnings.append(
-                        f"Recupero non disponibile per T il {d.date} (lunedì target): vincolo ignorato"
-                    )
+                    _v_rec_t = x[(sT.slot_id, "Recupero")]
+                    _b_rec_t = model.NewBoolVar(f"rec_t_miss_{d.date.isoformat()}")
+                    model.Add(_b_rec_t + _v_rec_t >= 1)  # almeno uno dei due è 1
+                    extra_obj.append(_REC_T_MON_PENALTY * _b_rec_t)
 
-            # For all other Mondays, forbid T=Recupero (so it happens on exactly 2 Mondays)
+            # Soft: scoraggia T=Recupero sugli altri lunedì
             for d in other_mondays:
                 sT = next((s for s in slots_by_day[d.date] if s.columns == ["T"]), None)
                 if sT and (sT.slot_id, "Recupero") in x:
-                    model.Add(x[(sT.slot_id, "Recupero")] == 0)
+                    extra_obj.append((_REC_T_MON_PENALTY // 2) * x[(sT.slot_id, "Recupero")])
 
     # U (Contr.PM) – Cimino esattamente N volte/mese (default: 2)
     if "rules" in cfg and "U" in cfg["rules"] and "Cimino" in doctors:
