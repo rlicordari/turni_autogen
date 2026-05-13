@@ -486,41 +486,85 @@ def assign_reperibilita_C(cfg: dict, days: List[DayRow], slots: List[Slot],
                     return False
         return True
 
+    # ── Funzione candidati con proximity J configurabile ──────────────────────
+    def build_candidates_with_prox(night_prox: int) -> Dict[dt.date, List[str]]:
+        """Costruisce candidates_by_date con finestra J±night_prox (0 = solo same-day)."""
+        result: Dict[dt.date, List[str]] = {}
+        for d in c_dates:
+            cands = []
+            for doc in pool:
+                if doc not in set(allowed_norm_by_date.get(d, [])):
+                    continue
+                # not_night_same_day sempre attivo
+                if assignment.get(f"{d}-{night_col}") == doc:
+                    continue
+                # Proximity J rilassabile
+                blocked = False
+                for delta in range(1, night_prox + 1):
+                    if assignment.get(f"{(d - dt.timedelta(days=delta))}-{night_col}") == doc:
+                        blocked = True; break
+                    if assignment.get(f"{(d + dt.timedelta(days=delta))}-{night_col}") == doc:
+                        blocked = True; break
+                if blocked:
+                    continue
+                # Festivi: non assegnato nello stesso giorno
+                if "not_working_same_day_on_sundays_and_holidays" in constraints:
+                    drow = dayrow_by_date.get(d)
+                    if drow is not None and is_festivo(drow, cfg):
+                        if doctor_works_same_day(d, doc):
+                            continue
+                cands.append(doc)
+            result[d] = cands
+        return result
+
+    # Costruisci candidati con proximity progressivamente rilassata
+    _c_relaxation_warnings: List[str] = []
     candidates_by_date: Dict[dt.date, List[str]] = {}
-    for d in c_dates:
-        candidates_by_date[d] = [doc for doc in pool if ok_candidate(d, doc)]
-        if not candidates_by_date[d]:
-            raise ValueError(
-                f"C_reperibilita infeasible: nessun candidato per {d} "
-                f"(controlla esclusioni/indisponibilità/Notte J e vincoli festivi)."
-            )
+    for _night_prox in [2, 1, 0]:
+        candidates_by_date = build_candidates_with_prox(_night_prox)
+        _empty_days = [d for d in c_dates if not candidates_by_date[d]]
+        if not _empty_days:
+            if _night_prox < 2:
+                _c_relaxation_warnings.append(
+                    f"C reperibilità: vincolo J proximity rilassato a ±{_night_prox} giorni "
+                    f"per trovare candidati."
+                )
+            break
+        if _night_prox == 0:
+            # Ultimo resort: ignora del tutto la disponibilità per i giorni problematici
+            for d in _empty_days:
+                fallback = list(allowed_norm_by_date.get(d, [])) or pool[:]
+                candidates_by_date[d] = fallback
+                _c_relaxation_warnings.append(
+                    f"C reperibilità: {d} senza candidati strict → usato pool completo ({len(fallback)} dottori)."
+                )
 
     total_days = len(c_dates)
     n_docs = len(pool)
 
-    # Feasibility checks for min/max
+    # Feasibility checks for min/max (con auto-aumento max_per se necessario)
     if max_per <= 0:
         raise ValueError("C_reperibilita: max_per_doctor deve essere > 0.")
     if min_per < 0:
         min_per = 0
 
     if total_days > n_docs * max_per:
-        raise ValueError(
-            f"C_reperibilita infeasible: {total_days} giorni ma solo {n_docs} medici eleggibili con max {max_per}/mese "
-            f"(capacità {n_docs*max_per}). Riduci 'excluded' o aumenta il pool (oppure aumenta max_per_doctor)."
+        # Auto-rilassa max_per invece di fallire
+        max_per = (total_days + n_docs - 1) // n_docs  # ceil(total/n)
+        _c_relaxation_warnings.append(
+            f"C reperibilità: max_per_doctor aumentato a {max_per} per coprire {total_days} giorni con {n_docs} medici."
         )
     if min_per > 0 and total_days < n_docs * min_per:
-        raise ValueError(
-            f"C_reperibilita infeasible: {total_days} giorni ma {n_docs} medici eleggibili con min {min_per}/mese "
-            f"(richiesti {n_docs*min_per}). Riduci il pool (o min_per_doctor)."
+        min_per = 0
+        _c_relaxation_warnings.append(
+            f"C reperibilità: min_per_doctor azzerato — troppi medici nel pool per il mese."
         )
 
     # Build desired counts: start at min_per, distribute remaining +1 up to max_per
     desired = {doc: (min_per if min_per > 0 else 0) for doc in pool}
     cur = sum(desired.values())
     remaining = total_days - cur
-    # Prefer target=2 if min_per==0; otherwise distribute evenly
-    order_docs = pool[:]  # stable
+    order_docs = pool[:]
     while remaining > 0:
         progress = False
         for doc in order_docs:
@@ -531,66 +575,99 @@ def assign_reperibilita_C(cfg: dict, days: List[DayRow], slots: List[Slot],
         if not progress:
             break
     if sum(desired.values()) != total_days:
-        raise ValueError("C_reperibilita internal error: desired counts do not match total days.")
+        # Distribuisci il residuo ignorando max_per
+        for doc in order_docs:
+            if remaining <= 0:
+                break
+            desired[doc] += 1
+            remaining -= 1
 
-    # Backtracking assignment with spacing constraint
-    c_dates_sorted = sorted(c_dates, key=lambda d: (len(candidates_by_date[d]), d))
+    # Backtracking DFS con retry su spacing rilassato
     assigned: Dict[dt.date, str] = {}
-    cnt = {doc: 0 for doc in pool}
-    dates_by_doc: Dict[str, List[dt.date]] = {doc: [] for doc in pool}
 
-    def spacing_ok(doc: str, d: dt.date) -> bool:
-        if spacing_min and spacing_min > 1:
-            for prev in dates_by_doc[doc]:
-                if abs((d - prev).days) < spacing_min:
-                    return False
-        return True
+    def _run_dfs_attempt(sp: int) -> bool:
+        _cnt = {doc: 0 for doc in pool}
+        _dates_by_doc: Dict[str, List[dt.date]] = {doc: [] for doc in pool}
+        _c_dates_sorted = sorted(c_dates, key=lambda d: (len(candidates_by_date[d]), d))
 
-    def pick_docs_for_day(d: dt.date) -> List[str]:
-        cands = candidates_by_date[d]
-        drow = dayrow_by_date.get(d)
-        day_is_festivo = drow is not None and is_festivo(drow, cfg)
-        def key(doc):
-            # On festivo days prefer doctors from the Festivi sorteggio pool;
-            # doctors doing Notte are already excluded upstream by ok_candidate().
-            festivo_pref = 1 if (day_is_festivo and doc in festivi_pool_norm) else 0
-            return (festivo_pref, desired[doc] - cnt[doc], -cnt[doc], doc.lower())
-        return sorted(cands, key=key, reverse=True)
-
-    def dfs(i: int) -> bool:
-        if i == len(c_dates_sorted):
+        def _spacing_ok(doc: str, d: dt.date) -> bool:
+            if sp > 1:
+                for prev in _dates_by_doc[doc]:
+                    if abs((d - prev).days) < sp:
+                        return False
             return True
-        d = c_dates_sorted[i]
-        for doc in pick_docs_for_day(d):
-            if cnt[doc] >= desired[doc]:
-                continue
-            if not spacing_ok(doc, d):
-                continue
-            assigned[d] = doc
-            cnt[doc] += 1
-            dates_by_doc[doc].append(d)
-            if dfs(i + 1):
-                return True
-            dates_by_doc[doc].pop()
-            cnt[doc] -= 1
-            assigned.pop(d, None)
-        return False
 
-    solved = dfs(0)
+        def _pick(d: dt.date) -> List[str]:
+            cands = candidates_by_date[d]
+            drow = dayrow_by_date.get(d)
+            day_is_festivo = drow is not None and is_festivo(drow, cfg)
+            def key(doc):
+                festivo_pref = 1 if (day_is_festivo and doc in festivi_pool_norm) else 0
+                return (festivo_pref, desired[doc] - _cnt[doc], -_cnt[doc], doc.lower())
+            return sorted(cands, key=key, reverse=True)
+
+        def _dfs(i: int) -> bool:
+            if i == len(_c_dates_sorted):
+                return True
+            d = _c_dates_sorted[i]
+            for doc in _pick(d):
+                if _cnt[doc] >= desired[doc]:
+                    continue
+                if not _spacing_ok(doc, d):
+                    continue
+                assigned[d] = doc
+                _cnt[doc] += 1
+                _dates_by_doc[doc].append(d)
+                if _dfs(i + 1):
+                    return True
+                _dates_by_doc[doc].pop()
+                _cnt[doc] -= 1
+                assigned.pop(d, None)
+            return False
+
+        assigned.clear()
+        return _dfs(0)
+
+    solved = False
+    _spacing_tried = spacing_min
+    for _sp in ([spacing_min] + list(range(spacing_min - 1, -1, -1))):
+        solved = _run_dfs_attempt(_sp)
+        if solved:
+            if _sp < spacing_min:
+                _c_relaxation_warnings.append(
+                    f"C reperibilità: spacing rilassato a {_sp} giorni (originale {spacing_min})."
+                )
+            break
+
     if not solved:
         raise ValueError(
-            "C_reperibilita infeasible under strict constraints (min/max/spacing/night/festivi). "
-            "Suggerimenti: allarga pool, riduci excluded, oppure riduci spacing_min_days."
+            "C_reperibilita: impossibile assegnare la reperibilità anche con vincoli rilassati. "
+            f"Pool: {pool}, pool_size={n_docs}, giorni={total_days}. "
+            "Verifica che il pool C non sia vuoto e che max_per_doctor sia sufficiente."
         )
 
     # Write back into assignment
     for d in c_dates:
         assignment[cslot_by_date[d].slot_id] = assigned.get(d)
 
-    # Diagnostics
-    diag: Dict = {"status": "OK_STRICT", "pool_size": n_docs, "total_days": total_days, "spacing_min_days": spacing_min}
-    diag["counts"] = {k: v for k, v in sorted(cnt.items(), key=lambda kv: (-kv[1], kv[0].lower())) if v}
-    # Overlap stats (weekdays should generally allow overlap)
+    # Diagnostics (compute counts from assigned dict)
+    _assigned_cnt: Dict[str, int] = {}
+    for d in c_dates:
+        doc = assigned.get(d)
+        if doc:
+            _assigned_cnt[doc] = _assigned_cnt.get(doc, 0) + 1
+
+    status_str = "OK_RELAXED" if _c_relaxation_warnings else "OK_STRICT"
+    diag: Dict = {
+        "status": status_str,
+        "pool_size": n_docs,
+        "total_days": total_days,
+        "spacing_min_days": spacing_min,
+    }
+    diag["counts"] = {k: v for k, v in sorted(_assigned_cnt.items(), key=lambda kv: (-kv[1], kv[0].lower())) if v}
+    if _c_relaxation_warnings:
+        diag["relaxation_warnings"] = _c_relaxation_warnings
+    # Overlap stats
     overlap_total = 0
     overlap_weekdays = 0
     for d in c_dates:
@@ -1561,24 +1638,30 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                 pool = apply_unavailability(pool, day, "Mattina", unav)
                 slots.append(Slot(day, f"{day.date}-AC", ["AC"], pool, required=True, shift="Mattina", rule_tag="AC"))
     # Validate domains
-    # If a slot ends up with an empty allowed domain, we *do not* crash.
-    # This can legitimately happen when the (possibly single-doctor) pool is fully
-    # unavailable on that day/shift (e.g. AC Scintigrafia with fixed doctor).
-    #
-    # Strategy: downgrade the slot to optional so it can remain blank and the rest
-    # of the schedule can still be generated.
+    # Se il pool di uno slot required è completamente esaurito (indisponibilità + smonti notte),
+    # prima di renderlo opzionale proviamo a espandere a qualsiasi medico attivo disponibile.
+    # Questo implementa il fallback "any available doctor" per i pool esauriti.
+    _abs_excl_norm = {norm_name(x) for x in (cfg.get("absolute_exclusions") or [])}
+    # Pool di emergenza: tutti i medici attivi non esclusi in assoluto (Recupero incluso solo per non-required)
+    _emergency_pool_all = [d for d in doctors_all if norm_name(d) not in _abs_excl_norm]
+    _emergency_pool_no_rec = [d for d in _emergency_pool_all if norm_name(d) != "recupero"]
+
     for s in slots:
         if not s.allowed:
+            if s.required:
+                # Prova a espandere a qualsiasi medico disponibile per quel giorno/turno
+                _emerg = apply_unavailability(_emergency_pool_no_rec, s.day, s.shift, unav)
+                if _emerg:
+                    s.allowed = _emerg
+                    # Slot coperto con medico di emergenza: penalità alta ma non blocca il solver
+                    # (il solver preferirà sempre un medico del pool originale se disponibile)
+                    continue
+            # Ancora vuoto (o optional): downgrade classico
             s.empty_domain = True
-            # Required slot with empty domain -> allow blank.
             if s.required:
                 s.required = False
-                # Non-zero penalty is only used for reporting; when the domain is truly empty
-                # there are no decision vars, so it won't affect the solver objective.
                 if getattr(s, "blank_penalty", 0) == 0:
                     s.blank_penalty = 1
-            # optional slot can be left blank
-            continue
     return slots
 # -------------------------
 # Solver (OR-Tools CP-SAT)

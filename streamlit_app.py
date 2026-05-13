@@ -4229,5 +4229,13 @@ else:
             )
 
         if isinstance(_stats, dict) and _stats.get("C_reperibilita_diag"):
+            _cdiag = _stats["C_reperibilita_diag"]
+            _relax_warns = _cdiag.get("relaxation_warnings") if isinstance(_cdiag, dict) else None
+            if _relax_warns:
+                st.warning(
+                    "⚠️ **Reperibilità (C) generata con vincoli rilassati** — "
+                    "verifica il risultato:\n\n" + "\n".join(f"- {w}" for w in _relax_warns),
+                    icon="⚠️",
+                )
             with st.expander("Dettagli Reperibilità (C)"):
-                st.json(_stats["C_reperibilita_diag"])
+                st.json(_cdiag)
