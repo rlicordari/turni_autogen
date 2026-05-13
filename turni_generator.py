@@ -3578,14 +3578,61 @@ def solve_with_ortools(
                     if _st4 == cp_model.INFEASIBLE:
                         _groups.append("EG_cap")
 
+                # Test 4: night_off_next_day
+                _gc4 = cfg.get("global_constraints") or {}
+                _night_next4 = bool((_gc4.get("night_off") or {}).get("next_day", True))
+                if _night_next4:
+                    _days_s4 = sorted(days, key=lambda d: d.date)
+                    for _i4, _drow4 in enumerate(_days_s4[:-1]):
+                        _next4 = _days_s4[_i4 + 1].date
+                        for _doc4 in doctors:
+                            _v1_4 = _ndvm2.get((_drow4.date, _doc4))
+                            if _v1_4 is None:
+                                continue
+                            for _s4 in slots_by_day.get(_next4, []):
+                                if _slot_is_exempt_daily(_s4):
+                                    continue
+                                _v2_4 = _x2.get((_s4.slot_id, _doc4))
+                                if _v2_4 is not None:
+                                    _model2.Add(_v1_4 + _v2_4 <= 1)
+                    _slv5 = cp_model.CpSolver()
+                    _slv5.parameters.max_time_in_seconds = 10.0
+                    _st5 = _slv5.Solve(_model2)
+                    if _st5 == cp_model.INFEASIBLE:
+                        _groups.append("night_off_next_day")
+
+                # Test 5: H/I consecutive day
+                _hi_ids5: Dict = {}
+                for _s5 in slots:
+                    for _c5 in (_s5.columns or []):
+                        if _c5 in {"H", "I"}:
+                            _hi_ids5.setdefault((_s5.day.date, _c5), []).append(_s5.slot_id)
+                _ds5 = sorted(days, key=lambda d: d.date)
+                for _i5 in range(len(_ds5) - 1):
+                    _d1_5, _d2_5 = _ds5[_i5].date, _ds5[_i5 + 1].date
+                    for _col5 in ("H", "I"):
+                        for _doc5 in doctors:
+                            if _doc5 == "Recupero":
+                                continue
+                            _vv1 = [_x2.get((sid, _doc5)) for sid in _hi_ids5.get((_d1_5, _col5), []) if _x2.get((sid, _doc5)) is not None]
+                            _vv2 = [_x2.get((sid, _doc5)) for sid in _hi_ids5.get((_d2_5, _col5), []) if _x2.get((sid, _doc5)) is not None]
+                            if _vv1 and _vv2:
+                                _model2.Add(sum(_vv1) + sum(_vv2) <= 1)
+                _slv6 = cp_model.CpSolver()
+                _slv6.parameters.max_time_in_seconds = 10.0
+                _st6 = _slv6.Solve(_model2)
+                if _st6 == cp_model.INFEASIBLE:
+                    _groups.append("HI_consecutive")
+
                 if _groups:
                     _diag_hints.append(
                         f"Gruppo TROVATO [{'; '.join(_groups)}] causa infeasibility."
                     )
                 else:
                     _diag_hints.append(
-                        f"night_spacing OK, university_cap OK, EG_cap OK — causa ignota. "
-                        f"Controlla Recupero T Monday, L Recupero equality, night_off constraints."
+                        f"Tutti i gruppi OK — causa è in combinazione non testata "
+                        f"(Recupero T Monday forced, L Recupero sum+short=3, o altro). "
+                        f"Prossimo passo: disabilita pool_config e testa con YAML puro."
                     )
             elif _status2 == cp_model.INFEASIBLE:
                 _diag_hints.append(
