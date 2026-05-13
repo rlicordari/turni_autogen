@@ -3356,11 +3356,21 @@ def solve_with_ortools(
     solver.parameters.num_search_workers = 8
     status = solver.Solve(model)
     if status not in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
-        # Model is truly infeasible even with soft-required slack variables.
-        # This should not happen in normal operation; raise with diagnostics.
+        # Diagnostica slot vuoti per giorno
+        _slots_by_day: dict = {}
+        for _s in slots:
+            _slots_by_day.setdefault(_s.day.date.isoformat(), []).append(_s)
+        _tight_days = []
+        for _day_str, _day_slots in sorted(_slots_by_day.items()):
+            _req = [_s for _s in _day_slots if _s.required]
+            _empty = [_s for _s in _req if not _s.allowed]
+            _very_small = [f"{'+'.join(_s.columns)}({len(_s.allowed)})" for _s in _req if 0 < len(_s.allowed) <= 2]
+            if _empty or _very_small:
+                _tight_days.append(f"{_day_str}: vuoti={['+'.join(_s.columns) for _s in _empty]} ristretti={_very_small}")
+        _diag = "; ".join(_tight_days) if _tight_days else "nessun slot vuoto rilevato"
         raise RuntimeError(
-            "No feasible schedule found even with relaxed constraints. "
-            "Controlla vincoli hard (quotas J, pattern D/F, uniqueness) e fixed_assignments."
+            f"INFEASIBLE — slot critici: {_diag}. "
+            "Controlla vincoli hard (quotas J, university cap, uniqueness) e indisponibilità."
         )
     # Identify required slots left blank (b_blank == 1) for diagnostics
     forced_blank_slots: List[str] = []
