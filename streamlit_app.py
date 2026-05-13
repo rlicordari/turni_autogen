@@ -3389,33 +3389,37 @@ else:
                     _draft["service_combinations"] = _new_combos
 
                     st.divider()
-                    st.markdown("**Servizi critici** — fallback se pool primario esaurito")
-                    _critical: dict = _draft.setdefault("critical_services", {})
-                    _crit_rows = []
-                    for _col, _spec in _critical.items():
-                        _fb = _spec.get("fallback", "any")
-                        _crit_rows.append({"Colonna": _col, "Fallback": "any" if _fb == "any" else ", ".join(_fb)})
-                    _crit_df = _pd_pool.DataFrame(_crit_rows) if _crit_rows else _pd_pool.DataFrame(columns=["Colonna", "Fallback"])
-                    _edited_crit = st.data_editor(
-                        _crit_df,
-                        column_config={
-                            "Colonna": st.column_config.SelectboxColumn("Colonna", options=_all_cols),
-                            "Fallback": st.column_config.TextColumn("Fallback", help="'any' oppure nomi separati da virgola"),
-                        },
-                        hide_index=True, use_container_width=True, key="pool_crit_editor", num_rows="dynamic",
+                    st.markdown("**Servizi indispensabili**")
+                    st.info(
+                        "Le colonne marcate come **indispensabili** hanno un fallback automatico: "
+                        "se il pool primario è esaurito (per ferie, indisponibilità, smonti notte), "
+                        "il solver può assegnare **qualsiasi medico disponibile** in quel turno. "
+                        "Il medico di emergenza riceve una penalità alta — viene usato solo se "
+                        "non esiste alternativa — ma la colonna non rimane vuota.",
+                        icon="🚨",
                     )
+                    _critical: dict = _draft.setdefault("critical_services", {})
+                    # Colonne attualmente marcate come indispensabili (fallback=any)
+                    _curr_critical_cols = sorted(
+                        col for col, spec in _critical.items() if spec.get("fallback") == "any"
+                    )
+                    _selected_critical = st.multiselect(
+                        "Colonne indispensabili (fallback → qualsiasi medico)",
+                        options=_all_cols,
+                        default=[c for c in _curr_critical_cols if c in _all_cols],
+                        key="pool_critical_multisel",
+                        help="Seleziona le colonne che non devono mai rimanere vuote. "
+                             "D, F, H, I, J sono tipicamente indispensabili.",
+                    )
+                    # Aggiorna critical_services mantenendo eventuali fallback custom (lista medici)
                     _new_crit: dict = {}
-                    for _, _row in _edited_crit.iterrows():
-                        _col = _row.get("Colonna")
-                        _fb_raw = str(_row.get("Fallback") or "any").strip()
-                        if not _col:
-                            continue
-                        if _fb_raw.lower() == "any":
-                            _new_crit[str(_col)] = {"fallback": "any"}
+                    for _col in _selected_critical:
+                        # Se aveva già un fallback custom (lista), mantienilo; altrimenti "any"
+                        _existing = _critical.get(_col, {})
+                        if isinstance(_existing.get("fallback"), list):
+                            _new_crit[_col] = _existing
                         else:
-                            _fb_list = [x.strip() for x in _fb_raw.split(",") if x.strip()]
-                            if _fb_list:
-                                _new_crit[str(_col)] = {"fallback": _fb_list}
+                            _new_crit[_col] = {"fallback": "any"}
                     _draft["critical_services"] = _new_crit
 
                 st.divider()

@@ -367,6 +367,7 @@ class Slot:
     empty_domain: bool = False    # True if allowed domain becomes empty after applying unavailability
 
     force_same_doctor: bool = False  # if True, this slot must use same doctor as its paired slot (e.g., D=F fallback)
+    emergency_doctors: Optional[List[str]] = None  # medici di emergenza (non nel pool primario) — usati con penalità
 # -------------------------
 # Reperibilità (C) – final assignment layer
 # -------------------------
@@ -1642,26 +1643,48 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                 pool = [fixed] if fixed in doctors_set else mk_allowed(r.get("pool") or [])
                 pool = apply_unavailability(pool, day, "Mattina", unav)
                 slots.append(Slot(day, f"{day.date}-AC", ["AC"], pool, required=True, shift="Mattina", rule_tag="AC"))
-    # Validate domains
-    # Se il pool di uno slot required è completamente esaurito (indisponibilità + smonti notte),
-    # prima di renderlo opzionale proviamo a espandere a qualsiasi medico attivo disponibile.
-    # Questo implementa il fallback "any available doctor" per i pool esauriti.
+    # ── Espansione pool per colonne indispensabili (critical_services) ──────────
+    # Per ogni colonna marcata come "indispensabile" in pool_critical_services:
+    # se il pool primario è vuoto o molto ridotto, si espande a qualsiasi medico
+    # disponibile per quel turno (con penalità nel solver per scoraggiarne l'uso).
     _abs_excl_norm = {norm_name(x) for x in (cfg.get("absolute_exclusions") or [])}
-    # Pool di emergenza: tutti i medici attivi non esclusi in assoluto (Recupero incluso solo per non-required)
-    _emergency_pool_all = [d for d in doctors_all if norm_name(d) not in _abs_excl_norm]
-    _emergency_pool_no_rec = [d for d in _emergency_pool_all if norm_name(d) != "recupero"]
+    _emerg_any_pool = [d for d in doctors_all
+                       if norm_name(d) not in _abs_excl_norm and norm_name(d) != "recupero"]
+    _critical_svc = cfg.get("pool_critical_services") or {}
 
+    for s in slots:
+        if not s.required:
+            continue
+        _match_col = next((c for c in (s.columns or []) if c in _critical_svc), None)
+        if not _match_col:
+            continue
+        _spec = _critical_svc.get(_match_col, {})
+        _fb = _spec.get("fallback", "")
+        if _fb == "any":
+            _fb_base = _emerg_any_pool
+        elif isinstance(_fb, list) and _fb:
+            _fb_base = [norm_name(d) for d in _fb if norm_name(d) in doctors_set]
+        else:
+            continue
+        _fb_avail = apply_unavailability(_fb_base, s.day, s.shift, unav)
+        _primary_set = set(s.allowed)
+        _new_emerg = [d for d in _fb_avail if d not in _primary_set]
+        if _new_emerg:
+            s.allowed = s.allowed + _new_emerg
+            s.emergency_doctors = _new_emerg
+
+    # ── Validate domains: slot required con pool ancora vuoto ────────────────
+    # Fallback generico: se un required slot ha il pool completamente esaurito
+    # (non è in critical_services), prova l'emergency pool globale prima di
+    # renderlo opzionale.
     for s in slots:
         if not s.allowed:
             if s.required:
-                # Prova a espandere a qualsiasi medico disponibile per quel giorno/turno
-                _emerg = apply_unavailability(_emergency_pool_no_rec, s.day, s.shift, unav)
+                _emerg = apply_unavailability(_emerg_any_pool, s.day, s.shift, unav)
                 if _emerg:
                     s.allowed = _emerg
-                    # Slot coperto con medico di emergenza: penalità alta ma non blocca il solver
-                    # (il solver preferirà sempre un medico del pool originale se disponibile)
+                    s.emergency_doctors = _emerg
                     continue
-            # Ancora vuoto (o optional): downgrade classico
             s.empty_domain = True
             if s.required:
                 s.required = False
@@ -1922,6 +1945,15 @@ def solve_with_ortools(
                 extra_obj.append(b * int(getattr(s, "blank_penalty", 0)))
             else:
                 model.Add(sum(vars_) <= 1)
+    # Penalità per medici di emergenza (non nel pool primario della colonna)
+    # Il solver li usa solo se non c'è alternativa migliore (penalità < blank penalty).
+    EMERGENCY_FILL_PENALTY = 2_000_000  # < BLANK_REQUIRED_PENALTY (5M) → meglio di blank
+    for s in slots:
+        for _emerg_doc in (s.emergency_doctors or []):
+            _ev = x.get((s.slot_id, norm_name(_emerg_doc)))
+            if _ev is not None:
+                extra_obj.append(EMERGENCY_FILL_PENALTY * _ev)
+
     # Helper: slots per day
     slots_by_day: Dict[dt.date, List[Slot]] = defaultdict(list)
     for s in slots:
