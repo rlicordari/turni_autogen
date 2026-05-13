@@ -1674,22 +1674,16 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
             s.emergency_doctors = _new_emerg
 
     # ── Validate domains: slot required con pool ancora vuoto ────────────────
-    # Fallback generico: se un required slot ha il pool completamente esaurito
-    # (non è in critical_services), prova l'emergency pool globale prima di
-    # renderlo opzionale.
+    # Per colonne INDISPENSABILI: già espanso sopra con emergency pool.
+    # Per colonne NON indispensabili: cella gialla (slot opzionale/blank).
+    # Il solver non cerca medici fuori dal pool — la cella rimane vuota
+    # ed evidenziata di giallo nell'Excel di output.
     for s in slots:
         if not s.allowed:
-            if s.required:
-                _emerg = apply_unavailability(_emerg_any_pool, s.day, s.shift, unav)
-                if _emerg:
-                    s.allowed = _emerg
-                    s.emergency_doctors = _emerg
-                    continue
             s.empty_domain = True
             if s.required:
                 s.required = False
-                if getattr(s, "blank_penalty", 0) == 0:
-                    s.blank_penalty = 1
+                s.blank_penalty = 5000  # → cella gialla nell'output Excel
     return slots
 # -------------------------
 # Solver (OR-Tools CP-SAT)
