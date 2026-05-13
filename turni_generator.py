@@ -1361,13 +1361,18 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                     allowed_base = sorted(doctors_set)
 
                 # Se solo uno del pair disponibile → share obbligatorio (lui fa D e F)
-                # Se nessuno del pair → H-pool con share
+                # Se nessuno del pair → pool completo (H pool + qualsiasi medico libero al mattino)
                 # Se entrambi → solo il pair, no share
                 if len(pair_avail) == 1:
                     allowed_df = pair_avail
                     prefer_share = True
                 elif len(pair_avail) == 0:
-                    allowed_df = h_avail if h_avail else sorted(doctors_set)
+                    # Fallback a cascata:
+                    # 1. Pool H (preferito)
+                    # 2. Qualsiasi medico disponibile al mattino (allowed_base = H + any_pool)
+                    # Questo evita che un solo medico (es. Migliorato) sia l'unico per D/F
+                    # bloccandosi poi per H pomeriggio.
+                    allowed_df = allowed_base if allowed_base else sorted(doctors_set)
                     prefer_share = True
                 else:
                     allowed_df = pair_avail
