@@ -1513,7 +1513,7 @@ def sync_pool_contacts_to_github(pool_cfg: dict) -> tuple[bool, str]:
         owner=g["owner"], repo=g["repo"], path=contacts_path,
         token=g["token"],
         message="Aggiornamento contatti medici da pool_config GUI",
-        content=content,
+        text=content,
         branch=g.get("branch", "main"),
         sha=sha_contacts,
     )
@@ -3027,6 +3027,23 @@ else:
     # Carica cfg una volta per entrambi i rami (Genera e Configurazione)
     cfg_admin = tg.load_rules(DEFAULT_RULES_PATH)
     doctors = doctors_from_cfg(cfg_admin)
+    try:
+        _pc_admin, _ = load_pool_config_from_github_st()
+        if _pc_admin:
+            _dn_set = {tg.norm_name(d) for d in doctors}
+            _new = [
+                d for d, dc in _pc_admin.get("doctors", {}).items()
+                if dc.get("active", True)
+                and tg.norm_name(d) not in _dn_set
+                and d != "Recupero"
+            ]
+            if _new:
+                doctors = sorted(
+                    doctors + _new,
+                    key=lambda s: (s == "Recupero", s.lower()),
+                )
+    except Exception:
+        pass
     rules_path = DEFAULT_RULES_PATH
 
     # ── Ramo Configurazione ───────────────────────────────────────────────

@@ -184,9 +184,10 @@ rules:
       Calabrò: 2
       Licordari: 3
       Colarusso: 3
+      Dattilo: 2
     weekend_night_min_soft:
       Zito: 1
-    weekend_night_min_soft_penalty: 3000
+    weekend_night_min_soft_penalty: 20000000
     weekend_excluded_doctors:
     - Calabrò
     pool_other:

@@ -1347,14 +1347,21 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                 # Rimuovi i medici forzati in J quel giorno (night_off same_day li esclude da D/F)
                 forced_j_today = forced_j_by_date.get(day.date, set())
                 pair_avail = [d for d in pair_avail if d not in forced_j_today]
+                # Calabrò non lavora mai in D/F di sabato
+                if day.dow == "Sat":
+                    _calabro_n = norm_name("Calabrò")
+                    pair_avail = [d for d in pair_avail if d != _calabro_n]
 
                 # Fallback source = H.pool_mon_fri (as requested)
                 h_rule = rules.get("H", {}) if isinstance(rules.get("H", {}), dict) else {}
                 h_pool = mk_allowed(h_rule.get("pool_mon_fri") or [])
                 h_avail = apply_unavailability(h_pool, day, "Mattina", unav)
 
-                # Ultimate fallback: any doctor available that morning (after unavailability filter)
-                any_pool = apply_unavailability(sorted(doctors_set), day, "Mattina", unav)
+                # Ultimate fallback: any doctor available that morning (MAI Recupero)
+                _recupero_n = norm_name("Recupero")
+                any_pool = apply_unavailability(
+                    [d for d in sorted(doctors_set) if d != _recupero_n], day, "Mattina", unav
+                )
 
                 # Build a robust shared domain (never empty for required slots)
                 allowed_base = sorted({*pair_avail, *h_avail, *any_pool})
@@ -1648,8 +1655,12 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
     # se il pool primario è vuoto o molto ridotto, si espande a qualsiasi medico
     # disponibile per quel turno (con penalità nel solver per scoraggiarne l'uso).
     _abs_excl_norm = {norm_name(x) for x in (cfg.get("absolute_exclusions") or [])}
+    # Grimaldi e Calabrò vanno SOLO in D/F (mai in pool di emergenza di altre colonne)
+    _df_only_norm = {norm_name("Grimaldi"), norm_name("Calabrò")}
     _emerg_any_pool = [d for d in doctors_all
-                       if norm_name(d) not in _abs_excl_norm and norm_name(d) != "recupero"]
+                       if norm_name(d) not in _abs_excl_norm
+                       and norm_name(d) != "Recupero"
+                       and norm_name(d) not in _df_only_norm]
     _critical_svc = cfg.get("pool_critical_services") or {}
 
     for s in slots:
@@ -1672,6 +1683,22 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
         if _new_emerg:
             s.allowed = s.allowed + _new_emerg
             s.emergency_doctors = _new_emerg
+
+    # ── Emergency expansion per H e E/G ────────────────────────────────────
+    # Se il pool primario non copre: qualsiasi medico disponibile eccetto
+    # Recupero, Grimaldi e Calabrò (che vanno solo in D/F).
+    _h_eg_excl_norm = _df_only_norm | {"Recupero"} | _abs_excl_norm
+    _h_eg_emerg_base = [d for d in doctors_all if norm_name(d) not in _h_eg_excl_norm]
+    for s in slots:
+        if not s.required or s.rule_tag not in {"H", "E_G"}:
+            continue
+        _emerg_avail = apply_unavailability(_h_eg_emerg_base, s.day, s.shift, unav)
+        _primary_set = set(s.allowed)
+        _new_emerg = [d for d in _emerg_avail if d not in _primary_set]
+        if _new_emerg:
+            s.allowed = s.allowed + _new_emerg
+            existing = s.emergency_doctors or []
+            s.emergency_doctors = existing + _new_emerg
 
     # ── Validate domains: slot required con pool ancora vuoto ────────────────
     # Per colonne INDISPENSABILI: già espanso sopra con emergency pool.
@@ -1908,14 +1935,30 @@ def solve_with_ortools(
             x[(s.slot_id, d)] = model.NewBoolVar(f"x_{hash(s.slot_id)%10**8}_{hash(d)%10**8}")
     # Slot assignment constraints.
     # Required slots use a "soft-required" approach: sum(vars) + b_blank == 1.
-    # b_blank == 1 means the slot is left empty (penalized at 5_000_000).
+    # b_blank == 1 means the slot is left empty (penalized by severity tier).
     # This makes the model ALWAYS feasible and lets the solver identify
     # which slots genuinely cannot be filled (they show up blank in the output).
+    #
     # Gerarchia sacrifici (crescente = si sacrifica per primo):
-    #   K=T share: 5K  →  L blank: 20K  →  R blank: 40K  →  altri required: 5M  →  H/I/J: 50M (MAI)
-    BLANK_REQUIRED_PENALTY = 5_000_000
-    BLANK_CRITICAL_PENALTY = 50_000_000  # H, I, J: praticamente mai vuoti
-    _CRITICAL_TAGS = {"H", "I", "J", "Festivo_HI"}
+    #   K=T share: 5K  →  L/Z/R: 20-40K (relief_valves)
+    #   → Q, W: 1M  → standard (C,S,T,U,V,Y,AB,K,AC,C_repreb): 5M
+    #   → E/G, I, Festivo_DE: 15M  → D, F, H, J, Festivo_HI: 40M
+    BLANK_REQUIRED_PENALTY = 5_000_000   # default per slot non classificati
+    _BLANK_PENALTY_BY_TAG: Dict[str, int] = {
+        # Critici — quasi mai vuoti
+        "J":          40_000_000,
+        "H":          40_000_000,
+        "D_F.D":      40_000_000,
+        "D_F.F":      40_000_000,
+        "Festivo_HI": 40_000_000,
+        # Alti — solo se davvero nessun medico disponibile
+        "I":          15_000_000,
+        "E_G":        15_000_000,
+        "Festivo_DE": 15_000_000,
+        # Bassi — possono cedere prima degli altri required
+        "Q":           1_000_000,
+        "W":           1_000_000,
+    }
     blank_required_vars: Dict[str, object] = {}  # slot_id -> b_blank var (for diagnostics)
     for s in slots:
         vars_ = [x[(s.slot_id, d)] for d in s.allowed if (s.slot_id, d) in x]
@@ -1925,7 +1968,7 @@ def solve_with_ortools(
         if s.required:
             b_blank = model.NewBoolVar(f"blank_req_{hash(s.slot_id)%10**8}")
             model.Add(sum(vars_) + b_blank == 1)
-            penalty = BLANK_CRITICAL_PENALTY if s.rule_tag in _CRITICAL_TAGS else BLANK_REQUIRED_PENALTY
+            penalty = _BLANK_PENALTY_BY_TAG.get(s.rule_tag, BLANK_REQUIRED_PENALTY)
             extra_obj.append(penalty * b_blank)
             blank_required_vars[s.slot_id] = b_blank
         else:
@@ -2586,10 +2629,12 @@ def solve_with_ortools(
                     model.AddMaxEquality(eg_max_v, eg_cnt_vars)
                     extra_obj.append(300 * eg_max_v)  # forte penalità per minimizzare il massimo
     # Monthly quotas — J
-    # Range [q-1, q] con penalità 8M per ogni notte mancante rispetto alla quota.
-    # Evita infeasibility combinatoria (quota hard == + spacing + one_per_day + university)
-    # pur garantendo che il solver cerchi di rispettare la quota al massimo.
-    J_QUOTA_DEV_PENALTY = 8_000_000
+    # Zito, Dattilo, Calabrò: quota ESATTA (hard upper + penalità 25M deficit).
+    # Licordari, Colarusso: gestiti via pool_quota_overrides (type=fixed, 8M deficit).
+    # Gli altri: soft bilanciamento [q-1, q] con penalità 8M.
+    J_QUOTA_DEV_PENALTY = 8_000_000   # default (Licordari/Colarusso tramite pool_quota_overrides)
+    J_QUOTA_STRICT_PENALTY = 25_000_000  # Zito, Dattilo, Calabrò — quasi-obbligatorio
+    _j_strict_docs = {norm_name("Zito"), norm_name("Dattilo"), norm_name("Calabrò")}
     if "rules" in cfg and "J" in cfg["rules"]:
         mq = cfg["rules"]["J"].get("monthly_quotas") or {}
         for doc_raw, q in mq.items():
@@ -2608,21 +2653,25 @@ def solve_with_ortools(
                     f"J quota {doc}: richieste {q_int} notti ma solo {n_avail} disponibili. "
                     f"Quota adattata a {q_eff}."
                 )
-            # Soft: penalizza se sopra quota (no hard per evitare infeasibility combinatoria)
-            # Nota: il solver difficilmente supera la quota dato il costo elevato
-            _jsup = model.NewIntVar(0, n_avail, f"jsup_{hash(doc)%10**6}")
-            model.Add(_jsup >= sum(vars_) - q_eff)
-            model.Add(_jsup >= 0)
-            extra_obj.append(J_QUOTA_DEV_PENALTY * _jsup)
-            # Soft: penalità per ogni notte mancante rispetto alla quota
-            # _jsum bounded [0, n_avail] (NON q_eff) per evitare infeasibility
-            # se il solver assegna più di q_eff notti (non c'è hard upper bound)
+            _strict = doc in _j_strict_docs
+            _pen = J_QUOTA_STRICT_PENALTY if _strict else J_QUOTA_DEV_PENALTY
+            # Hard upper per i medici a quota stretta (Zito, Dattilo, Calabrò):
+            # non devono mai superare la loro quota.
+            if _strict:
+                model.Add(sum(vars_) <= q_eff)
+            else:
+                # Soft surplus per gli altri (hard upper già gestito da pool_quota_overrides)
+                _jsup = model.NewIntVar(0, n_avail, f"jsup_{hash(doc)%10**6}")
+                model.Add(_jsup >= sum(vars_) - q_eff)
+                model.Add(_jsup >= 0)
+                extra_obj.append(_pen * _jsup)
+            # Soft deficit: penalità per ogni notte mancante rispetto alla quota
             _jsum = model.NewIntVar(0, n_avail, f"jsum_{hash(doc)%10**6}")
             model.Add(_jsum == sum(vars_))
             _jdef = model.NewIntVar(0, n_avail, f"jdef_{hash(doc)%10**6}")
             model.Add(_jdef >= q_eff - _jsum)
             model.Add(_jdef >= 0)
-            extra_obj.append(J_QUOTA_DEV_PENALTY * _jdef)
+            extra_obj.append(_pen * _jdef)
     # Pool quota overrides max/min — da pool_config (tutti i tipi e colonne)
     qov = cfg.get("pool_quota_overrides") or {}
     for (doc_n, col), spec in qov.items():
@@ -2819,7 +2868,14 @@ def solve_with_ortools(
         if we_cnt_vars:
             we_max = model.NewIntVar(0, 10, "we_night_max")
             model.AddMaxEquality(we_max, we_cnt_vars)
-            extra_obj.append(500 * we_max)  # minimizza il massimo fortemente
+            extra_obj.append(500 * we_max)  # minimizza il massimo
+            # Minimizza anche la differenza max-min per distribuire equamente
+            if len(we_cnt_vars) > 1:
+                we_min = model.NewIntVar(0, 10, "we_night_min")
+                model.AddMinEquality(we_min, we_cnt_vars)
+                we_diff = model.NewIntVar(0, 10, "we_night_diff")
+                model.Add(we_diff == we_max - we_min)
+                extra_obj.append(2000 * we_diff)  # penalizza fortemente la disparità
     # H monthly quotas Mon-Fri
     # MODIFICA 1: Grimaldi e Calabrò sono esclusi da H; ignora eventuali quote riferite a loro
     _h_df_pair = {norm_name("Grimaldi"), norm_name("Calabrò")}
