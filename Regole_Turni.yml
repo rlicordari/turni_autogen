@@ -188,6 +188,8 @@ rules:
     weekend_night_min_soft:
       Zito: 1
     weekend_night_min_soft_penalty: 20000000
+    weekend_night_max_hard:
+      Zito: 1
     weekend_excluded_doctors:
     - Calabrò
     pool_other:

@@ -2787,6 +2787,17 @@ def solve_with_ortools(
             model.Add(we_sum < min_we).OnlyEnforceIf(no_we)
             model.Add(we_sum >= min_we).OnlyEnforceIf(no_we.Not())
             extra_obj.append(wn_pen * no_we)
+        # Hard max weekend nights per dottore (es. Zito: max 1)
+        wn_max_hard = rJ_wn.get("weekend_night_max_hard") or {}
+        for doc_raw, max_we in wn_max_hard.items():
+            doc = norm_name(doc_raw)
+            if doc not in doctors:
+                continue
+            we_vars = [night_var_by_day_doc.get((d.date, doc))
+                       for d in days if d.dow in ("Sat", "Sun")]
+            we_vars = [v for v in we_vars if v is not None]
+            if we_vars:
+                model.Add(sum(we_vars) <= int(max_we))
     # Night distribution (HARD min/max per dottore + soft balance weekend)
     # Logica: total_nights = giorni del mese - giovedì (thursday_blank).
     # pool_available_nights esclude slot J pre-assegnate a medici fuori pool (es. festivi fissi).
@@ -2861,8 +2872,10 @@ def solve_with_ortools(
             if any(night_var_by_day_doc.get((day.date, doc)) is not None for doc in weekend_docs)
         )
         n_we_docs = len(weekend_docs)
-        min_feasible_cap = _math.ceil(total_we_nights / n_we_docs) if n_we_docs > 0 else 2
-        we_hard_cap = max(2, min_feasible_cap)
+        # Hard cap = ceil(totale_weekend / n_pool): rimuove il vecchio floor a 2.
+        # Con 8 notti weekend e 10 medici il cap diventa 1 → nessuno fa 2 weekend nights.
+        we_hard_cap = _math.ceil(total_we_nights / n_we_docs) if n_we_docs > 0 else 1
+        we_soft_target = (total_we_nights // n_we_docs) if n_we_docs > 0 else 1
         we_cnt_vars = []
         for doc in sorted(weekend_docs):
             we_vars = []
@@ -2874,19 +2887,25 @@ def solve_with_ortools(
             if we_vars:
                 we_cnt = model.NewIntVar(0, len(we_vars), f"we_night_{hash(doc)%10**6}")
                 model.Add(we_cnt == sum(we_vars))
-                model.Add(we_cnt <= we_hard_cap)  # cap dinamico: max(2, ceil(totale/pool))
+                model.Add(we_cnt <= we_hard_cap)
                 we_cnt_vars.append(we_cnt)
+                # Penalizza chi supera il target morbido (floor) anche entro il cap
+                if we_hard_cap > we_soft_target:
+                    over_tgt = model.NewIntVar(0, we_hard_cap, f"we_over_tgt_{hash(doc)%10**6}")
+                    model.Add(over_tgt >= we_cnt - we_soft_target)
+                    model.Add(over_tgt >= 0)
+                    extra_obj.append(5000 * over_tgt)
         if we_cnt_vars:
             we_max = model.NewIntVar(0, 10, "we_night_max")
             model.AddMaxEquality(we_max, we_cnt_vars)
             extra_obj.append(500 * we_max)  # minimizza il massimo
-            # Minimizza anche la differenza max-min per distribuire equamente
+            # Spread max-min: penalità aumentata per forzare equidistribuzione
             if len(we_cnt_vars) > 1:
                 we_min = model.NewIntVar(0, 10, "we_night_min")
                 model.AddMinEquality(we_min, we_cnt_vars)
                 we_diff = model.NewIntVar(0, 10, "we_night_diff")
                 model.Add(we_diff == we_max - we_min)
-                extra_obj.append(2000 * we_diff)  # penalizza fortemente la disparità
+                extra_obj.append(8000 * we_diff)
     # H monthly quotas Mon-Fri
     # MODIFICA 1: Grimaldi e Calabrò sono esclusi da H; ignora eventuali quote riferite a loro
     _h_df_pair = {norm_name("Grimaldi"), norm_name("Calabrò")}
@@ -3478,6 +3497,20 @@ def solve_with_ortools(
                 _sun_cnt = model.NewIntVar(0, len(_sun_vars), f"hist_sunj_{abs(hash(_doc)) % 10 ** 6}")
                 model.Add(_sun_cnt == sum(_sun_vars))
                 extra_obj.append(HIST_FEST_PENALTY * _hist_dom_j * _sun_cnt)
+
+        # Sabati J: penalizza notti di sabato storiche (stessa logica delle domeniche)
+        for _doc in sorted(_night_pool_hist):
+            _j_data3 = _hist.get(_doc, {}).get("J", {})
+            _hist_sab_j = _j_data3.get("sabati", 0) if isinstance(_j_data3, dict) else 0
+            if _hist_sab_j <= 0:
+                continue
+            _sat_vars = [night_var_by_day_doc.get((d.date, _doc))
+                         for d in days if d.dow == "Sat"
+                         if night_var_by_day_doc.get((d.date, _doc)) is not None]
+            if _sat_vars:
+                _sat_cnt = model.NewIntVar(0, len(_sat_vars), f"hist_satj_{abs(hash(_doc)) % 10 ** 6}")
+                model.Add(_sat_cnt == sum(_sat_vars))
+                extra_obj.append(HIST_FEST_PENALTY * _hist_sab_j * _sat_cnt)
 
         # Festivi DEHI: penalizza medici con più festivi storici (solo pool senza quota fissa)
         HIST_DEHI_PENALTY = 200
