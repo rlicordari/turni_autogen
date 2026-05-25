@@ -2789,13 +2789,17 @@ def solve_with_ortools(
             extra_obj.append(wn_pen * no_we)
         # Hard max weekend nights per dottore (es. Zito: max 1)
         wn_max_hard = rJ_wn.get("weekend_night_max_hard") or {}
+        print(f"[DEBUG wn_max_hard] dict={wn_max_hard}", file=sys.stderr)
         for doc_raw, max_we in wn_max_hard.items():
             doc = norm_name(doc_raw)
-            if doc not in doctors:
+            in_doctors = doc in doctors
+            print(f"[DEBUG wn_max_hard] doc={doc!r} in_doctors={in_doctors} max_we={max_we}", file=sys.stderr)
+            if not in_doctors:
                 continue
             we_vars = [night_var_by_day_doc.get((d.date, doc))
                        for d in days if d.dow in ("Sat", "Sun")]
             we_vars = [v for v in we_vars if v is not None]
+            print(f"[DEBUG wn_max_hard] {doc!r} we_vars_count={len(we_vars)} -> adding model.Add(sum<=({max_we}))", file=sys.stderr)
             if we_vars:
                 model.Add(sum(we_vars) <= int(max_we))
     # Night distribution (HARD min/max per dottore + soft balance weekend)
@@ -2861,20 +2865,16 @@ def solve_with_ortools(
                         model.Add(diff_cnt == max_cnt - min_cnt)
                         extra_obj.append(200 * diff_cnt)
 
-        # Weekend nights: ogni dottore al massimo 2 weekend nights (Sat+Sun)
-        # e distribuzione equa (minimizza massimo)
+        # Weekend nights: distribuzione equa (soft) — no hard cap globale per non causare INFEASIBLE.
+        # Il hard max per-dottore specifico (es. Zito=1) è già gestito sopra via wn_max_hard.
         _j_wex = {norm_name(d) for d in (rJ.get("weekend_excluded_doctors") or ["Calabrò"])}
         weekend_docs = night_pool - _j_wex
-        # Calcola il cap minimo feasible: ceil(notti_weekend_totali / medici_disponibili)
         import math as _math
         total_we_nights = sum(
             1 for day in days if day.dow in ["Sat", "Sun"]
             if any(night_var_by_day_doc.get((day.date, doc)) is not None for doc in weekend_docs)
         )
         n_we_docs = len(weekend_docs)
-        # Hard cap = ceil(totale_weekend / n_pool): rimuove il vecchio floor a 2.
-        # Con 8 notti weekend e 10 medici il cap diventa 1 → nessuno fa 2 weekend nights.
-        we_hard_cap = _math.ceil(total_we_nights / n_we_docs) if n_we_docs > 0 else 1
         we_soft_target = (total_we_nights // n_we_docs) if n_we_docs > 0 else 1
         we_cnt_vars = []
         for doc in sorted(weekend_docs):
@@ -2887,19 +2887,17 @@ def solve_with_ortools(
             if we_vars:
                 we_cnt = model.NewIntVar(0, len(we_vars), f"we_night_{hash(doc)%10**6}")
                 model.Add(we_cnt == sum(we_vars))
-                model.Add(we_cnt <= we_hard_cap)
                 we_cnt_vars.append(we_cnt)
-                # Penalizza chi supera il target morbido (floor) anche entro il cap
-                if we_hard_cap > we_soft_target:
-                    over_tgt = model.NewIntVar(0, we_hard_cap, f"we_over_tgt_{hash(doc)%10**6}")
-                    model.Add(over_tgt >= we_cnt - we_soft_target)
-                    model.Add(over_tgt >= 0)
-                    extra_obj.append(5000 * over_tgt)
+                # Penalizza chi supera il target (floor)
+                over_tgt = model.NewIntVar(0, len(we_vars), f"we_over_tgt_{hash(doc)%10**6}")
+                model.Add(over_tgt >= we_cnt - we_soft_target)
+                model.Add(over_tgt >= 0)
+                extra_obj.append(5000 * over_tgt)
         if we_cnt_vars:
             we_max = model.NewIntVar(0, 10, "we_night_max")
             model.AddMaxEquality(we_max, we_cnt_vars)
             extra_obj.append(500 * we_max)  # minimizza il massimo
-            # Spread max-min: penalità aumentata per forzare equidistribuzione
+            # Spread max-min
             if len(we_cnt_vars) > 1:
                 we_min = model.NewIntVar(0, 10, "we_night_min")
                 model.AddMinEquality(we_min, we_cnt_vars)
