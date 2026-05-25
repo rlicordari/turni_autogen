@@ -3371,6 +3371,7 @@ def solve_with_ortools(
             cap = int(rcol.get('max_per_doctor') or 0)
             cap_pen = int(rcol.get('max_per_doctor_penalty') or 800)
             max_col = model.NewIntVar(0, len(slot_ids), f"max_{col_key}_load")
+            _load_vars_for_spread = []
             for d in pool:
                 vars_d = []
                 for sid in slot_ids:
@@ -3382,6 +3383,7 @@ def solve_with_ortools(
                 load_d = model.NewIntVar(0, len(slot_ids), f"load_{col_key}_{hash(d)%10**6}")
                 model.Add(load_d == sum(vars_d))
                 model.Add(load_d <= max_col)
+                _load_vars_for_spread.append(load_d)
                 if cap > 0:
                     over = model.NewIntVar(0, len(slot_ids), f"over_{col_key}_{hash(d)%10**6}")
                     # over >= load_d - cap, over >= 0
@@ -3389,6 +3391,13 @@ def solve_with_ortools(
                     model.Add(over >= 0)
                     objective_terms.append(over * cap_pen)
             objective_terms.append(max_col * bal_w)
+            # Penalizza anche lo spread max-min per forzare equidistribuzione
+            if len(_load_vars_for_spread) >= 2:
+                min_col = model.NewIntVar(0, len(slot_ids), f"min_{col_key}_load")
+                model.AddMinEquality(min_col, _load_vars_for_spread)
+                spread_col = model.NewIntVar(0, len(slot_ids), f"spread_{col_key}_load")
+                model.Add(spread_col == max_col - min_col)
+                objective_terms.append(spread_col * bal_w)
     except Exception:
         # never fail scheduling due to a balance/cap config issue
         pass
@@ -4134,6 +4143,15 @@ def write_output(
                 doc_eligible_by_date[fdate].setdefault(doc, set()).add("M")
             for doc in _fp_p:
                 doc_eligible_by_date[fdate].setdefault(doc, set()).add("P")
+
+    # Medici in never_in_J non fanno mai notti → togli "N" dal loro eligible
+    # (l'emergency expansion di J li aggiunge come fallback ma non possono davvero fare J)
+    if cfg and isinstance(cfg.get("rules"), dict):
+        _j_never = {norm_name(d) for d in ((cfg["rules"].get("J") or {}).get("never_in_J") or [])}
+        for _elig_map in doc_eligible_by_date.values():
+            for _dn in _j_never:
+                if _dn in _elig_map:
+                    _elig_map[_dn].discard("N")
 
     def _free_label(doc: str, unav_shifts: Set[str], eligible: Set[str]) -> Optional[str]:
         """Restituisce la stringa da scrivere in Medici liberi, o None se non disponibile.
