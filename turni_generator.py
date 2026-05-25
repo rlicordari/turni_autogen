@@ -2767,6 +2767,7 @@ def solve_with_ortools(
         except Exception:
             pass
     # Soft: alcuni medici devono preferibilmente avere almeno N notti weekend (sab/dom)
+    print("[DBG] CP-SAT reached weekend-night block", flush=True)
     if "rules" in cfg and "J" in cfg["rules"]:
         rJ_wn = cfg["rules"]["J"]
         wn_min_soft = rJ_wn.get("weekend_night_min_soft") or {}
@@ -2789,17 +2790,17 @@ def solve_with_ortools(
             extra_obj.append(wn_pen * no_we)
         # Hard max weekend nights per dottore (es. Zito: max 1)
         wn_max_hard = rJ_wn.get("weekend_night_max_hard") or {}
-        print(f"[DEBUG wn_max_hard] dict={wn_max_hard}", file=sys.stderr)
+        print(f"[DBG] wn_max_hard block reached. dict={wn_max_hard}", flush=True)
         for doc_raw, max_we in wn_max_hard.items():
             doc = norm_name(doc_raw)
             in_doctors = doc in doctors
-            print(f"[DEBUG wn_max_hard] doc={doc!r} in_doctors={in_doctors} max_we={max_we}", file=sys.stderr)
+            print(f"[DBG] wn_max_hard: doc={doc!r} in_doctors={in_doctors} max_we={max_we}", flush=True)
             if not in_doctors:
                 continue
             we_vars = [night_var_by_day_doc.get((d.date, doc))
                        for d in days if d.dow in ("Sat", "Sun")]
             we_vars = [v for v in we_vars if v is not None]
-            print(f"[DEBUG wn_max_hard] {doc!r} we_vars_count={len(we_vars)} -> adding model.Add(sum<=({max_we}))", file=sys.stderr)
+            print(f"[DBG] wn_max_hard: {doc!r} we_vars_count={len(we_vars)} constraint={'ADDED' if we_vars else 'SKIPPED(empty)'}", flush=True)
             if we_vars:
                 model.Add(sum(we_vars) <= int(max_we))
     # Night distribution (HARD min/max per dottore + soft balance weekend)
