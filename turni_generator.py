@@ -2767,7 +2767,6 @@ def solve_with_ortools(
         except Exception:
             pass
     # Soft: alcuni medici devono preferibilmente avere almeno N notti weekend (sab/dom)
-    print("[DBG] CP-SAT reached weekend-night block", flush=True)
     if "rules" in cfg and "J" in cfg["rules"]:
         rJ_wn = cfg["rules"]["J"]
         wn_min_soft = rJ_wn.get("weekend_night_min_soft") or {}
@@ -2790,17 +2789,17 @@ def solve_with_ortools(
             extra_obj.append(wn_pen * no_we)
         # Hard max weekend nights per dottore (es. Zito: max 1)
         wn_max_hard = rJ_wn.get("weekend_night_max_hard") or {}
-        print(f"[DBG] wn_max_hard block reached. dict={wn_max_hard}", flush=True)
+        pre_solve_warnings.append(f"[diag] wn_max_hard={wn_max_hard}")
         for doc_raw, max_we in wn_max_hard.items():
             doc = norm_name(doc_raw)
             in_doctors = doc in doctors
-            print(f"[DBG] wn_max_hard: doc={doc!r} in_doctors={in_doctors} max_we={max_we}", flush=True)
             if not in_doctors:
+                pre_solve_warnings.append(f"[diag] wn_max_hard: {doc!r} NON in doctors — vincolo saltato")
                 continue
             we_vars = [night_var_by_day_doc.get((d.date, doc))
                        for d in days if d.dow in ("Sat", "Sun")]
             we_vars = [v for v in we_vars if v is not None]
-            print(f"[DBG] wn_max_hard: {doc!r} we_vars_count={len(we_vars)} constraint={'ADDED' if we_vars else 'SKIPPED(empty)'}", flush=True)
+            pre_solve_warnings.append(f"[diag] wn_max_hard: {doc!r} we_vars={len(we_vars)} → {'ADDED' if we_vars else 'SKIPPED(empty!)'}")
             if we_vars:
                 model.Add(sum(we_vars) <= int(max_we))
     # Night distribution (HARD min/max per dottore + soft balance weekend)
@@ -4753,6 +4752,9 @@ def solve_across_months(
         slots_all.extend(slots_m)
         assignment_all.update(assignment_m)
         stats_all["months"][mk] = stats_m
+        # Bubble up per-month warnings (inclusi [diag]) al top-level per visibilità in UI
+        for _w in (stats_m.get("warnings") or []):
+            stats_all.setdefault("warnings", []).append(f"[{mk}] {_w}")
         st = str(stats_m.get("status", "")).upper()
         if "INFEAS" in st:
             stats_all["status"] = "INFEASIBLE"
