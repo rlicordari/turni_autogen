@@ -3875,6 +3875,10 @@ def solve_greedy(cfg: dict, days: List[DayRow], slots: List[Slot]) -> Tuple[Dict
     night_off_next = bool((gc.get("night_off") or {}).get("next_day", True))
     # --- Hard quotas / caps from rules
     rules = cfg.get("rules", {}) or {}
+    # J: weekend night hard max per doctor (e.g. Zito: 1)
+    _rJ_greedy = rules.get("J") or {}
+    wn_max_hard_greedy = {norm_name(k): int(v) for k, v in (_rJ_greedy.get("weekend_night_max_hard") or {}).items()}
+    we_nights_by_doc: Dict[str, int] = defaultdict(int)
     # L: Recupero cap (interpret as MAX, not exact)
     L_cap_rec = None
     if isinstance(rules.get("L"), dict):
@@ -3929,6 +3933,10 @@ def solve_greedy(cfg: dict, days: List[DayRow], slots: List[Slot]) -> Tuple[Dict
         if s.columns == ["J"]:
             for prev in nights_by_doc[doc]:
                 if abs((s.day.date - prev).days) < min_gap:
+                    return False
+            # Weekend night hard max (e.g. Zito: max 1 weekend night)
+            if s.day.dow in ("Sat", "Sun") and doc in wn_max_hard_greedy:
+                if we_nights_by_doc[doc] >= wn_max_hard_greedy[doc]:
                     return False
         # Night off next day (if doc did night previous day)
         if night_off_next:
@@ -4009,6 +4017,8 @@ def solve_greedy(cfg: dict, days: List[DayRow], slots: List[Slot]) -> Tuple[Dict
         load_by_tag[s.rule_tag or ""][chosen] += 1
         if s.columns == ["J"]:
             nights_by_doc[chosen].append(s.day.date)
+            if s.day.dow in ("Sat", "Sun"):
+                we_nights_by_doc[chosen] += 1
         if s.columns == ["L"] and chosen == "Recupero":
             L_rec_used += 1
         if s.columns == ["T"] and getattr(s.day, "dow", "") == "Mon" and chosen == "Recupero":
@@ -4180,7 +4190,7 @@ def write_output(
     # Medici in never_in_J non fanno mai notti → togli "N" dal loro eligible
     # (l'emergency expansion di J li aggiunge come fallback ma non possono davvero fare J)
     if cfg and isinstance(cfg.get("rules"), dict):
-        _j_never = {norm_name(d) for d in ((cfg["rules"].get("J") or {}).get("never_in_J") or [])}
+        _j_never = {norm_name(d) for d in ((cfg["rules"].get("J") or {}).get("never_in_J") or ["De Gregorio", "Manganaro"])}
         for _elig_map in doc_eligible_by_date.values():
             for _dn in _j_never:
                 if _dn in _elig_map:

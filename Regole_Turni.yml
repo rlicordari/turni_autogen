@@ -179,6 +179,9 @@ rules:
     saturday_must_be_covered: true
   J:
     thursday_blank: true
+    never_in_J:
+    - De Gregorio
+    - Manganaro
     monthly_quotas:
       Zito: 2
       Calabrò: 2
