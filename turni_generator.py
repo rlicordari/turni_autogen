@@ -1321,7 +1321,7 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                 if not allowed_de:
                     allowed_de = [d for d in doctors_all if d != "Recupero" and d not in fest_excl]
                 else:
-                    allowed_de = [d for d in allowed_de if d not in fest_excl]
+                    allowed_de = [d for d in allowed_de if d not in fest_excl and d != "Recupero"]
                 allowed_de = apply_unavailability(allowed_de, day, "Mattina", unav)
             slots.append(Slot(day, f"{day.date}-DE", ["D","E"], allowed_de, required=True, shift="Mattina", rule_tag="Festivo_DE"))
 
@@ -1335,7 +1335,7 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                 if not allowed_hi:
                     allowed_hi = [d for d in doctors_all if d != "Recupero" and d not in fest_excl]
                 else:
-                    allowed_hi = [d for d in allowed_hi if d not in fest_excl]
+                    allowed_hi = [d for d in allowed_hi if d not in fest_excl and d != "Recupero"]
                 allowed_hi = apply_unavailability(allowed_hi, day, "Pomeriggio", unav)
             slots.append(Slot(day, f"{day.date}-HI", ["H","I"], allowed_hi, required=True, shift="Pomeriggio", rule_tag="Festivo_HI"))
         else:
@@ -1674,7 +1674,8 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
         if _fb == "any":
             _fb_base = _emerg_any_pool
         elif isinstance(_fb, list) and _fb:
-            _fb_base = [norm_name(d) for d in _fb if norm_name(d) in doctors_set]
+            _fb_base = [norm_name(d) for d in _fb
+                        if norm_name(d) in doctors_set and norm_name(d) != "Recupero"]
         else:
             continue
         _fb_avail = apply_unavailability(_fb_base, s.day, s.shift, unav)
@@ -1699,6 +1700,16 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
             s.allowed = s.allowed + _new_emerg
             existing = s.emergency_doctors or []
             s.emergency_doctors = existing + _new_emerg
+
+    # ── Safety: rimuove Recupero da qualsiasi slot festivo (DE, HI) ─────────────
+    # Recupero è un placeholder — non lavora mai nei festivi.
+    _recupero_str = "Recupero"
+    for s in slots:
+        if s.rule_tag in {"Festivo_DE", "Festivo_HI"}:
+            if _recupero_str in s.allowed:
+                s.allowed = [d for d in s.allowed if d != _recupero_str]
+                if s.emergency_doctors:
+                    s.emergency_doctors = [d for d in s.emergency_doctors if d != _recupero_str]
 
     # ── Validate domains: slot required con pool ancora vuoto ────────────────
     # Per colonne INDISPENSABILI: già espanso sopra con emergency pool.
