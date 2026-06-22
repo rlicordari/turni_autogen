@@ -1196,7 +1196,7 @@ def apply_unavailability(allowed: List[str], day: DayRow, shift: str, unav: Dict
             continue
         out.append(doc)
     return out
-def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date, Set[str]]], fixed_assignments: Optional[List[dict]] = None, v_double_overrides: Optional[List[str]] = None, j_blank_week_overrides: Optional[Dict[str, Optional[str]]] = None) -> List[Slot]:
+def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date, Set[str]]], fixed_assignments: Optional[List[dict]] = None, v_double_overrides: Optional[List[str]] = None, j_blank_week_overrides: Optional[Dict[str, List[str]]] = None) -> List[Slot]:
     """
     Converts YAML column rules into per-day slots.
     Handles exception days (festivi) by merging D+E and H+I, and merging E+G always.
@@ -1252,15 +1252,21 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
         except Exception:
             pass
 
-    # PRE-PROCESSA j_blank_week_overrides: per settimana, qual è il giorno in cui J è vuota
-    # Formato chiave: "YYYY-WNN" (es. "2026-W16"), valore: data ISO o None (= nessun vuoto)
-    _j_week_ov: Dict[tuple, Optional[dt.date]] = {}
-    for _wk_str, _bd_str in (j_blank_week_overrides or {}).items():
+    # PRE-PROCESSA j_blank_week_overrides: per settimana, quali giorni hanno J vuota.
+    # Formato chiave: "YYYY-WNN" (es. "2026-W16"), valore: lista di date ISO (può essere vuota = nessun vuoto).
+    # Per retrocompatibilità accetta anche una singola stringa (o None) come valore.
+    _j_week_ov: Dict[tuple, Set[dt.date]] = {}
+    for _wk_str, _bd_val in (j_blank_week_overrides or {}).items():
         try:
             _parts = str(_wk_str).split("-W")
             _iso_key = (int(_parts[0]), int(_parts[1]))
-            _blank_d = dt.date.fromisoformat(str(_bd_str).strip()) if _bd_str else None
-            _j_week_ov[_iso_key] = _blank_d
+            if isinstance(_bd_val, (list, tuple, set)):
+                _blank_dates = {dt.date.fromisoformat(str(x).strip()) for x in _bd_val if str(x).strip()}
+            elif _bd_val:
+                _blank_dates = {dt.date.fromisoformat(str(_bd_val).strip())}
+            else:
+                _blank_dates = set()
+            _j_week_ov[_iso_key] = _blank_dates
         except Exception:
             pass
 
@@ -1418,9 +1424,8 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
             # Data di override (es. "2026-03-04" per mercoledì 4 marzo al posto di giovedì 5)
             _week_key_j = day.date.isocalendar()[:2]
             if _week_key_j in _j_week_ov:
-                # Override UI: questa settimana ha un'impostazione specifica
-                _ui_blank_d = _j_week_ov[_week_key_j]
-                _skip_j = (_ui_blank_d is not None and day.date == _ui_blank_d)
+                # Override UI: questa settimana ha un'impostazione specifica (uno o più giorni vuoti)
+                _skip_j = day.date in _j_week_ov[_week_key_j]
             else:
                 # Comportamento default: giovedì vuoto + eventuale override YAML
                 _j_override_raw = (cfg.get("global_constraints") or {}).get("j_blank_override_date")
@@ -4632,7 +4637,7 @@ def solve_across_months(
     fixed_assignments: Optional[List[dict]] = None,
     availability_preferences: Optional[List[dict]] = None,
     v_double_overrides: Optional[List[str]] = None,
-    j_blank_week_overrides: Optional[Dict[str, Optional[str]]] = None,
+    j_blank_week_overrides: Optional[Dict[str, List[str]]] = None,
     historical_stats: Optional[dict] = None,
 ) -> Tuple[List[Slot], Dict[str, Optional[str]], Dict]:
     """Solve schedules month-by-month and merge.
@@ -4848,7 +4853,7 @@ def generate_schedule(
     fixed_assignments: Optional[List[dict]] = None,
     availability_preferences: Optional[List[dict]] = None,
     v_double_overrides: Optional[List[str]] = None,
-    j_blank_week_overrides: Optional[Dict[str, Optional[str]]] = None,
+    j_blank_week_overrides: Optional[Dict[str, List[str]]] = None,
     historical_stats: Optional[dict] = None,
     pool_config: Optional[dict] = None,
 ):
