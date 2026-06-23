@@ -57,7 +57,7 @@ python turni_generator.py --gui
 ### Flusso dei dati
 
 1. Le **regole** sono definite in `Regole_Turni.yml` — le lettere di colonna corrispondono ai tipi di turno, ciascuno con pool, quote, vincoli di spaziatura e pesi di penalità.
-2. Le **indisponibilità** sono archiviate come CSV in una repo GitHub privata (`data/unavailability_store.csv`). I medici le inseriscono via Streamlit; l'admin può anche caricare un file Excel.
+2. Le **indisponibilità** sono archiviate come CSV per-medico in una repo GitHub privata, uno per file (`data/unavailability/unavail_<slug>.csv`, vedi `_doctor_unavail_path()` in `streamlit_app.py`) — evita conflitti di scrittura concorrente tra medici. `load_store_from_github()` aggrega tutti i file della cartella; se la cartella è vuota usa come fallback legacy il vecchio file unico `data/unavailability_store.csv` (path configurabile via `github_unavailability.path`). Stessa logica a coppie per le **preferenze di disponibilità** (`data/availability/avail_<slug>.csv`, aggregate da `load_avail_store_from_github()`, fallback legacy `data/availability_store.csv`). I medici inseriscono indisponibilità/preferenze via Streamlit; l'admin può anche caricare un file Excel.
 3. Il **solver** (`turni_generator.py`) traduce regole + indisponibilità in variabili e vincoli CP-SAT, risolve e compila il workbook openpyxl.
 4. **Streamlit** (`streamlit_app.py`) orchestra il tutto per gli utenti web: gestisce auth PIN, OTP via SMTP, lease di sessione per medico (kick-out in caso di login concorrente) e invoca `turni_generator` in-process.
 
@@ -75,7 +75,10 @@ token  = "ghp_..."
 owner  = "REPO_OWNER"
 repo   = "REPO_NAME"
 branch = "main"
-path   = "data/unavailability_store.csv"
+path   = "data/unavailability_store.csv"          # fallback legacy, solo se per_doctor_dir è vuota
+per_doctor_dir = "data/unavailability"             # default, opzionale se non rinominata
+availability_path = "data/availability_store.csv"  # fallback legacy preferenze
+per_doctor_avail_dir = "data/availability"         # default, opzionale se non rinominata
 
 [smtp]
 host     = "smtp.gmail.com"
@@ -85,6 +88,10 @@ password = "APP_PASSWORD"
 from     = "..."
 starttls = true
 ```
+
+### IMPORTANTE: `num_search_workers` del CP-SAT solver
+
+In `solve_with_ortools()` (`turni_generator.py`) tutte le istanze di `cp_model.CpSolver()` usano `num_search_workers = 1`. **Non aumentare questo valore.** Con `num_search_workers > 1` (testato con 8) il `max_time_in_seconds` non viene rispettato: il `solver.Solve()` può bloccarsi indefinitamente (osservato >125s contro un limite di 30s), sia in locale (macOS arm64) sia su Streamlit Cloud — bug della ricerca multi-thread di OR-Tools su questa combinazione di piattaforma/versione (`ortools` 9.15.6755), non un problema delle regole/vincoli. Con `num_search_workers = 1` il timeout è sempre rispettato (verificato: 30.0s esatti). Se si aggiorna `ortools` in futuro e si vuole ritentare il multi-thread, verificare prima con un test di carico che il timeout venga rispettato in modo affidabile.
 
 ### Keep-alive (GitHub Actions)
 

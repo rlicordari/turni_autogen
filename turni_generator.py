@@ -3539,7 +3539,7 @@ def solve_with_ortools(
     model.Minimize(sum(objective_terms + extra_obj))
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = 30.0
-    solver.parameters.num_search_workers = 8
+    solver.parameters.num_search_workers = 1
     status = solver.Solve(model)
     if status not in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
         # ── Diagnostica: retry senza vincoli di quota hard per identificare la causa ──
@@ -3593,7 +3593,7 @@ def solve_with_ortools(
             _model2.Minimize(sum(_extra2) if _extra2 else _model2.NewIntVar(0, 0, "z2"))
             _solver2 = cp_model.CpSolver()
             _solver2.parameters.max_time_in_seconds = 15.0
-            _solver2.parameters.num_search_workers = 4
+            _solver2.parameters.num_search_workers = 1
             _status2 = _solver2.Solve(_model2)
             if _status2 in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
                 # ── Retry granulare: trova quale gruppo causa l'infeasibility ──
@@ -3609,7 +3609,7 @@ def solve_with_ortools(
                         # Strategia: aggiungi il gruppo al modello2 già costruito e ri-solvi
                         _solver3 = cp_model.CpSolver()
                         _solver3.parameters.max_time_in_seconds = 8.0
-                        _solver3.parameters.num_search_workers = 2
+                        _solver3.parameters.num_search_workers = 1
                         add_fn(_model2, _x2)
                         _st3 = _solver3.Solve(_model2)
                         if _st3 == cp_model.INFEASIBLE:
