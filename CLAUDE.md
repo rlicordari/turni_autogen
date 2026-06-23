@@ -173,11 +173,10 @@ starttls = true
 ### Logica quote notti J — CONFERMATA
 | Medico | Override | Comportamento |
 |---|---|---|
-| Licordari, Colarusso | `quota: 3, type: fixed` | Sempre esattamente 3 — vincolo hard |
 | Zito, Dattilo | `quota: 2, type: max` | Mai più di 2 — vincolo hard; ratio universitario già applicato |
 | De Gregorio | J non in `columns` | Escluso dalle notti (non nel pool) |
 | Calabrò | `weekend_nights: false` | Notti feriali sì, sab/dom no |
-| Tutti gli altri | nessuno | Target flessibile 2; fanno 3 a rotazione se necessario |
+| Licordari, Colarusso e tutti gli altri | nessuno | Target flessibile 2; fanno 3 a rotazione se necessario (aggiornato 23 giugno 2026: rimossa quota fissa 3 per Licordari/Colarusso) |
 
 ### Regole chiave chiarite
 - **J vale 2 turni per tutti** (ospedalieri e universitari) → `counts_as: 2` in `column_settings`
@@ -236,7 +235,7 @@ starttls = true
   },
   "_note_column_settings": "monthly_target = quota di default per il turno J per tutti i medici senza override. counts_as=2 per J vale per tutti.",
   "_note_column_overrides": "Tre tipi di override quota per colonna J: fixed (sempre esattamente N), max (mai più di N, ma può fare meno), nessun override (default flessibile, può fare +1 in rotazione se necessario). weekend_nights:false esclude sab/dom.",
-  "_note_notti_logic": "Licordari e Colarusso: fixed=3 (sempre 3). Zito e Dattilo: max=2 (MAI 3). Tutti gli altri: default flessibile (di solito 2, fanno 3 a turno se serve).",
+  "_note_notti_logic": "Zito e Dattilo: max=2 (MAI 3). Tutti gli altri (incl. Licordari e Colarusso): default flessibile (di solito 2, fanno 3 a turno se serve).",
   "service_combinations": [
     {
       "columns": ["K", "T"],

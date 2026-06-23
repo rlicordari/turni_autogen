@@ -2646,9 +2646,9 @@ def solve_with_ortools(
                     extra_obj.append(300 * eg_max_v)  # forte penalità per minimizzare il massimo
     # Monthly quotas — J
     # Zito, Dattilo, Calabrò: quota ESATTA (hard upper + penalità 25M deficit).
-    # Licordari, Colarusso: gestiti via pool_quota_overrides (type=fixed, 8M deficit).
-    # Gli altri: soft bilanciamento [q-1, q] con penalità 8M.
-    J_QUOTA_DEV_PENALTY = 8_000_000   # default (Licordari/Colarusso tramite pool_quota_overrides)
+    # Licordari, Colarusso e gli altri: nessuna quota fissa qui — bilanciamento
+    # soft [min_per, max_per] gestito più sotto (target 2, fino a 3 se necessario).
+    J_QUOTA_DEV_PENALTY = 8_000_000   # default
     J_QUOTA_STRICT_PENALTY = 25_000_000  # Zito, Dattilo, Calabrò — quasi-obbligatorio
     _j_strict_docs = {norm_name("Zito"), norm_name("Dattilo"), norm_name("Calabrò")}
     if "rules" in cfg and "J" in cfg["rules"]:
