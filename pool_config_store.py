@@ -21,6 +21,31 @@ SCHEMA_VERSION = 1
 
 QUOTA_TYPES = {"fixed", "max", "min"}
 COMBINATION_MODES = {"always", "fallback", "preferred"}
+FREE_COLUMNS = {"AD", "AE", "AF", "AG"}
+AUTO_COLUMNS = {"AA", "AC"}
+
+_COL_RULE_TARGETS: dict[str, list[tuple[str, str | None]]] = {
+    "C": [("C_reperibilita", None)],
+    "D": [("D_F", "allowed")],
+    "F": [("D_F", "allowed")],
+    "E": [("E_G", "allowed")],
+    "G": [("E_G", "allowed")],
+    "H": [("H", "pool_mon_fri"), ("H", "distribution_pool")],
+    "I": [("I", "distribution_pool")],
+    "J": [("J", "pool_other")],
+    "K": [("K", "pool")],
+    "L": [("L", "pool_other")],
+    "Q": [("Q", "pool")],
+    "R": [("R", "pool")],
+    "S": [("S", "pool")],
+    "T": [("T", "pool")],
+    "U": [("U", "pool")],
+    "V": [("V", "pool")],
+    "W": [("W", "other_days_pool")],
+    "Y": [("Y", "other_pool")],
+    "Z": [("Z", "pool")],
+    "AB": [("AB", "fallback_pool")],
+}
 
 _DOCTOR_REQUIRED_KEYS = {
     "active",
@@ -36,11 +61,64 @@ _DOCTOR_REQUIRED_KEYS = {
 # ── 1. Serializzazione pura ──────────────────────────────────────────────────
 
 def pool_config_to_text(cfg: dict) -> str:
-    return json.dumps(cfg, ensure_ascii=False, indent=2)
+    return json.dumps(normalize_pool_config(cfg), ensure_ascii=False, indent=2)
 
 
 def pool_config_from_text(text: str) -> dict:
-    return json.loads(text)
+    return normalize_pool_config(json.loads(text))
+
+
+def normalize_pool_config(cfg: dict) -> dict:
+    """Normalize historical JSON quirks before validation/save."""
+    if not isinstance(cfg, dict):
+        return cfg
+    out = copy.deepcopy(cfg)
+    doctors = out.get("doctors")
+    if isinstance(doctors, dict):
+        for dcfg in doctors.values():
+            if not isinstance(dcfg, dict):
+                continue
+            if isinstance(dcfg.get("columns"), list):
+                dcfg["columns"] = sorted({
+                    str(c).strip().upper()
+                    for c in dcfg.get("columns", [])
+                    if str(c).strip()
+                })
+            overrides = dcfg.get("column_overrides")
+            if isinstance(overrides, dict):
+                normalized_overrides = {}
+                for col, ov in overrides.items():
+                    c = str(col).strip().upper()
+                    if c:
+                        normalized_overrides[c] = ov
+                dcfg["column_overrides"] = normalized_overrides
+    combos = out.get("service_combinations")
+    if isinstance(combos, list):
+        for combo in combos:
+            if not isinstance(combo, dict):
+                continue
+            cols_list = [str(c).strip().upper() for c in (combo.get("columns") or []) if str(c).strip()]
+            combo["columns"] = cols_list
+            cols = tuple(sorted(cols_list))
+            if cols == ("K", "T") and combo.get("mode") == "always":
+                combo["mode"] = "fallback"
+    critical = out.get("critical_services")
+    if isinstance(critical, dict):
+        normalized_critical = {}
+        for col, spec in critical.items():
+            c = str(col).strip().upper()
+            if c:
+                normalized_critical[c] = spec
+        out["critical_services"] = normalized_critical
+    col_settings = out.get("column_settings")
+    if isinstance(col_settings, dict):
+        normalized_settings = {}
+        for col, spec in col_settings.items():
+            c = str(col).strip().upper()
+            if c:
+                normalized_settings[c] = spec
+        out["column_settings"] = normalized_settings
+    return out
 
 
 # ── 2. Skeleton vuoto ────────────────────────────────────────────────────────
@@ -71,34 +149,84 @@ def empty_pool_config() -> dict:
 
 # ── 3. Validazione ───────────────────────────────────────────────────────────
 
-def validate_pool_config(cfg: dict) -> list[str]:
+def validate_pool_config(cfg: dict, cfg_yaml: Optional[dict] = None) -> list[str]:
     """Ritorna lista di errori (vuota se OK)."""
+    cfg = normalize_pool_config(cfg)
+    audit = audit_pool_config(cfg, cfg_yaml)
+    return list(audit["errors"])
+
+
+def audit_pool_config(cfg: dict, cfg_yaml: Optional[dict] = None) -> dict:
+    """Validate pool_config and return errors, warnings and derived previews."""
+    cfg = normalize_pool_config(cfg)
     errs: list[str] = []
+    warnings: list[str] = []
+    preview: dict = {"column_pools": {}}
 
     if not isinstance(cfg, dict):
-        return ["La configurazione non è un dizionario valido"]
+        return {"errors": ["La configurazione non è un dizionario valido"], "warnings": [], "preview": preview}
+
+    from turni_generator import norm_name
 
     if cfg.get("schema_version") != SCHEMA_VERSION:
         errs.append(f"schema_version deve essere {SCHEMA_VERSION}, trovato: {cfg.get('schema_version')}")
 
+    yaml_columns = set((cfg_yaml or {}).get("columns", {}).keys())
+    editable_columns = (yaml_columns - FREE_COLUMNS - AUTO_COLUMNS) if yaml_columns else set(_COL_RULE_TARGETS.keys())
+    known_columns = set(yaml_columns or editable_columns) | set(_COL_RULE_TARGETS.keys())
+    rules = (cfg_yaml or {}).get("rules", {}) if isinstance((cfg_yaml or {}).get("rules", {}), dict) else {}
+    never_in_j = {
+        norm_name(d)
+        for d in ((rules.get("J") or {}).get("never_in_J") or ["De Gregorio", "Manganaro"])
+    }
+
     doctors = cfg.get("doctors", {})
+    active_docs: dict[str, dict] = {}
+    known_doc_norms: dict[str, str] = {}
     if not isinstance(doctors, dict):
         errs.append("'doctors' deve essere un dizionario")
     else:
         for name, dcfg in doctors.items():
+            name_s = str(name).strip()
+            dn = norm_name(name_s)
+            if not name_s:
+                errs.append("Nome medico vuoto")
+                continue
+            if dn in known_doc_norms and known_doc_norms[dn] != name_s:
+                errs.append(f"Medico duplicato dopo normalizzazione: '{known_doc_norms[dn]}' e '{name_s}'")
+            known_doc_norms[dn] = name_s
             if not isinstance(dcfg, dict):
                 errs.append(f"Medico '{name}': deve essere un dizionario")
                 continue
             missing = _DOCTOR_REQUIRED_KEYS - dcfg.keys()
             if missing:
                 errs.append(f"Medico '{name}': campi mancanti: {sorted(missing)}")
-            if not isinstance(dcfg.get("columns", []), list):
+            if dcfg.get("active", True):
+                active_docs[name_s] = dcfg
+            columns = dcfg.get("columns", [])
+            if not isinstance(columns, list):
                 errs.append(f"Medico '{name}': 'columns' deve essere una lista")
+            else:
+                cols_norm = [str(c).strip().upper() for c in columns if str(c).strip()]
+                for col in cols_norm:
+                    if col in FREE_COLUMNS or col in AUTO_COLUMNS or col == "C":
+                        errs.append(f"Medico '{name}': colonna '{col}' non modificabile da pool_config")
+                    elif col not in editable_columns:
+                        errs.append(f"Medico '{name}': colonna '{col}' sconosciuta o non esposta in GUI")
+                if dn in never_in_j and "J" in cols_norm:
+                    errs.append(f"Medico '{name}': non puo' essere abilitato in J perche' e' in J.never_in_J")
+                if dcfg.get("active", True) and not cols_norm and dcfg.get("excluded_from_reperibilita", False):
+                    warnings.append(f"Medico '{name}' attivo ma senza colonne e senza reperibilita'")
             overrides = dcfg.get("column_overrides", {})
             if not isinstance(overrides, dict):
                 errs.append(f"Medico '{name}': 'column_overrides' deve essere un dizionario")
             else:
                 for col, ov in overrides.items():
+                    col_u = str(col).strip().upper()
+                    if col_u not in editable_columns:
+                        errs.append(f"Medico '{name}', colonna '{col_u}': override su colonna sconosciuta/non esposta")
+                    if dn in never_in_j and col_u == "J":
+                        errs.append(f"Medico '{name}': non puo' avere override su J perche' e' in J.never_in_J")
                     if not isinstance(ov, dict):
                         errs.append(f"Medico '{name}', colonna '{col}': override deve essere un dizionario")
                         continue
@@ -120,9 +248,16 @@ def validate_pool_config(cfg: dict) -> list[str]:
             cols = combo.get("columns", [])
             if not isinstance(cols, list) or len(cols) != 2:
                 errs.append(f"service_combinations[{i}]: 'columns' deve essere una lista di 2 lettere")
+            else:
+                cols_u = [str(c).strip().upper() for c in cols]
+                for col in cols_u:
+                    if col not in editable_columns:
+                        errs.append(f"service_combinations[{i}]: colonna '{col}' sconosciuta/non esposta")
             mode = combo.get("mode")
             if mode not in COMBINATION_MODES:
                 errs.append(f"service_combinations[{i}]: mode '{mode}' non valido (ammessi: {sorted(COMBINATION_MODES)})")
+            if isinstance(cols, list) and tuple(sorted(str(c).strip().upper() for c in cols)) == ("K", "T") and mode != "fallback":
+                warnings.append("K/T viene sempre trattato come fallback di emergenza, non come combinazione abituale")
 
     critical = cfg.get("critical_services", {})
     if not isinstance(critical, dict):
@@ -135,18 +270,61 @@ def validate_pool_config(cfg: dict) -> list[str]:
             fb = spec.get("fallback")
             if fb != "any" and not isinstance(fb, list):
                 errs.append(f"critical_services['{col}']: fallback deve essere 'any' o una lista di medici")
+            col_u = str(col).strip().upper()
+            if col_u not in editable_columns:
+                errs.append(f"critical_services['{col_u}']: colonna sconosciuta/non esposta")
+            if isinstance(fb, list):
+                for doc in fb:
+                    dn = norm_name(doc)
+                    if dn not in known_doc_norms:
+                        errs.append(f"critical_services['{col_u}']: medico fallback sconosciuto '{doc}'")
+                    elif not active_docs.get(known_doc_norms[dn]):
+                        errs.append(f"critical_services['{col_u}']: medico fallback non attivo '{doc}'")
 
     col_settings = cfg.get("column_settings", {})
     if not isinstance(col_settings, dict):
         errs.append("'column_settings' deve essere un dizionario")
     else:
+        for col, col_cfg in col_settings.items():
+            col_u = str(col).strip().upper()
+            if col_u not in editable_columns:
+                errs.append(f"column_settings.{col_u}: colonna sconosciuta/non esposta")
+            if not isinstance(col_cfg, dict):
+                errs.append(f"column_settings.{col_u}: deve essere un dizionario")
+                continue
+            spacing_min = int(col_cfg.get("spacing_min_days", 0) or 0)
+            spacing_pref = int(col_cfg.get("spacing_preferred_days", 0) or 0)
+            if spacing_pref and spacing_pref < spacing_min:
+                warnings.append(f"column_settings.{col_u}: spacing preferito minore dello spacing minimo")
+            if col_cfg.get("monthly_target") not in (None, ""):
+                try:
+                    if int(col_cfg.get("monthly_target")) < 0:
+                        errs.append(f"column_settings.{col_u}.monthly_target deve essere >= 0")
+                except Exception:
+                    errs.append(f"column_settings.{col_u}.monthly_target deve essere un intero")
         c_cfg = col_settings.get("C", {})
         if isinstance(c_cfg, dict):
             ca = c_cfg.get("counts_as")
             if ca is not None and ca != 0:
                 errs.append("column_settings.C.counts_as deve essere 0 (reperibilità non conta nel workload)")
 
-    return errs
+    if isinstance(doctors, dict):
+        for col in sorted(editable_columns & set(_COL_RULE_TARGETS.keys())):
+            if col == "C":
+                continue
+            pool = [
+                doc for doc, dcfg in doctors.items()
+                if isinstance(dcfg, dict)
+                and dcfg.get("active", True)
+                and col in [str(c).strip().upper() for c in (dcfg.get("columns") or [])]
+            ]
+            preview["column_pools"][col] = pool
+            if col in critical and not pool:
+                errs.append(f"Colonna indispensabile {col}: pool primario vuoto")
+            elif not pool:
+                warnings.append(f"Colonna {col}: pool vuoto; il solver potra' lasciarla vuota o usare solo fallback tecnici")
+
+    return {"errors": errs, "warnings": warnings, "preview": preview}
 
 
 # ── 4. GitHub storage ────────────────────────────────────────────────────────

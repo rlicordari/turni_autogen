@@ -3385,7 +3385,14 @@ else:
                     st.markdown("**Combinazioni same-day**")
                     _combos: list = _draft.setdefault("service_combinations", [])
                     _combo_rows = [
-                        {"Col 1": c["columns"][0], "Col 2": c["columns"][1], "Modalità": c["mode"]}
+                        {
+                            "Col 1": c["columns"][0],
+                            "Col 2": c["columns"][1],
+                            "Modalità": "fallback"
+                            if tuple(sorted(str(_cc).strip().upper() for _cc in c.get("columns", []))) == ("K", "T")
+                            and c.get("mode") == "always"
+                            else c["mode"],
+                        }
                         for c in _combos if len(c.get("columns", [])) == 2
                     ]
                     _combo_df = _pd_pool.DataFrame(_combo_rows) if _combo_rows else _pd_pool.DataFrame(columns=["Col 1", "Col 2", "Modalità"])
@@ -3402,6 +3409,8 @@ else:
                     for _, _row in _edited_combo.iterrows():
                         _c1, _c2, _mode = _row.get("Col 1"), _row.get("Col 2"), _row.get("Modalità")
                         if _c1 and _c2 and _mode:
+                            if tuple(sorted([str(_c1).strip().upper(), str(_c2).strip().upper()])) == ("K", "T"):
+                                _mode = "fallback"
                             _new_combos.append({"columns": [str(_c1), str(_c2)], "same_day": True, "mode": str(_mode)})
                     _draft["service_combinations"] = _new_combos
 
@@ -3440,6 +3449,25 @@ else:
                     _draft["critical_services"] = _new_crit
 
                 st.divider()
+                _audit = _pcs_ui.audit_pool_config(_draft, cfg_admin)
+                with st.expander("🧪 Controllo configurazione prima del salvataggio", expanded=bool(_audit["errors"])):
+                    if _audit["errors"]:
+                        st.error("Errori bloccanti:\n\n" + "\n".join(f"- {e}" for e in _audit["errors"]))
+                    else:
+                        st.success("Nessun errore bloccante nella configurazione.")
+                    if _audit["warnings"]:
+                        st.warning("Avvisi:\n\n" + "\n".join(f"- {w}" for w in _audit["warnings"]))
+                    _pool_preview = [
+                        {
+                            "Colonna": _col,
+                            "Medici attivi nel pool": ", ".join(_docs) if _docs else "—",
+                            "N": len(_docs),
+                        }
+                        for _col, _docs in sorted((_audit.get("preview") or {}).get("column_pools", {}).items())
+                    ]
+                    if _pool_preview:
+                        st.dataframe(_pd_pool.DataFrame(_pool_preview), use_container_width=True, hide_index=True)
+
                 _col_save, _col_reset = st.columns([3, 1])
                 with _col_reset:
                     if st.button("↩️ Reset draft", key="btn_pool_reset"):
@@ -3449,10 +3477,10 @@ else:
                     if st.button("💾 Salva configurazione pool", type="primary", key="btn_pool_save"):
                         import copy as _copy_save
                         from datetime import datetime as _dt_save, timezone as _tz_save
-                        _to_save = _copy_save.deepcopy(_draft)
+                        _to_save = _pcs_ui.normalize_pool_config(_copy_save.deepcopy(_draft))
                         _to_save["updated_at"] = _dt_save.now(_tz_save.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
                         _to_save["updated_by"] = "admin"
-                        _errs = _pcs_ui.validate_pool_config(_to_save)
+                        _errs = _pcs_ui.validate_pool_config(_to_save, cfg_admin)
                         if _errs:
                             st.error("Configurazione non valida:\n\n" + "\n".join(f"- {e}" for e in _errs))
                         else:

@@ -709,6 +709,11 @@ def apply_pool_config(cfg_yaml: dict, pool_cfg: Optional[dict]) -> dict:
     cfg = _copy.deepcopy(cfg_yaml)
     if not pool_cfg or not pool_cfg.get("doctors"):
         return cfg
+    try:
+        from pool_config_store import normalize_pool_config as _normalize_pool_config
+        pool_cfg = _normalize_pool_config(pool_cfg)
+    except Exception:
+        pass
 
     doctors: dict = pool_cfg.get("doctors", {})
     col_settings: dict = pool_cfg.get("column_settings", {})
@@ -760,8 +765,6 @@ def apply_pool_config(cfg_yaml: dict, pool_cfg: Optional[dict]) -> dict:
             doc for doc, dcfg in doctors.items()
             if dcfg.get("active", True) and col in (dcfg.get("columns") or [])
         ]
-        if not new_pool:
-            continue  # safety: se il pool è vuoto, lascia il YAML invariato
         for rule_key, pool_field in rule_targets:
             rules.setdefault(rule_key, {})[pool_field] = new_pool
 
@@ -831,11 +834,19 @@ def apply_pool_config(cfg_yaml: dict, pool_cfg: Optional[dict]) -> dict:
 
     # 8. counts_as per colonna
     counts_as_map: dict[str, int] = {}
+    monthly_targets: dict[str, int] = {}
     for col, cs in col_settings.items():
         if isinstance(cs, dict) and "counts_as" in cs:
             counts_as_map[col] = int(cs["counts_as"])
+        if isinstance(cs, dict) and cs.get("monthly_target") is not None:
+            try:
+                monthly_targets[str(col).strip().upper()] = int(cs.get("monthly_target"))
+            except Exception:
+                pass
     if counts_as_map:
         cfg["pool_counts_as"] = counts_as_map
+    if monthly_targets:
+        cfg["pool_monthly_targets"] = monthly_targets
 
     # 9. service_combinations
     combos = pool_cfg.get("service_combinations")
@@ -1196,6 +1207,24 @@ def apply_unavailability(allowed: List[str], day: DayRow, shift: str, unav: Dict
             continue
         out.append(doc)
     return out
+
+
+def _never_in_j_set(cfg: dict) -> Set[str]:
+    """Doctors that must never be assigned to night J, even via UI overrides."""
+    rules = cfg.get("rules") or {}
+    rJ = rules.get("J", {}) if isinstance(rules.get("J", {}), dict) else {}
+    return {norm_name(d) for d in (rJ.get("never_in_J") or ["De Gregorio", "Manganaro"])}
+
+
+def _fixed_assignment_allowed(cfg: dict, col: str, doctor: str) -> Tuple[bool, str]:
+    """Return whether an admin fixed assignment may expand the slot domain."""
+    col = str(col or "").strip().upper()
+    doc = norm_name(doctor)
+    if col == "J" and doc in _never_in_j_set(cfg):
+        return False, f"{doc} e' in J.never_in_J"
+    return True, ""
+
+
 def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date, Set[str]]], fixed_assignments: Optional[List[dict]] = None, v_double_overrides: Optional[List[str]] = None, j_blank_week_overrides: Optional[Dict[str, List[str]]] = None) -> List[Slot]:
     """
     Converts YAML column rules into per-day slots.
@@ -1241,6 +1270,9 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
             fa_date = dt.date.fromisoformat(str(fa.get("date","")).strip())
             fa_doc = norm_name(str(fa.get("doctor","")).strip())
             if fa_col == "J":
+                ok_fixed, _reason = _fixed_assignment_allowed(cfg, fa_col, fa_doc)
+                if not ok_fixed:
+                    continue
                 forced_j_by_date.setdefault(fa_date, set()).add(fa_doc)
             elif fa_col == "D" and fa_doc in doctors_set:
                 # Il medico sorteggiato potrebbe non essere nel pool Festivi (es. Grimaldi, Calabrò)
@@ -1683,8 +1715,10 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                         if norm_name(d) in doctors_set and norm_name(d) != "Recupero"]
         else:
             continue
-        _fb_avail = apply_unavailability(_fb_base, s.day, s.shift, unav)
         _primary_set = set(s.allowed)
+        if _primary_set:
+            continue
+        _fb_avail = apply_unavailability(_fb_base, s.day, s.shift, unav)
         _new_emerg = [d for d in _fb_avail if d not in _primary_set]
         if _new_emerg:
             s.allowed = s.allowed + _new_emerg
@@ -1698,8 +1732,10 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
     for s in slots:
         if not s.required or s.rule_tag not in {"H", "E_G"}:
             continue
-        _emerg_avail = apply_unavailability(_h_eg_emerg_base, s.day, s.shift, unav)
         _primary_set = set(s.allowed)
+        if _primary_set:
+            continue
+        _emerg_avail = apply_unavailability(_h_eg_emerg_base, s.day, s.shift, unav)
         _new_emerg = [d for d in _emerg_avail if d not in _primary_set]
         if _new_emerg:
             s.allowed = s.allowed + _new_emerg
@@ -1942,6 +1978,35 @@ def solve_with_ortools(
     doctors = collect_doctors(cfg)
     doctors = [d for d in doctors if d != "Recupero"] + (["Recupero"] if "Recupero" in doctors else [])
     doc_to_idx = {d:i for i,d in enumerate(doctors)}
+
+    # Fixed assignments are admin overrides, but they must be part of the slot
+    # domain before variables and slot cardinality constraints are created.
+    for fa in (fixed_assignments or []):
+        try:
+            fa_date = dt.date.fromisoformat(str(fa.get("date","")).strip())
+            fa_doc = norm_name(str(fa.get("doctor","")).strip())
+            fa_col = str(fa.get("column","")).strip().upper()
+        except Exception:
+            continue
+        if fa_doc not in doc_to_idx:
+            pre_solve_warnings.append(
+                f"Fixed assignment ignorata: medico sconosciuto {fa_doc} su {fa_date}/{fa_col}."
+            )
+            continue
+        ok_fixed, reason = _fixed_assignment_allowed(cfg, fa_col, fa_doc)
+        if not ok_fixed:
+            pre_solve_warnings.append(
+                f"Fixed assignment ignorata: {fa_doc} su {fa_date}/{fa_col} ({reason})."
+            )
+            continue
+        for s in slots:
+            if s.day.date == fa_date and fa_col in [str(c).strip().upper() for c in (s.columns or [])]:
+                if fa_doc not in s.allowed:
+                    s.allowed.append(fa_doc)
+                    existing = s.emergency_doctors or []
+                    if fa_doc not in existing:
+                        s.emergency_doctors = existing + [fa_doc]
+
     # Decision vars: x[(slot_id, doc)] in {0,1}
     x = {}
     for s in slots:
@@ -2033,9 +2098,10 @@ def solve_with_ortools(
         for ts in target_slots:
             tv = x.get((ts.slot_id, fa_doc))
             if tv is None:
-                # Il medico non è nell'allowed originale — aggiunge la variabile
-                tv = model.NewBoolVar(f"x_{hash(ts.slot_id)%10**8}_{hash(fa_doc)%10**8}_forced")
-                x[(ts.slot_id, fa_doc)] = tv
+                pre_solve_warnings.append(
+                    f"Fixed assignment ignorata: {fa_doc} non ammesso in {ts.slot_id}."
+                )
+                continue
             model.Add(tv == 1)  # HARD: questo medico deve essere assegnato
             # Forza tutti gli altri a 0 in questo slot
             for d2 in list(ts.allowed) + list(doctors):
@@ -2106,8 +2172,18 @@ def solve_with_ortools(
     # Uniqueness per day: one doctor max 1 slot/day (exceptions already handled by merged columns)
     gc = cfg.get("global_constraints") or {}
     relief = gc.get("relief_valves") or {}
-    enable_kt_share = bool(relief.get("enable_kt_share", False))
-    kt_share_penalty = int(relief.get("kt_share_penalty", 5000))
+    service_combos = cfg.get("pool_service_combinations") or []
+    kt_combo_fallback = any(
+        tuple(sorted(str(c).strip().upper() for c in (combo.get("columns") or []))) == ("K", "T")
+        and str(combo.get("mode", "")).strip().lower() in {"fallback", "always"}
+        for combo in service_combos
+        if isinstance(combo, dict)
+    )
+    enable_kt_share = bool(relief.get("enable_kt_share", False)) or kt_combo_fallback
+    # K/T is a rescue valve only: keep the penalty above ordinary soft costs, but
+    # below the required-slot blank penalty for K/T so it can still save coverage.
+    KT_SHARE_PENALTY_FLOOR = 4_000_000
+    kt_share_penalty = max(int(relief.get("kt_share_penalty", 5000)), KT_SHARE_PENALTY_FLOOR)
 
     # D/F share valve (allows the same doctor to cover both D and F ONLY if needed)
     rules_map = cfg.get("rules", {}) or {}
@@ -2718,6 +2794,56 @@ def solve_with_ortools(
             model.Add(_fdef >= effective_val - sv)
             model.Add(_fdef >= 0)
             extra_obj.append(J_QUOTA_DEV_PENALTY * _fdef)
+
+    # Target mensili globali da GUI: obiettivo soft per tutti i medici del pool
+    # della colonna. Gli override per singolo medico prevalgono e vengono saltati.
+    pool_monthly_targets = cfg.get("pool_monthly_targets") or {}
+    if pool_monthly_targets:
+        _rule_for_col = {
+            "D": "D_F", "F": "D_F", "E": "E_G", "G": "E_G",
+            "H": "H", "I": "I", "J": "J", "K": "K", "L": "L",
+            "Q": "Q", "R": "R", "S": "S", "T": "T", "U": "U",
+            "V": "V", "W": "W", "Y": "Y", "Z": "Z", "AB": "AB",
+        }
+        _j_mq_docs = {
+            norm_name(d)
+            for d in ((cfg.get("rules") or {}).get("J", {}).get("monthly_quotas") or {}).keys()
+        }
+        for col_raw, target_raw in pool_monthly_targets.items():
+            col = str(col_raw).strip().upper()
+            if col == "C":
+                continue
+            try:
+                target = int(target_raw)
+            except Exception:
+                continue
+            if target < 0:
+                continue
+            col_slots = [s for s in slots if col in (s.columns or [])]
+            if not col_slots:
+                continue
+            rcol = (cfg.get("rules") or {}).get(_rule_for_col.get(col, col), {}) or {}
+            target_penalty = max(int(rcol.get("balance_weight") or 200), 1) * 250
+            for doc in doctors:
+                if (doc, col) in qov:
+                    continue
+                if col == "J" and doc in _j_mq_docs:
+                    continue
+                vars_ = [x.get((s.slot_id, doc)) for s in col_slots]
+                vars_ = [v for v in vars_ if v is not None]
+                if not vars_:
+                    continue
+                n_avail = len(vars_)
+                effective_target = min(target, n_avail)
+                cnt = model.NewIntVar(0, n_avail, f"mt_cnt_{hash((doc,col))%10**6}")
+                model.Add(cnt == sum(vars_))
+                under = model.NewIntVar(0, effective_target, f"mt_under_{hash((doc,col))%10**6}")
+                over = model.NewIntVar(0, n_avail, f"mt_over_{hash((doc,col))%10**6}")
+                model.Add(under >= effective_target - cnt)
+                model.Add(under >= 0)
+                model.Add(over >= cnt - effective_target)
+                model.Add(over >= 0)
+                extra_obj.append(target_penalty * (under + over))
             if effective_val < val:
                 pre_solve_warnings.append(
                     f"Quota fixed {doc_n}/{col}: richiesto {val} ma solo {n_avail} slot disponibili, ridotto a {effective_val}."
