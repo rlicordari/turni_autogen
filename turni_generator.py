@@ -791,6 +791,14 @@ def apply_pool_config(cfg_yaml: dict, pool_cfg: Optional[dict]) -> dict:
     ]
     cfg["pool_festivi_notti_excluded"] = {norm_name(d) for d in festivi_notti_excl}
 
+    # 4b. Esclusione sabato diurno: vale per turni Mattina/Pomeriggio,
+    # non per J notte e non per C reperibilita'.
+    saturday_day_excl = [
+        doc for doc, dcfg in doctors.items()
+        if dcfg.get("active", True) and dcfg.get("exclude_saturday_day", False)
+    ]
+    cfg["pool_saturday_day_excluded"] = {norm_name(d) for d in saturday_day_excl}
+
     # 5. Reperibilità C: sostituisce excluded list
     c_excl = [
         doc for doc, dcfg in doctors.items()
@@ -1751,6 +1759,23 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                 s.allowed = [d for d in s.allowed if d != _recupero_str]
                 if s.emergency_doctors:
                     s.emergency_doctors = [d for d in s.emergency_doctors if d != _recupero_str]
+
+    # ── Esclusione sabato diurno da GUI ────────────────────────────────────────
+    # Si applica dopo i fallback, così il medico escluso non rientra come
+    # emergenza. Non riguarda J notte, C reperibilita' o slot "Any".
+    _sat_day_excl = {norm_name(d) for d in (cfg.get("pool_saturday_day_excluded") or set())}
+    if _sat_day_excl:
+        for s in slots:
+            if s.day.dow != "Sat":
+                continue
+            if (s.shift or "") not in {"Mattina", "Pomeriggio"}:
+                continue
+            s.allowed = [d for d in s.allowed if norm_name(d) not in _sat_day_excl]
+            if s.emergency_doctors:
+                s.emergency_doctors = [
+                    d for d in s.emergency_doctors
+                    if norm_name(d) not in _sat_day_excl
+                ]
 
     # ── Validate domains: slot required con pool ancora vuoto ────────────────
     # Per colonne INDISPENSABILI: già espanso sopra con emergency pool.

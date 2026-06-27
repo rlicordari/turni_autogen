@@ -3210,6 +3210,7 @@ else:
                             "Medico": _dname,
                             "Attivo": bool(_dc.get("active", True)),
                             "Reperibilità": not bool(_dc.get("excluded_from_reperibilita", False)),
+                            "No sabato diurno": bool(_dc.get("exclude_saturday_day", False)),
                             "Festivi diurni": bool(_dc.get("festivi_diurni", True)),
                             "Festivi notti": bool(_dc.get("festivi_notti", True)),
                             "Universitario": bool(_dc.get("university_doctor")),
@@ -3222,6 +3223,7 @@ else:
                             "Medico": st.column_config.TextColumn("Medico", help="Cognome esatto (maiuscola iniziale)"),
                             "Attivo": st.column_config.CheckboxColumn("Attivo"),
                             "Reperibilità": st.column_config.CheckboxColumn("Reperibilità C"),
+                            "No sabato diurno": st.column_config.CheckboxColumn("No sabato mattina/pomeriggio"),
                             "Festivi diurni": st.column_config.CheckboxColumn("Festivi diurni"),
                             "Festivi notti": st.column_config.CheckboxColumn("Festivi notti"),
                             "Universitario": st.column_config.CheckboxColumn("Universitario"),
@@ -3242,12 +3244,14 @@ else:
                             _draft_doctors[_dn] = {
                                 "active": True, "columns": [],
                                 "festivi_diurni": True, "festivi_notti": True,
+                                "exclude_saturday_day": False,
                                 "excluded_from_reperibilita": False,
                                 "university_doctor": None, "column_overrides": {},
                                 "email": None,
                             }
                         _draft_doctors[_dn]["active"] = bool(_row["Attivo"])
                         _draft_doctors[_dn]["excluded_from_reperibilita"] = not bool(_row["Reperibilità"])
+                        _draft_doctors[_dn]["exclude_saturday_day"] = bool(_row["No sabato diurno"])
                         _draft_doctors[_dn]["festivi_diurni"] = bool(_row["Festivi diurni"])
                         _draft_doctors[_dn]["festivi_notti"] = bool(_row["Festivi notti"])
                         _is_uni = bool(_row["Universitario"])

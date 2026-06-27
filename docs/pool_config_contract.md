@@ -12,6 +12,7 @@ autoritativi per:
 - email dei medici;
 - colonne in cui ogni medico puo' comparire;
 - abilitazione a reperibilita' C;
+- esclusione dai turni diurni del sabato (mattina e pomeriggio, non notte);
 - abilitazione a festivi diurni e notti festive;
 - flag universitario;
 - quote/limiti per singolo medico e colonna;
@@ -41,6 +42,8 @@ Le regole YAML che limitano la sicurezza del dominio, come `J.never_in_J` e
 
 - `K+T` e' solo una valvola di emergenza. Il solver deve separare K e T quando
   esistono due medici disponibili.
+- L'esclusione dal sabato vale solo per turni diurni (`Mattina`/`Pomeriggio`):
+  non rimuove il medico da `J` notte e non rimuove la reperibilita' `C`.
 - `J.never_in_J` prevale su pool, override e assegnazioni fisse.
 - I servizi critici usano fallback solo quando il pool primario disponibile e'
   vuoto.

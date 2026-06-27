@@ -52,6 +52,7 @@ _DOCTOR_REQUIRED_KEYS = {
     "columns",
     "festivi_diurni",
     "festivi_notti",
+    "exclude_saturday_day",
     "excluded_from_reperibilita",
     "university_doctor",
     "column_overrides",
@@ -83,7 +84,11 @@ def normalize_pool_config(cfg: dict) -> dict:
                     str(c).strip().upper()
                     for c in dcfg.get("columns", [])
                     if str(c).strip()
+                    and str(c).strip().upper() not in FREE_COLUMNS
+                    and str(c).strip().upper() not in AUTO_COLUMNS
+                    and str(c).strip().upper() != "C"
                 })
+            dcfg["exclude_saturday_day"] = bool(dcfg.get("exclude_saturday_day", False))
             overrides = dcfg.get("column_overrides")
             if isinstance(overrides, dict):
                 normalized_overrides = {}
@@ -434,6 +439,7 @@ def migrate_from_yaml(cfg_yaml: dict) -> dict:
             "columns": columns,
             "festivi_diurni": festivi_diurni,
             "festivi_notti": festivi_notti,
+            "exclude_saturday_day": False,
             "excluded_from_reperibilita": excluded_from_rep,
             "university_doctor": university_doctor,
             "column_overrides": column_overrides,
@@ -447,6 +453,7 @@ def migrate_from_yaml(cfg_yaml: dict) -> dict:
                 "columns": [],
                 "festivi_diurni": False,
                 "festivi_notti": False,
+                "exclude_saturday_day": False,
                 "excluded_from_reperibilita": True,
                 "university_doctor": None,
                 "column_overrides": {},

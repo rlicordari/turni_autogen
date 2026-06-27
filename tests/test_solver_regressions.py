@@ -122,6 +122,26 @@ class SolverRegressionTests(unittest.TestCase):
         self.assertEqual(normalized["service_combinations"][0]["mode"], "fallback")
         self.assertEqual(normalized["service_combinations"][1]["mode"], "always")
 
+    def test_pool_config_normalizes_non_editable_columns_out_of_doctor_columns(self):
+        cfg = {
+            "schema_version": 1,
+            "doctors": {
+                "A": {
+                    "active": True,
+                    "columns": ["C", "K", "AC", "AD"],
+                    "festivi_diurni": True,
+                    "festivi_notti": True,
+                    "excluded_from_reperibilita": False,
+                    "university_doctor": None,
+                    "column_overrides": {},
+                }
+            },
+        }
+
+        normalized = normalize_pool_config(cfg)
+
+        self.assertEqual(normalized["doctors"]["A"]["columns"], ["K"])
+
     def test_pool_config_empty_gui_pool_does_not_fall_back_to_yaml_pool(self):
         cfg_yaml = {
             "columns": {"D": "UTIC mattina", "F": "Supporto 118"},
@@ -195,6 +215,76 @@ class SolverRegressionTests(unittest.TestCase):
         merged = apply_pool_config(cfg_yaml, pool_cfg)
 
         self.assertEqual(merged["pool_monthly_targets"]["K"], 1)
+
+    def test_pool_config_saturday_day_exclusion_is_merged_for_solver(self):
+        cfg_yaml = {
+            "columns": {"K": "Letto"},
+            "rules": {"K": {"pool": ["A", "B"]}},
+            "global_constraints": {},
+        }
+        doctor_template = {
+            "active": True,
+            "columns": ["K"],
+            "festivi_diurni": True,
+            "festivi_notti": True,
+            "excluded_from_reperibilita": False,
+            "university_doctor": None,
+            "column_overrides": {},
+        }
+        pool_cfg = {
+            "schema_version": 1,
+            "doctors": {
+                "A": {**doctor_template, "exclude_saturday_day": True},
+                "B": dict(doctor_template),
+            },
+        }
+
+        merged = apply_pool_config(cfg_yaml, pool_cfg)
+
+        self.assertEqual(merged["pool_saturday_day_excluded"], {"A"})
+
+    def test_saturday_day_exclusion_removes_morning_and_afternoon_but_not_night_or_c(self):
+        cfg = {
+            "columns": {"C": "Reperibilita", "H": "UTIC pomeriggio", "J": "Notte", "K": "Letto"},
+            "rules": {
+                "C_reperibilita": {"excluded": []},
+                "H": {"pool_mon_fri": ["A", "B"]},
+                "J": {"pool_other": ["A", "B"]},
+                "K": {"pool": ["A", "B"]},
+            },
+            "global_constraints": {},
+            "pool_saturday_day_excluded": {"A"},
+        }
+        sat = DayRow(dt.date(2026, 7, 4), "Sat", 5)
+        fri = DayRow(dt.date(2026, 7, 3), "Fri", 4)
+
+        slots = slots_for_month(cfg, [fri, sat], {})
+        sat_k = next(s for s in slots if s.slot_id == "2026-07-04-K")
+        sat_h = next(s for s in slots if s.slot_id == "2026-07-04-H")
+        sat_j = next(s for s in slots if s.slot_id == "2026-07-04-J")
+        sat_c = next(s for s in slots if s.slot_id == "2026-07-04-C")
+        fri_k = next(s for s in slots if s.slot_id == "2026-07-03-K")
+
+        self.assertNotIn("A", sat_k.allowed)
+        self.assertNotIn("A", sat_h.allowed)
+        self.assertIn("A", sat_j.allowed)
+        self.assertIn("A", sat_c.allowed)
+        self.assertIn("A", fri_k.allowed)
+
+    def test_saturday_day_exclusion_applies_after_critical_fallback(self):
+        cfg = {
+            "columns": {"H": "UTIC pomeriggio"},
+            "rules": {"H": {"pool_mon_fri": ["A"]}},
+            "global_constraints": {},
+            "pool_critical_services": {"H": {"fallback": "any"}},
+            "pool_saturday_day_excluded": {"A"},
+        }
+        sat = DayRow(dt.date(2026, 7, 4), "Sat", 5)
+
+        slots = slots_for_month(cfg, [sat], {})
+        sat_h = next(s for s in slots if s.slot_id == "2026-07-04-H")
+
+        self.assertNotIn("A", sat_h.allowed)
 
 
 if __name__ == "__main__":
