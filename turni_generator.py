@@ -20,6 +20,7 @@ import argparse
 import dataclasses
 import calendar
 import datetime as dt
+import math
 import re
 import sys
 from collections import defaultdict, Counter
@@ -238,14 +239,26 @@ def _apply_model_style_to_template(ws, cfg: dict, year: int, month: int, last_da
     except Exception:
         pass
 
-    # Holiday set for styling
+    # Holiday set for styling. The template may cover a custom range across
+    # multiple months/years, so derive involved years from the actual rows.
     extra = set()
     for x in cfg.get("festivi_extra", []) or []:
         try:
             extra.add(parse_date(x))
         except Exception:
             pass
-    holidays = italy_public_holidays(int(year)) | extra
+    row_dates = []
+    for r in range(2, last_day + 2):
+        d = ws.cell(r, 1).value
+        if isinstance(d, dt.datetime):
+            d = d.date()
+        if isinstance(d, dt.date):
+            row_dates.append(d)
+    years = {d.year for d in row_dates} or {int(year)}
+    holidays = set()
+    for y in years:
+        holidays |= italy_public_holidays(int(y))
+    holidays |= extra
 
     # Apply per-cell styles for the month (lightweight: <= 31 rows * ~31 cols)
     for r in range(2, last_day + 2):
@@ -405,6 +418,25 @@ def assign_reperibilita_C(cfg: dict, days: List[DayRow], slots: List[Slot],
     min_per = int(rC.get("min_per_doctor", rC.get("target_per_doctor", 0) or 0) or 0)
     max_per = int(rC.get("max_per_doctor", 0) or 0)
     target = int(rC.get("target_per_doctor", 0) or 0)
+    if days:
+        try:
+            import calendar as _calendar_c
+            _dates_c = sorted(d.date for d in days)
+            _first_c = _dates_c[0]
+            _last_c = _dates_c[-1]
+            _full_month_days_c = _calendar_c.monthrange(_first_c.year, _first_c.month)[1]
+            _partial_c = (
+                _first_c.day != 1
+                or _last_c.day != _full_month_days_c
+                or len(_dates_c) != _full_month_days_c
+            )
+            if _partial_c and _full_month_days_c > 0:
+                _frac_c = len(_dates_c) / _full_month_days_c
+                target = int(math.floor(target * _frac_c + 0.5))
+                min_per = int(math.floor(min_per * _frac_c + 0.5))
+                max_per = max(1, int(math.ceil(max_per * _frac_c))) if max_per > 0 else 0
+        except Exception:
+            pass
 
     night_col = "J"  # fixed: Notte is column J
 
@@ -582,6 +614,14 @@ def assign_reperibilita_C(cfg: dict, days: List[DayRow], slots: List[Slot],
                 break
             desired[doc] += 1
             remaining -= 1
+    # Nei periodi parziali (es. 1-6 settembre dentro una generazione 1/8-6/9),
+    # il target mensile serve solo a ordinare le preferenze: non può diventare
+    # un limite hard, altrimenti assegna capacità zero a molti medici e può
+    # rendere impossibile C anche quando il pool è sufficiente.
+    hard_cap_by_doc = {
+        doc: (max_per if min_per == 0 else desired[doc])
+        for doc in pool
+    }
 
     # Backtracking DFS con retry su spacing rilassato
     assigned: Dict[dt.date, str] = {}
@@ -612,7 +652,7 @@ def assign_reperibilita_C(cfg: dict, days: List[DayRow], slots: List[Slot],
                 return True
             d = _c_dates_sorted[i]
             for doc in _pick(d):
-                if _cnt[doc] >= desired[doc]:
+                if _cnt[doc] >= hard_cap_by_doc[doc]:
                     continue
                 if not _spacing_ok(doc, d):
                     continue
@@ -1102,6 +1142,76 @@ def create_month_template_xlsx(
     wb.save(outp)
     return outp
 
+
+def create_period_template_xlsx(
+    rules_yml: "Path | str",
+    start_date: dt.date,
+    end_date: dt.date,
+    out_path: "Path | str",
+    sheet_name: Optional[str] = None,
+) -> Path:
+    """Create an Excel template for an arbitrary inclusive date range."""
+    if end_date < start_date:
+        raise ValueError("end_date must be on or after start_date.")
+
+    rules_path = Path(rules_yml)
+    outp = Path(out_path)
+    cfg = load_rules(rules_path)
+
+    cols_map = cfg.get("columns") or {}
+    if not isinstance(cols_map, dict):
+        cols_map = {}
+    keep_empty = cfg.get("keep_empty_columns") or []
+    if not isinstance(keep_empty, list):
+        keep_empty = []
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    if sheet_name:
+        ws.title = str(sheet_name)
+    else:
+        ws.title = f"GUARDIE_{start_date:%Y%m%d}_{end_date:%Y%m%d}"
+
+    _ = ws["A1"]
+    _ = ws["B1"]
+    for col_letter, label in cols_map.items():
+        col_letter = str(col_letter).strip().upper()
+        if col_letter:
+            ws[f"{col_letter}1"] = str(label) if label is not None else ""
+    for col_letter in keep_empty:
+        col_letter = str(col_letter).strip().upper()
+        if col_letter:
+            _ = ws[f"{col_letter}1"]
+
+    r = 2
+    cur = start_date
+    while cur <= end_date:
+        ws.cell(row=r, column=1).value = cur
+        ws.cell(row=r, column=1).number_format = "dd/mm/yyyy"
+        ws.cell(row=r, column=2).value = ["lunedi", "martedi", "mercoledi", "giovedi", "venerdi", "sabato", "domenica"][cur.weekday()]
+        cur += dt.timedelta(days=1)
+        r += 1
+
+    try:
+        ws.freeze_panes = "A2"
+        ws.column_dimensions["A"].width = 12
+        ws.column_dimensions["B"].width = 6
+    except Exception:
+        pass
+
+    _apply_model_style_to_template(
+        ws,
+        cfg,
+        int(start_date.year),
+        int(start_date.month),
+        (end_date - start_date).days + 1,
+    )
+
+    outp.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(outp)
+    return outp
+
+
 def load_template_days(xlsx_path: Path, sheet_name: Optional[str]=None) -> Tuple[openpyxl.Workbook, openpyxl.worksheet.worksheet.Worksheet, List[DayRow]]:
     wb = openpyxl.load_workbook(xlsx_path)
     if sheet_name:
@@ -1233,7 +1343,7 @@ def _fixed_assignment_allowed(cfg: dict, col: str, doctor: str) -> Tuple[bool, s
     return True, ""
 
 
-def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date, Set[str]]], fixed_assignments: Optional[List[dict]] = None, v_double_overrides: Optional[List[str]] = None, j_blank_week_overrides: Optional[Dict[str, List[str]]] = None) -> List[Slot]:
+def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date, Set[str]]], fixed_assignments: Optional[List[dict]] = None, v_double_overrides: Optional[List[str]] = None, j_blank_week_overrides: Optional[Dict[str, List[str]]] = None, disabled_columns: Optional[List[str]] = None) -> List[Slot]:
     """
     Converts YAML column rules into per-day slots.
     Handles exception days (festivi) by merging D+E and H+I, and merging E+G always.
@@ -1241,6 +1351,11 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
     rules = cfg.get("rules", {})
     if not isinstance(rules, dict):
         raise ValueError("cfg.rules must be a mapping.")
+    disabled_cols = {
+        str(c).strip().upper()
+        for c in (disabled_columns or cfg.get("disabled_columns") or [])
+        if str(c).strip()
+    }
     doctors_all = collect_doctors(cfg)
     doctors_set = set(doctors_all)
     # Relief valves (optional): allow specific columns to be left blank with penalties (used only if needed).
@@ -1695,6 +1810,20 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                 pool = [fixed] if fixed in doctors_set else mk_allowed(r.get("pool") or [])
                 pool = apply_unavailability(pool, day, "Mattina", unav)
                 slots.append(Slot(day, f"{day.date}-AC", ["AC"], pool, required=True, shift="Mattina", rule_tag="AC"))
+    # ── Disattivazione esplicita colonne ────────────────────────────────────────
+    # Se una colonna è disattivata dall'admin per questa generazione, non deve
+    # produrre slot né fallback: la cella resta intenzionalmente vuota.
+    if disabled_cols:
+        _filtered_slots: List[Slot] = []
+        for s in slots:
+            _enabled_columns = [c for c in (s.columns or []) if str(c).strip().upper() not in disabled_cols]
+            if not _enabled_columns:
+                continue
+            if _enabled_columns != s.columns:
+                s.columns = _enabled_columns
+            _filtered_slots.append(s)
+        slots = _filtered_slots
+
     # ── Espansione pool per colonne indispensabili (critical_services) ──────────
     # Per ogni colonna marcata come "indispensabile" in pool_critical_services:
     # se il pool primario è vuoto o molto ridotto, si espande a qualsiasi medico
@@ -1826,11 +1955,19 @@ def diagnose_day_level(days: List[DayRow], slots: List[Slot]) -> List[Dict]:
     for s in slots:
         slots_by_day[s.day.date].append(s)
     report: List[Dict] = []
+    def _diag_slot_is_exempt_daily(s: Slot) -> bool:
+        # The real model exempts C from daily uniqueness. This diagnostic is a
+        # quick bipartite check, so exempt slots must not consume a unique doctor.
+        return any(str(c).strip().upper() == "C" for c in (s.columns or []))
+
     for day in days:
         day_slots = slots_by_day.get(day.date, [])
-        uniq_slots = [s for s in day_slots if not _slot_is_exempt_daily(s)]
         # consider only required slots (and also "penalized optional" slots) as "should be filled"
-        must_fill = [s for s in day_slots if s.required or (getattr(s, "blank_penalty", 0) and int(getattr(s, "blank_penalty", 0)) > 0)]
+        must_fill = [
+            s for s in day_slots
+            if not _diag_slot_is_exempt_daily(s)
+            and (s.required or (getattr(s, "blank_penalty", 0) and int(getattr(s, "blank_penalty", 0)) > 0))
+        ]
         if not must_fill:
             continue
         matched, slot_to_doc = _max_bipartite_matching(must_fill)
@@ -1972,6 +2109,7 @@ def solve_with_ortools(
     availability_preferences: Optional[List[dict]] = None,
     unav_map: Optional[Dict[str, Dict[dt.date, Set[str]]]] = None,
     historical_stats: Optional[dict] = None,
+    prior_usage: Optional[dict] = None,
 ) -> Tuple[Dict[str, Optional[str]], Dict]:
     """
     Returns:
@@ -2003,6 +2141,111 @@ def solve_with_ortools(
     doctors = collect_doctors(cfg)
     doctors = [d for d in doctors if d != "Recupero"] + (["Recupero"] if "Recupero" in doctors else [])
     doc_to_idx = {d:i for i,d in enumerate(doctors)}
+    month_key_for_solver = f"{days[0].date.year:04d}-{days[0].date.month:02d}" if days else ""
+    prior_usage = prior_usage or {}
+    prior_counts_month = ((prior_usage.get("counts") or {}).get(month_key_for_solver) or {})
+
+    period_month_fraction = 1.0
+    period_is_partial_month = False
+    if days:
+        try:
+            _period_dates = sorted({d.date for d in days})
+            _first_period_day = _period_dates[0]
+            _last_period_day = _period_dates[-1]
+            _full_month_days = calendar.monthrange(_first_period_day.year, _first_period_day.month)[1]
+            period_is_partial_month = (
+                _first_period_day.day != 1
+                or _last_period_day.day != _full_month_days
+                or len(_period_dates) != _full_month_days
+            )
+            if period_is_partial_month and _full_month_days > 0:
+                period_month_fraction = len(_period_dates) / _full_month_days
+                pre_solve_warnings.append(
+                    "Quote mensili riproporzionate al periodo: "
+                    f"{len(_period_dates)}/{_full_month_days} giorni del mese."
+                )
+        except Exception:
+            period_month_fraction = 1.0
+            period_is_partial_month = False
+
+    def _prior_count(doc: Optional[str], col: Optional[str]) -> int:
+        if not doc or not col:
+            return 0
+        doc_n = norm_name(doc)
+        col_n = str(col).strip().upper()
+        by_col = prior_counts_month.get(doc_n) or prior_counts_month.get(str(doc).strip()) or {}
+        try:
+            if col_n == "FESTIVI":
+                return sum(int(by_col.get(c, 0) or 0) for c in ("D", "E", "H", "I"))
+            return int(by_col.get(col_n, 0) or 0)
+        except Exception:
+            return 0
+
+    def _prior_total_count(doc: Optional[str]) -> int:
+        if not doc:
+            return 0
+        doc_n = norm_name(doc)
+        by_col = prior_counts_month.get(doc_n) or prior_counts_month.get(str(doc).strip()) or {}
+        total = 0
+        for v in by_col.values():
+            try:
+                total += int(v or 0)
+            except Exception:
+                continue
+        return total
+
+    def _prior_j_weekend_count(doc: Optional[str]) -> int:
+        if not doc:
+            return 0
+        doc_n = norm_name(doc)
+        by_doc = ((prior_usage.get("night_dates_by_doc") or {}).get(month_key_for_solver) or {})
+        dates = by_doc.get(doc_n) or by_doc.get(str(doc).strip()) or []
+        total = 0
+        for ds in dates:
+            try:
+                d = dt.date.fromisoformat(str(ds)[:10])
+            except Exception:
+                continue
+            if d.weekday() in (5, 6):
+                total += 1
+        return total
+
+    def _prior_rule_balance_count(doc: Optional[str], rule_key: Optional[str]) -> int:
+        if not doc or not rule_key:
+            return 0
+        key = str(rule_key).strip().upper()
+        pair_map = {
+            "E_G": ("E", "G"),
+            "FESTIVO_DE": ("D", "E"),
+            "FESTIVO_HI": ("H", "I"),
+            "DE": ("D", "E"),
+            "HI": ("H", "I"),
+        }
+        cols = pair_map.get(key)
+        if cols is None and "_" in key:
+            cols = tuple(c for c in key.split("_") if c)
+        if cols:
+            return max((_prior_count(doc, c) for c in cols), default=0)
+        return _prior_count(doc, key)
+
+    def _has_prior_month_usage() -> bool:
+        return bool(prior_counts_month)
+
+    def _monthly_target_for_period(value: int, doc: Optional[str] = None, col: Optional[str] = None) -> int:
+        value = int(value)
+        if period_is_partial_month and doc and col and _has_prior_month_usage():
+            return max(0, value - _prior_count(doc, col))
+        if not period_is_partial_month:
+            return value
+        return int(math.floor(value * period_month_fraction + 0.5))
+
+    def _monthly_cap_for_period(value: int, doc: Optional[str] = None, col: Optional[str] = None) -> int:
+        value = int(value)
+        if period_is_partial_month and doc and col and _has_prior_month_usage():
+            return max(0, value - _prior_count(doc, col))
+        if not period_is_partial_month:
+            return value
+        return max(1, int(math.ceil(value * period_month_fraction))) if value > 0 else 0
 
     # Fixed assignments are admin overrides, but they must be part of the slot
     # domain before variables and slot cardinality constraints are created.
@@ -2046,24 +2289,24 @@ def solve_with_ortools(
     # which slots genuinely cannot be filled (they show up blank in the output).
     #
     # Gerarchia sacrifici (crescente = si sacrifica per primo):
-    #   K=T share: 5K  →  L/Z/R: 20-40K (relief_valves)
-    #   → Q, W: 1M  → standard (C,S,T,U,V,Y,AB,K,AC,C_repreb): 5M
-    #   → E/G, I, Festivo_DE: 15M  → D, F, H, J, Festivo_HI: 40M
-    BLANK_REQUIRED_PENALTY = 5_000_000   # default per slot non classificati
+    #   K=T share: 4M  →  preferenze/quote/target  →  slot obbligatorio vuoto.
+    # Il vuoto obbligatorio deve restare una vera ultima spiaggia, ma senza usare
+    # coefficienti enormi che rallentano molto CP-SAT sul caso reale.
+    BLANK_REQUIRED_PENALTY = 50_000_000   # default per slot non classificati
     _BLANK_PENALTY_BY_TAG: Dict[str, int] = {
         # Critici — quasi mai vuoti
-        "J":          40_000_000,
-        "H":          40_000_000,
-        "D_F.D":      40_000_000,
-        "D_F.F":      40_000_000,
-        "Festivo_HI": 40_000_000,
+        "J":          200_000_000,
+        "H":          200_000_000,
+        "D_F.D":      200_000_000,
+        "D_F.F":      200_000_000,
+        "Festivo_HI": 200_000_000,
         # Alti — solo se davvero nessun medico disponibile
-        "I":          15_000_000,
-        "E_G":        15_000_000,
-        "Festivo_DE": 15_000_000,
+        "I":          120_000_000,
+        "E_G":        120_000_000,
+        "Festivo_DE": 120_000_000,
         # Bassi — possono cedere prima degli altri required
-        "Q":           1_000_000,
-        "W":           1_000_000,
+        "Q":           50_000_000,
+        "W":           50_000_000,
     }
     blank_required_vars: Dict[str, object] = {}  # slot_id -> b_blank var (for diagnostics)
     for s in slots:
@@ -2090,7 +2333,7 @@ def solve_with_ortools(
                 model.Add(sum(vars_) <= 1)
     # Penalità per medici di emergenza (non nel pool primario della colonna)
     # Il solver li usa solo se non c'è alternativa migliore (penalità < blank penalty).
-    EMERGENCY_FILL_PENALTY = 2_000_000  # < BLANK_REQUIRED_PENALTY (5M) → meglio di blank
+    EMERGENCY_FILL_PENALTY = 5_000_000  # < BLANK_REQUIRED_PENALTY → meglio di blank
     for s in slots:
         for _emerg_doc in (s.emergency_doctors or []):
             _ev = x.get((s.slot_id, norm_name(_emerg_doc)))
@@ -2721,7 +2964,6 @@ def solve_with_ortools(
             eg_pool = [norm_name(d) for d in (rEG.get("allowed") or []) if norm_name(d) in doctors]
             if eg_pool:
                 n_eg = len(eg_slots_all)
-                import math
                 # Conta solo i medici con almeno una variabile disponibile (tiene conto delle indisponibilità)
                 eg_active_docs = [
                     d for d in eg_pool
@@ -2764,29 +3006,36 @@ def solve_with_ortools(
                 continue
             q_int = int(q)
             n_avail = len(vars_)
-            q_eff = min(q_int, n_avail)
-            if n_avail < q_int:
+            q_target = min(_monthly_target_for_period(q_int, doc, "J"), n_avail)
+            q_cap = min(_monthly_cap_for_period(q_int, doc, "J"), n_avail)
+            q_cap = max(q_cap, q_target)
+            if n_avail < q_int and not period_is_partial_month:
                 pre_solve_warnings.append(
                     f"J quota {doc}: richieste {q_int} notti ma solo {n_avail} disponibili. "
-                    f"Quota adattata a {q_eff}."
+                    f"Quota adattata a {q_target}."
                 )
             _strict = doc in _j_strict_docs
             _pen = J_QUOTA_STRICT_PENALTY if _strict else J_QUOTA_DEV_PENALTY
             # Hard upper per i medici a quota stretta (Zito, Dattilo, Calabrò):
             # non devono mai superare la loro quota.
             if _strict:
-                model.Add(sum(vars_) <= q_eff)
+                model.Add(sum(vars_) <= q_cap)
+                if q_cap > q_target:
+                    _jsup = model.NewIntVar(0, n_avail, f"jsup_strict_{hash(doc)%10**6}")
+                    model.Add(_jsup >= sum(vars_) - q_target)
+                    model.Add(_jsup >= 0)
+                    extra_obj.append(_pen * _jsup)
             else:
                 # Soft surplus per gli altri (hard upper già gestito da pool_quota_overrides)
                 _jsup = model.NewIntVar(0, n_avail, f"jsup_{hash(doc)%10**6}")
-                model.Add(_jsup >= sum(vars_) - q_eff)
+                model.Add(_jsup >= sum(vars_) - q_target)
                 model.Add(_jsup >= 0)
                 extra_obj.append(_pen * _jsup)
             # Soft deficit: penalità per ogni notte mancante rispetto alla quota
             _jsum = model.NewIntVar(0, n_avail, f"jsum_{hash(doc)%10**6}")
             model.Add(_jsum == sum(vars_))
             _jdef = model.NewIntVar(0, n_avail, f"jdef_{hash(doc)%10**6}")
-            model.Add(_jdef >= q_eff - _jsum)
+            model.Add(_jdef >= q_target - _jsum)
             model.Add(_jdef >= 0)
             extra_obj.append(_pen * _jdef)
     # Pool quota overrides max/min — da pool_config (tutti i tipi e colonne)
@@ -2799,26 +3048,37 @@ def solve_with_ortools(
             continue
         sv = sum(vars_)
         qt = spec.get("type", "max")
-        val = int(spec.get("value", 0))
+        val_monthly = int(spec.get("value", 0))
         n_avail = len(vars_)
         if qt == "max":
-            model.Add(sv <= val)
+            model.Add(sv <= min(_monthly_cap_for_period(val_monthly, doc_n, col), n_avail))
         elif qt == "min":
-            effective_min = min(val, n_avail)
+            effective_min = min(_monthly_target_for_period(val_monthly, doc_n, col), n_avail)
             if effective_min > 0:
                 model.Add(sv >= effective_min)
-            if effective_min < val:
+            if effective_min < val_monthly and not period_is_partial_month:
                 pre_solve_warnings.append(
-                    f"Quota min {doc_n}/{col}: richiesto min {val} ma solo {n_avail} slot disponibili."
+                    f"Quota min {doc_n}/{col}: richiesto min {val_monthly} ma solo {n_avail} slot disponibili."
                 )
         elif qt == "fixed":
-            effective_val = min(val, n_avail)
-            # Hard upper bound + soft lower (no hard lower per evitare infeasibility)
-            model.Add(sv <= effective_val)
-            _fdef = model.NewIntVar(0, effective_val, f"fdef_{hash((doc_n,col))%10**6}")
-            model.Add(_fdef >= effective_val - sv)
+            effective_target = min(_monthly_target_for_period(val_monthly, doc_n, col), n_avail)
+            effective_cap = min(_monthly_cap_for_period(val_monthly, doc_n, col), n_avail)
+            effective_cap = max(effective_cap, effective_target)
+            # Hard upper bound + soft deviation from the period target.
+            model.Add(sv <= effective_cap)
+            _fdef = model.NewIntVar(0, n_avail, f"fdef_{hash((doc_n,col))%10**6}")
+            model.Add(_fdef >= effective_target - sv)
             model.Add(_fdef >= 0)
             extra_obj.append(J_QUOTA_DEV_PENALTY * _fdef)
+            if effective_cap > effective_target:
+                _fsup = model.NewIntVar(0, n_avail, f"fsup_{hash((doc_n,col))%10**6}")
+                model.Add(_fsup >= sv - effective_target)
+                model.Add(_fsup >= 0)
+                extra_obj.append(J_QUOTA_DEV_PENALTY * _fsup)
+            if effective_target < val_monthly and not period_is_partial_month:
+                pre_solve_warnings.append(
+                    f"Quota fixed {doc_n}/{col}: richiesto {val_monthly} ma solo {n_avail} slot disponibili, ridotto a {effective_target}."
+                )
 
     # Target mensili globali da GUI: obiettivo soft per tutti i medici del pool
     # della colonna. Gli override per singolo medico prevalgono e vengono saltati.
@@ -2839,10 +3099,10 @@ def solve_with_ortools(
             if col == "C":
                 continue
             try:
-                target = int(target_raw)
+                target_monthly = int(target_raw)
             except Exception:
                 continue
-            if target < 0:
+            if target_monthly < 0:
                 continue
             col_slots = [s for s in slots if col in (s.columns or [])]
             if not col_slots:
@@ -2859,6 +3119,7 @@ def solve_with_ortools(
                 if not vars_:
                     continue
                 n_avail = len(vars_)
+                target = _monthly_target_for_period(target_monthly, doc, col)
                 effective_target = min(target, n_avail)
                 cnt = model.NewIntVar(0, n_avail, f"mt_cnt_{hash((doc,col))%10**6}")
                 model.Add(cnt == sum(vars_))
@@ -2869,11 +3130,6 @@ def solve_with_ortools(
                 model.Add(over >= cnt - effective_target)
                 model.Add(over >= 0)
                 extra_obj.append(target_penalty * (under + over))
-            if effective_val < val:
-                pre_solve_warnings.append(
-                    f"Quota fixed {doc_n}/{col}: richiesto {val} ma solo {n_avail} slot disponibili, ridotto a {effective_val}."
-                )
-
     # Monthly quotas (hard) — Festivi DE+HI
     if "rules" in cfg and "Festivi" in cfg["rules"]:
         rFest = cfg["rules"]["Festivi"]
@@ -2886,14 +3142,21 @@ def solve_with_ortools(
                 vars_ = [x.get((s.slot_id, doc)) for s in festivo_slots]
                 vars_ = [v for v in vars_ if v is not None]
                 if vars_:
-                    q_eff = min(q, len(vars_))
-                    # Hard upper bound + soft lower
-                    model.Add(sum(vars_) <= q_eff)
-                    _fqdef = model.NewIntVar(0, q_eff, f"fqdef_{hash(doc)%10**6}")
-                    model.Add(_fqdef >= q_eff - sum(vars_))
+                    q_target = min(_monthly_target_for_period(q, doc, "Festivi"), len(vars_))
+                    q_cap = min(_monthly_cap_for_period(q, doc, "Festivi"), len(vars_))
+                    q_cap = max(q_cap, q_target)
+                    # Hard upper bound + soft deviation from the period target.
+                    model.Add(sum(vars_) <= q_cap)
+                    _fqdef = model.NewIntVar(0, len(vars_), f"fqdef_{hash(doc)%10**6}")
+                    model.Add(_fqdef >= q_target - sum(vars_))
                     model.Add(_fqdef >= 0)
                     extra_obj.append(J_QUOTA_DEV_PENALTY * _fqdef)
-                    if q_eff < q:
+                    if q_cap > q_target:
+                        _fqsup = model.NewIntVar(0, len(vars_), f"fqsup_{hash(doc)%10**6}")
+                        model.Add(_fqsup >= sum(vars_) - q_target)
+                        model.Add(_fqsup >= 0)
+                        extra_obj.append(J_QUOTA_DEV_PENALTY * _fqsup)
+                    if q_target < q and not period_is_partial_month:
                         pre_solve_warnings.append(
                             f"Festivi quota {doc}: richiesti {q} ma solo {len(vars_)} slot disponibili."
                         )
@@ -2909,15 +3172,17 @@ def solve_with_ortools(
             festivo_slots_all = [s for s in slots if s.rule_tag in ("Festivo_DE", "Festivo_HI")]
             fest_bal_w = int(rFest.get("balance_weight") or 500)
             if balance_pool and festivo_slots_all:
-                max_fest = model.NewIntVar(0, len(festivo_slots_all), "max_fest_load")
+                max_prior_fest = max((_prior_count(d, "Festivi") for d in balance_pool), default=0)
+                max_fest = model.NewIntVar(0, len(festivo_slots_all) + max_prior_fest, "max_fest_load")
                 for d in balance_pool:
                     vars_d = [x[(s.slot_id, d)] for s in festivo_slots_all
                               if (s.slot_id, d) in x]
                     if not vars_d:
                         continue
-                    load_d = model.NewIntVar(0, len(festivo_slots_all),
+                    prior_fest = _prior_count(d, "Festivi")
+                    load_d = model.NewIntVar(0, len(festivo_slots_all) + prior_fest,
                                             f"fest_load_{hash(d) % 10**6}")
-                    model.Add(load_d == sum(vars_d))
+                    model.Add(load_d == sum(vars_d) + prior_fest)
                     model.Add(load_d <= max_fest)
                 extra_obj.append(fest_bal_w * max_fest)
         except Exception:
@@ -2936,7 +3201,9 @@ def solve_with_ortools(
             we_vars = [v for v in we_vars if v is not None]
             if not we_vars:
                 continue  # Zito indisponibile tutti i weekend: vincolo ignorato
-            min_we = int(min_we)
+            min_we = _monthly_target_for_period(int(min_we), doc, "J")
+            if min_we <= 0:
+                continue
             no_we = model.NewBoolVar(f"no_we_night_{hash(doc)%10**6}")
             we_sum = model.NewIntVar(0, len(we_vars), f"we_sum_{hash(doc)%10**6}")
             model.Add(we_sum == sum(we_vars))
@@ -2953,7 +3220,7 @@ def solve_with_ortools(
                        for d in days if d.dow in ("Sat", "Sun")]
             we_vars = [v for v in we_vars if v is not None]
             if we_vars:
-                model.Add(sum(we_vars) <= int(max_we))
+                model.Add(sum(we_vars) <= _monthly_cap_for_period(int(max_we), doc, "J"))
     # Night distribution (HARD min/max per dottore + soft balance weekend)
     # Logica: total_nights = giorni del mese - giovedì (thursday_blank).
     # pool_available_nights esclude slot J pre-assegnate a medici fuori pool (es. festivi fissi).
@@ -2977,15 +3244,19 @@ def solve_with_ortools(
             # Medici con quota fissa: già vincolati con == sopra.
             # Medici senza quota fissa: imponiamo min=2, max=3 hard.
             free_docs = [d for d in sorted(night_pool) if d not in mq_fixed]
-            fixed_total = sum(mq_fixed.values())
+            fixed_total = sum(_monthly_target_for_period(v, doc, "J") for doc, v in mq_fixed.items())
             free_total = max(0, pool_available_nights - fixed_total)
 
             # Calcola min/max bilanciati per i medici liberi
             if free_docs:
                 n_free = len(free_docs)
-                # free_total / n_free → es. 21/9 = 2.33 → min=2, max=3
-                min_per = free_total // n_free  # minimo garantito
-                remainder = free_total - min_per * n_free
+                prior_free_total = sum(_prior_count(doc, "J") for doc in free_docs)
+                month_free_total = free_total + prior_free_total
+                # month_free_total / n_free → es. 21/9 = 2.33 → min=2, max=3.
+                # Nei periodi parziali successivi la prima settimana salvata resta
+                # nel totale mensile tramite prior_free_total.
+                min_per = month_free_total // n_free  # minimo garantito sul mese logico
+                remainder = month_free_total - min_per * n_free
                 # max_per = min_per se il resto è 0, altrimenti min_per+1
                 max_per = min_per + (1 if remainder > 0 else 0)
                 max_per = max(max_per, 0)  # sicurezza: mai negativo
@@ -2994,8 +3265,12 @@ def solve_with_ortools(
                     vars_ = [night_var_by_day_doc.get((d.date, doc)) for d in days
                              if night_var_by_day_doc.get((d.date, doc)) is not None]
                     if vars_:
-                        model.Add(sum(vars_) >= min_per)   # HARD: minimo
-                        model.Add(sum(vars_) <= max_per)   # HARD: massimo
+                        prior_j = _prior_count(doc, "J")
+                        cur_min = max(0, min_per - prior_j)
+                        cur_max = max(0, max_per - prior_j)
+                        if cur_min > 0:
+                            model.Add(sum(vars_) >= cur_min)   # HARD: minimo residuo
+                        model.Add(sum(vars_) <= cur_max)   # HARD: massimo residuo
 
                 # Soft balance: minimizza la differenza max-min tra i medici liberi
                 # per distribuire equamente il "resto"
@@ -3005,15 +3280,15 @@ def solve_with_ortools(
                         vars_ = [night_var_by_day_doc.get((d.date, doc)) for d in days
                                  if night_var_by_day_doc.get((d.date, doc)) is not None]
                         if vars_:
-                            cnt = model.NewIntVar(0, total_nights, f"nightcnt_{hash(doc)%10**6}")
-                            model.Add(cnt == sum(vars_))
+                            cnt = model.NewIntVar(0, month_free_total, f"nightcnt_{hash(doc)%10**6}")
+                            model.Add(cnt == sum(vars_) + _prior_count(doc, "J"))
                             cnt_vars.append(cnt)
                     if cnt_vars:
-                        max_cnt = model.NewIntVar(0, total_nights, "night_max_free")
-                        min_cnt = model.NewIntVar(0, total_nights, "night_min_free")
+                        max_cnt = model.NewIntVar(0, month_free_total, "night_max_free")
+                        min_cnt = model.NewIntVar(0, month_free_total, "night_min_free")
                         model.AddMaxEquality(max_cnt, cnt_vars)
                         model.AddMinEquality(min_cnt, cnt_vars)
-                        diff_cnt = model.NewIntVar(0, total_nights, "night_diff_free")
+                        diff_cnt = model.NewIntVar(0, month_free_total, "night_diff_free")
                         model.Add(diff_cnt == max_cnt - min_cnt)
                         extra_obj.append(200 * diff_cnt)
 
@@ -3026,9 +3301,11 @@ def solve_with_ortools(
             1 for day in days if day.dow in ["Sat", "Sun"]
             if any(night_var_by_day_doc.get((day.date, doc)) is not None for doc in weekend_docs)
         )
+        prior_we_nights = sum(_prior_j_weekend_count(doc) for doc in weekend_docs)
+        month_we_nights = total_we_nights + prior_we_nights
         n_we_docs = len(weekend_docs)
-        we_hard_cap = _math.ceil(total_we_nights / n_we_docs) if n_we_docs > 0 else 1
-        we_soft_target = (total_we_nights // n_we_docs) if n_we_docs > 0 else 1
+        we_hard_cap = _math.ceil(month_we_nights / n_we_docs) if n_we_docs > 0 else 1
+        we_soft_target = (month_we_nights // n_we_docs) if n_we_docs > 0 else 1
         we_cnt_vars = []
         for doc in sorted(weekend_docs):
             we_vars = []
@@ -3038,12 +3315,13 @@ def solve_with_ortools(
                     if v is not None:
                         we_vars.append(v)
             if we_vars:
-                we_cnt = model.NewIntVar(0, len(we_vars), f"we_night_{hash(doc)%10**6}")
-                model.Add(we_cnt == sum(we_vars))
+                prior_we_doc = _prior_j_weekend_count(doc)
+                we_cnt = model.NewIntVar(0, len(we_vars) + prior_we_doc, f"we_night_{hash(doc)%10**6}")
+                model.Add(we_cnt == sum(we_vars) + prior_we_doc)
                 model.Add(we_cnt <= we_hard_cap)
                 we_cnt_vars.append(we_cnt)
                 if we_hard_cap > we_soft_target:
-                    over_tgt = model.NewIntVar(0, we_hard_cap, f"we_over_tgt_{hash(doc)%10**6}")
+                    over_tgt = model.NewIntVar(0, len(we_vars) + prior_we_doc, f"we_over_tgt_{hash(doc)%10**6}")
                     model.Add(over_tgt >= we_cnt - we_soft_target)
                     model.Add(over_tgt >= 0)
                     extra_obj.append(5000 * over_tgt)
@@ -3079,7 +3357,19 @@ def solve_with_ortools(
                     if sH and (sH.slot_id, doc) in x:
                         vars_.append(x[(sH.slot_id, doc)])
             if vars_:
-                model.Add(sum(vars_) == int(q))
+                q_target = min(_monthly_target_for_period(int(q), doc, "H"), len(vars_))
+                q_cap = min(_monthly_cap_for_period(int(q), doc, "H"), len(vars_))
+                q_cap = max(q_cap, q_target)
+                model.Add(sum(vars_) <= q_cap)
+                _hdef = model.NewIntVar(0, len(vars_), f"hdef_{hash((doc,key))%10**6}")
+                model.Add(_hdef >= q_target - sum(vars_))
+                model.Add(_hdef >= 0)
+                extra_obj.append(J_QUOTA_DEV_PENALTY * _hdef)
+                if q_cap > q_target:
+                    _hsup = model.NewIntVar(0, len(vars_), f"hsup_{hash((doc,key))%10**6}")
+                    model.Add(_hsup >= sum(vars_) - q_target)
+                    model.Add(_hsup >= 0)
+                    extra_obj.append(J_QUOTA_DEV_PENALTY * _hsup)
         # cap per doctor for pool_mon_fri
         cap = cfg["rules"]["H"].get("cap_mon_fri_per_doctor")
         if cap is not None:
@@ -3109,7 +3399,7 @@ def solve_with_ortools(
                 if s.columns == ["L"] and (s.slot_id, "Recupero") in x:
                     vars_.append(x[(s.slot_id, "Recupero")])
             if vars_:
-                qrec_int = int(qrec)
+                qrec_int = _monthly_target_for_period(int(qrec), "Recupero", "L")
                 model.Add(sum(vars_) <= qrec_int)
                 # Soft: penalizza shortfall senza hard equality (evita infeasibility)
                 _lrec_sum = model.NewIntVar(0, qrec_int, f"L_rec_sum")
@@ -3170,14 +3460,21 @@ def solve_with_ortools(
                 if s.columns == ["U"] and (s.slot_id, "Cimino") in x:
                     vars_.append(x[(s.slot_id, "Cimino")])
             if vars_:
-                effective_exact = min(exact, len(vars_))
+                effective_exact = min(_monthly_target_for_period(exact, "Cimino", "U"), len(vars_))
+                effective_cap = min(_monthly_cap_for_period(exact, "Cimino", "U"), len(vars_))
+                effective_cap = max(effective_cap, effective_exact)
                 # Hard upper bound + soft lower
-                model.Add(sum(vars_) <= effective_exact)
-                _cudef = model.NewIntVar(0, effective_exact, f"cudef_{effective_exact}")
+                model.Add(sum(vars_) <= effective_cap)
+                _cudef = model.NewIntVar(0, len(vars_), f"cudef_{effective_exact}")
                 model.Add(_cudef >= effective_exact - sum(vars_))
                 model.Add(_cudef >= 0)
                 extra_obj.append(J_QUOTA_DEV_PENALTY * _cudef)
-                if effective_exact < exact:
+                if effective_cap > effective_exact:
+                    _cusup = model.NewIntVar(0, len(vars_), f"cusup_{effective_exact}")
+                    model.Add(_cusup >= sum(vars_) - effective_exact)
+                    model.Add(_cusup >= 0)
+                    extra_obj.append(J_QUOTA_DEV_PENALTY * _cusup)
+                if effective_exact < exact and not period_is_partial_month:
                     pre_solve_warnings.append(
                         f"Cimino U: richiesti esattamente {exact} ma solo {len(vars_)} slot disponibili, ridotto a {effective_exact}."
                     )
@@ -3233,8 +3530,8 @@ def solve_with_ortools(
     if "rules" in cfg and "T" in cfg["rules"]:
         rT = cfg["rules"]["T"] or {}
         if "Recupero" in doctors:
-            min_rec = int(rT.get("recupero_min_per_month", 0) or 0)
-            target_rec = int(rT.get("recupero_target_per_month", 0) or 0)
+            min_rec = _monthly_target_for_period(int(rT.get("recupero_min_per_month", 0) or 0), "Recupero", "T")
+            target_rec = _monthly_target_for_period(int(rT.get("recupero_target_per_month", 0) or 0), "Recupero", "T")
             target_pen = int(rT.get("recupero_target_penalty", 2000) or 2000)
             vars_ = []
             for s in slots:
@@ -3262,7 +3559,7 @@ def solve_with_ortools(
     if "rules" in cfg and "Q" in cfg["rules"]:
         rQ = cfg["rules"]["Q"] or {}
         if "Recupero" in doctors:
-            max_rec = int(rQ.get("recupero_max_per_month", 0) or 0)
+            max_rec = _monthly_cap_for_period(int(rQ.get("recupero_max_per_month", 0) or 0), "Recupero", "Q")
             if max_rec > 0:
                 vars_ = []
                 for s in slots:
@@ -3298,7 +3595,7 @@ def solve_with_ortools(
     # W: cap Recupero per evitare che domini il turno
     if "rules" in cfg and "W" in cfg["rules"] and "Recupero" in doctors:
         rW = cfg["rules"]["W"] or {}
-        w_rec_max = int(rW.get("recupero_max_per_month", 0) or 0)
+        w_rec_max = _monthly_cap_for_period(int(rW.get("recupero_max_per_month", 0) or 0), "Recupero", "W")
         if w_rec_max > 0:
             vars_ = []
             for s in slots:
@@ -3395,8 +3692,9 @@ def solve_with_ortools(
             extra_obj.append(50 * ab_max_per_doc)  # minimizza il massimo → bilanciamento
 
         # Sabati: HARD con Crea (2 sabati/mese)
-        sat_n = int(rAB.get("saturday_per_month", 0) or 0)
         sat_doc = norm_name(rAB.get("saturday_only_doctor") or "Crea")
+        sat_n = _monthly_target_for_period(int(rAB.get("saturday_per_month", 0) or 0), sat_doc, "AB")
+        sat_cap = _monthly_cap_for_period(int(rAB.get("saturday_per_month", 0) or 0), sat_doc, "AB")
         if sat_n > 0 and sat_doc in doctors:
             vars_=[]
             for s in slots:
@@ -3405,7 +3703,7 @@ def solve_with_ortools(
             if vars_:
                 if bool(rAB.get("saturday_soft", False)):
                     # soft (fallback per evitare infeasible)
-                    model.Add(sum(vars_) <= sat_n)
+                    model.Add(sum(vars_) <= sat_cap)
                     short = model.NewIntVar(0, sat_n, "AB_sat_short")
                     model.Add(sum(vars_) + short == sat_n)
                     extra_obj.append(int(rAB.get("saturday_shortfall_penalty", 10000)) * short)
@@ -3417,7 +3715,7 @@ def solve_with_ortools(
     # By default this is a HARD constraint. If it makes the month infeasible,
     # you can set global_constraints.weekend_off_soft: true to make it a SOFT constraint
     # (the solver will minimize the number of missing weekends-off).
-    min_weekends = int(gc.get("min_full_weekends_off_per_month", 0) or 0)
+    min_weekends = _monthly_target_for_period(int(gc.get("min_full_weekends_off_per_month", 0) or 0))
     weekend_exempt = set(norm_name(x) for x in (gc.get("weekend_off_exempt") or []))
     # NOTA: 'Recupero' è trattato come medico reale: rientra nel conteggio dei weekend-off.
     weekend_soft = bool(gc.get("weekend_off_soft", False))
@@ -3501,7 +3799,7 @@ def solve_with_ortools(
                 vars_.append(v)
         if vars_:
             load = model.NewIntVar(0, 999, f"load_{hash(doc)%10**6}")
-            model.Add(load == sum(vars_))
+            model.Add(load == sum(vars_) + _prior_total_count(doc))
             model.Add(load <= max_load)
     objective_terms.append(max_load * 10)
     # Column-specific balancing (and optional soft caps) for specific columns.
@@ -3540,7 +3838,8 @@ def solve_with_ortools(
             bal_w = int(rcol.get('balance_weight') or 40)
             cap = int(rcol.get('max_per_doctor') or 0)
             cap_pen = int(rcol.get('max_per_doctor_penalty') or 800)
-            max_col = model.NewIntVar(0, len(slot_ids), f"max_{col_key}_load")
+            max_prior_col = max((_prior_rule_balance_count(d, col_key) for d in pool), default=0)
+            max_col = model.NewIntVar(0, len(slot_ids) + max_prior_col, f"max_{col_key}_load")
             _load_vars_for_spread = []
             for d in pool:
                 vars_d = []
@@ -3550,12 +3849,13 @@ def solve_with_ortools(
                         vars_d.append(v)
                 if not vars_d:
                     continue
-                load_d = model.NewIntVar(0, len(slot_ids), f"load_{col_key}_{hash(d)%10**6}")
-                model.Add(load_d == sum(vars_d))
+                prior_col = _prior_rule_balance_count(d, col_key)
+                load_d = model.NewIntVar(0, len(slot_ids) + prior_col, f"load_{col_key}_{hash(d)%10**6}")
+                model.Add(load_d == sum(vars_d) + prior_col)
                 model.Add(load_d <= max_col)
                 _load_vars_for_spread.append(load_d)
                 if cap > 0:
-                    over = model.NewIntVar(0, len(slot_ids), f"over_{col_key}_{hash(d)%10**6}")
+                    over = model.NewIntVar(0, len(slot_ids) + prior_col, f"over_{col_key}_{hash(d)%10**6}")
                     # over >= load_d - cap, over >= 0
                     model.Add(load_d - cap <= over)
                     model.Add(over >= 0)
@@ -3563,9 +3863,9 @@ def solve_with_ortools(
             objective_terms.append(max_col * bal_w)
             # Penalizza anche lo spread max-min per forzare equidistribuzione
             if len(_load_vars_for_spread) >= 2:
-                min_col = model.NewIntVar(0, len(slot_ids), f"min_{col_key}_load")
+                min_col = model.NewIntVar(0, len(slot_ids) + max_prior_col, f"min_{col_key}_load")
                 model.AddMinEquality(min_col, _load_vars_for_spread)
-                spread_col = model.NewIntVar(0, len(slot_ids), f"spread_{col_key}_load")
+                spread_col = model.NewIntVar(0, len(slot_ids) + max_prior_col, f"spread_{col_key}_load")
                 model.Add(spread_col == max_col - min_col)
                 objective_terms.append(spread_col * bal_w)
     except Exception:
@@ -3939,11 +4239,26 @@ def solve_with_ortools(
             f"{'; '.join(_diag_hints)} | Slot critici: {_slots_diag}"
         )
     # Identify required slots left blank (b_blank == 1) for diagnostics
+    slots_by_id = {s.slot_id: s for s in slots}
     forced_blank_slots: List[str] = []
+    forced_blank_details: List[Dict[str, object]] = []
     for sid, bv in blank_required_vars.items():
         try:
             if solver.Value(bv) == 1:
                 forced_blank_slots.append(sid)
+                s = slots_by_id.get(sid)
+                if s is not None:
+                    forced_blank_details.append({
+                        "slot_id": sid,
+                        "date": s.day.date.isoformat(),
+                        "columns": list(s.columns),
+                        "rule_tag": s.rule_tag,
+                        "shift": s.shift,
+                        "allowed_n": len(s.allowed or []),
+                        "allowed": list(s.allowed or []),
+                        "emergency_n": len(s.emergency_doctors or []),
+                        "emergency_doctors": list(s.emergency_doctors or []),
+                    })
         except Exception:
             pass
 
@@ -3965,6 +4280,10 @@ def solve_with_ortools(
     if has_forced_blanks:
         stats["status"] = "PARTIAL"
         stats["forced_blank_slots"] = sorted(forced_blank_slots)
+        stats["forced_blank_details"] = sorted(
+            forced_blank_details,
+            key=lambda item: str(item.get("slot_id", "")),
+        )
         stats.setdefault("warnings", []).append(
             f"{len(forced_blank_slots)} slot obbligatori lasciati vuoti (infeasible): "
             + ", ".join(sorted(forced_blank_slots))
@@ -4207,12 +4526,18 @@ def write_output(
     cfg: Optional[dict] = None,
     unav_map: Optional[Dict[str, Dict[dt.date, Set[str]]]] = None,
 ):
+    disabled_cols = {
+        str(c).strip().upper()
+        for c in ((cfg or {}).get("disabled_columns") or [])
+        if str(c).strip()
+    }
     # Clear target columns (only those managed)
     managed_cols=set()
     for s in slots:
         managed_cols |= set(s.columns)
+    managed_cols |= disabled_cols
     # do not wipe A,B headers; wipe from row 2
-    if cfg and isinstance(cfg.get("rules", {}), dict) and "AA" in (cfg.get("rules") or {}):
+    if cfg and isinstance(cfg.get("rules", {}), dict) and "AA" in (cfg.get("rules") or {}) and "AA" not in disabled_cols:
         managed_cols.add("AA")
     for drow in days:
         for col in managed_cols:
@@ -4231,7 +4556,7 @@ def write_output(
         assigned_by_day[s.day.date].add(doc)
     
     # Post-process: affiancamento Recupero in Y sui 2 lunedì fissi (i primi 2 del mese) – vedi vincolo su T.
-    if cfg and isinstance(cfg.get("rules", {}), dict):
+    if cfg and isinstance(cfg.get("rules", {}), dict) and "Y" not in disabled_cols:
         rY = (cfg.get("rules") or {}).get("Y") or {}
         if rY.get("recupero_two_mondays_per_month", False) and rY.get("recupero_affianca_in_T", False):
             monday_dates = [drow.date for drow in days if getattr(drow, "dow", "") == "Mon"]
@@ -4416,7 +4741,7 @@ def write_output(
 
     # Fill AA (SPOC): solo Lun/Mer, copiando il medico di K o T. Il bilanciamento è fatto
     # in post-process scegliendo (quando K != T) il candidato meno usato nel mese.
-    if cfg and "rules" in cfg and "AA" in (cfg.get("rules") or {}):
+    if cfg and "rules" in cfg and "AA" in (cfg.get("rules") or {}) and "AA" not in disabled_cols:
         rAA = (cfg.get("rules") or {}).get("AA") or {}
         copy_from = [str(c).strip().upper() for c in (rAA.get("copy_from") or ["K", "T"])]
         counts_by_month: Dict[Tuple[int, int], Dict[str, int]] = defaultdict(lambda: defaultdict(int))
@@ -4748,8 +5073,33 @@ def write_solver_log(out_path: Path, stats: Dict) -> Optional[Path]:
             fbs = sm.get("forced_blank_slots") or []
             if fbs:
                 lines.append(f"ATTENZIONE: {len(fbs)} slot obbligatori NON coperti (infeasible parziale):")
+                details_by_slot = {
+                    str(item.get("slot_id")): item
+                    for item in (sm.get("forced_blank_details") or [])
+                    if item.get("slot_id")
+                }
                 for sid in fbs:
-                    lines.append(f"  - {sid}")
+                    detail = details_by_slot.get(str(sid)) or {}
+                    if detail:
+                        allowed = detail.get("allowed") or []
+                        emergency = detail.get("emergency_doctors") or []
+                        allowed_preview = ", ".join(map(str, allowed[:12]))
+                        emergency_preview = ", ".join(map(str, emergency[:8]))
+                        suffix = (
+                            f" | tag={detail.get('rule_tag') or '-'}"
+                            f" | allowed_n={detail.get('allowed_n')}"
+                        )
+                        if allowed_preview:
+                            suffix += f" | allowed={allowed_preview}"
+                            if len(allowed) > 12:
+                                suffix += ", ..."
+                        if emergency_preview:
+                            suffix += f" | emergenza={emergency_preview}"
+                            if len(emergency) > 8:
+                                suffix += ", ..."
+                        lines.append(f"  - {sid}{suffix}")
+                    else:
+                        lines.append(f"  - {sid}")
             # Relief used
             ru = sm.get("relief_used") or {}
             if ru.get("kt_share_days") or ru.get("blank_columns"):
@@ -4789,7 +5139,9 @@ def solve_across_months(
     availability_preferences: Optional[List[dict]] = None,
     v_double_overrides: Optional[List[str]] = None,
     j_blank_week_overrides: Optional[Dict[str, List[str]]] = None,
+    disabled_columns: Optional[List[str]] = None,
     historical_stats: Optional[dict] = None,
+    prior_usage: Optional[dict] = None,
 ) -> Tuple[List[Slot], Dict[str, Optional[str]], Dict]:
     """Solve schedules month-by-month and merge.
 
@@ -4828,14 +5180,51 @@ def solve_across_months(
             local[docn][day] = set()
         local[docn][day].update(shifts)
 
-    for (yy, mm) in month_keys:
+    generated_carryover_by_month: Dict[str, dict] = {}
+
+    for _month_idx, (yy, mm) in enumerate(month_keys):
         days_m = [d for d in days if (d.date.year, d.date.month) == (yy, mm)]
         mk = _norm_key(yy, mm)
 
         # Local copy of unavailability so we can inject carryover constraints without mutating input
         local_unav: Dict[str, Dict[dt.date, Set[str]]] = {k: {dk: set(sv) for dk, sv in v.items()} for k, v in (unav_map or {}).items()}
 
-        carry = (carryover_by_month or {}).get(mk) if isinstance(carryover_by_month, dict) else None
+        carry_parts = []
+        if generated_carryover_by_month.get(mk):
+            carry_parts.append(generated_carryover_by_month.get(mk))
+        if isinstance(carryover_by_month, dict) and carryover_by_month.get(mk):
+            carry_parts.append(carryover_by_month.get(mk))
+        carry = None
+        prior_month_nights = ((prior_usage or {}).get("night_dates_by_doc") or {}).get(mk) or {}
+        if prior_month_nights and days_m:
+            prior_part = {"blocked_day1_doctors": [], "recent_nights_by_doc": {}}
+            first_day_m = min(d.date for d in days_m)
+            for dname, date_list in prior_month_nights.items():
+                for ds in (date_list or []):
+                    prev = _parse_iso_date(ds)
+                    if not prev or prev >= first_day_m:
+                        continue
+                    delta = (first_day_m - prev).days
+                    if 0 < delta < night_gap:
+                        prior_part["recent_nights_by_doc"].setdefault(dname, []).append(prev.isoformat())
+                    if delta == 1:
+                        prior_part["blocked_day1_doctors"].append(dname)
+            if prior_part["blocked_day1_doctors"] or prior_part["recent_nights_by_doc"]:
+                carry_parts.append(prior_part)
+
+        if carry_parts:
+            carry = {"blocked_day1_doctors": [], "recent_nights_by_doc": {}}
+            for part in carry_parts:
+                for dname in (part.get("blocked_day1_doctors") or []):
+                    if dname not in carry["blocked_day1_doctors"]:
+                        carry["blocked_day1_doctors"].append(dname)
+                recent_part = part.get("recent_nights_by_doc") or {}
+                if isinstance(recent_part, dict):
+                    for dname, date_list in recent_part.items():
+                        carry["recent_nights_by_doc"].setdefault(dname, [])
+                        for ds in (date_list or []):
+                            if ds not in carry["recent_nights_by_doc"][dname]:
+                                carry["recent_nights_by_doc"][dname].append(ds)
         if carry and days_m:
             # Block day 1 entirely for doctors coming from previous-month last night
             for dname in (carry.get("blocked_day1_doctors") or []):
@@ -4863,7 +5252,15 @@ def solve_across_months(
             if d is not None and d.year == yy and d.month == mm:
                 fixed_m.append(f)
 
-        slots_m = slots_for_month(cfg, days_m, local_unav, fixed_assignments=fixed_m, v_double_overrides=v_double_overrides, j_blank_week_overrides=j_blank_week_overrides)
+        slots_m = slots_for_month(
+            cfg,
+            days_m,
+            local_unav,
+            fixed_assignments=fixed_m,
+            v_double_overrides=v_double_overrides,
+            j_blank_week_overrides=j_blank_week_overrides,
+            disabled_columns=disabled_columns,
+        )
         avail_m = []
         for a in (availability_preferences or []):
             d = _parse_iso_date(str(a.get("date", "")))
@@ -4877,6 +5274,7 @@ def solve_across_months(
                 availability_preferences=avail_m,
                 unav_map=local_unav,
                 historical_stats=historical_stats,
+                prior_usage=prior_usage,
             )
         except Exception as e:
             # MODIFICA 2: niente Greedy. Se OR-Tools fallisce, propaga l'errore
@@ -4912,6 +5310,34 @@ def solve_across_months(
             stats_all["status"] = "PARTIAL"
         elif stats_all.get("status") == "OK" and "FEAS" in st:
             stats_all["status"] = "FEASIBLE"
+
+        # If this generated range spans months, carry the solved end-of-month
+        # nights into the next month before building its slots.
+        if _month_idx + 1 < len(month_keys) and days_m:
+            next_yy, next_mm = month_keys[_month_idx + 1]
+            next_days = [d for d in days if (d.date.year, d.date.month) == (next_yy, next_mm)]
+            if next_days:
+                next_mk = _norm_key(next_yy, next_mm)
+                next_first = min(d.date for d in next_days)
+                last_date = max(d.date for d in days_m)
+                recent_by_doc: Dict[str, List[str]] = {}
+                last_night_doc = None
+                for s in slots_m:
+                    if s.columns != ["J"]:
+                        continue
+                    doc = assignment_m.get(s.slot_id)
+                    if not doc:
+                        continue
+                    delta = (next_first - s.day.date).days
+                    if 0 <= delta < night_gap:
+                        recent_by_doc.setdefault(doc, []).append(s.day.date.isoformat())
+                    if s.day.date == last_date:
+                        last_night_doc = doc
+                if recent_by_doc or last_night_doc:
+                    generated_carryover_by_month[next_mk] = {
+                        "blocked_day1_doctors": [last_night_doc] if last_night_doc else [],
+                        "recent_nights_by_doc": recent_by_doc,
+                    }
 
     return slots_all, assignment_all, stats_all
 
@@ -5005,8 +5431,10 @@ def generate_schedule(
     availability_preferences: Optional[List[dict]] = None,
     v_double_overrides: Optional[List[str]] = None,
     j_blank_week_overrides: Optional[Dict[str, List[str]]] = None,
+    disabled_columns: Optional[List[str]] = None,
     historical_stats: Optional[dict] = None,
     pool_config: Optional[dict] = None,
+    prior_usage: Optional[dict] = None,
 ):
     """Generate schedules without Tkinter.
 
@@ -5023,6 +5451,12 @@ def generate_schedule(
     cfg = load_rules(rules)
     if pool_config:
         cfg = apply_pool_config(cfg, pool_config)
+    if disabled_columns:
+        cfg["disabled_columns"] = sorted({
+            str(c).strip().upper()
+            for c in disabled_columns
+            if str(c).strip()
+        })
 
     # Merge pre-assigned holiday shifts from data/turni_festivi.yml
     tf = load_turni_festivi()
@@ -5043,9 +5477,11 @@ def generate_schedule(
         carryover_by_month=carryover_by_month,
         v_double_overrides=v_double_overrides,
         j_blank_week_overrides=j_blank_week_overrides,
+        disabled_columns=disabled_columns,
         fixed_assignments=fixed_assignments,
         availability_preferences=availability_preferences,
         historical_stats=historical_stats,
+        prior_usage=prior_usage,
     )
     # REMOVED: terza chiamata ridondante a assign_reperibilita_C (sovrascriveva C già ottimizzata)
     write_output(wb, ws, days, slots, assignment, cfg=cfg, out_path=outp, unav_map=unav_map)
