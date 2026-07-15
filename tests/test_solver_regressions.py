@@ -417,6 +417,43 @@ class SolverRegressionTests(unittest.TestCase):
         self.assertTrue(all(assignment.get(f"{d.date}-C") for d in days))
         self.assertIn("OK", diag["C_reperibilita_diag"]["status"])
 
+    def test_reperibilita_c_desired_distribution_is_not_a_hard_cap(self):
+        docs = ["A", "B", "C"]
+        cfg = {
+            "rules": {
+                "C_reperibilita": {
+                    "min_per_doctor": 1,
+                    "max_per_doctor": 2,
+                    "target_per_doctor": 1,
+                    "spacing_min_days": 0,
+                    "excluded": [],
+                    "constraints": [],
+                }
+            },
+            "global_constraints": {},
+        }
+        days = [
+            DayRow(dt.date(2026, 8, 3), "Mon", 2),
+            DayRow(dt.date(2026, 8, 4), "Tue", 3),
+            DayRow(dt.date(2026, 8, 5), "Wed", 4),
+            DayRow(dt.date(2026, 8, 6), "Thu", 5),
+            DayRow(dt.date(2026, 8, 7), "Fri", 6),
+        ]
+        slots = [
+            Slot(days[0], "2026-08-03-C", ["C"], ["C"], required=True, shift="Any", rule_tag="C_reperibilita"),
+            Slot(days[1], "2026-08-04-C", ["C"], ["C"], required=True, shift="Any", rule_tag="C_reperibilita"),
+            Slot(days[2], "2026-08-05-C", ["C"], ["A"], required=True, shift="Any", rule_tag="C_reperibilita"),
+            Slot(days[3], "2026-08-06-C", ["C"], ["A"], required=True, shift="Any", rule_tag="C_reperibilita"),
+            Slot(days[4], "2026-08-07-C", ["C"], ["B"], required=True, shift="Any", rule_tag="C_reperibilita"),
+        ]
+
+        assignment, diag = assign_reperibilita_C(cfg, days, slots, {})
+
+        self.assertEqual(assignment["2026-08-03-C"], "C")
+        self.assertEqual(assignment["2026-08-04-C"], "C")
+        self.assertIn("OK", diag["C_reperibilita_diag"]["status"])
+        self.assertGreaterEqual(diag["C_reperibilita_diag"]["effective_max_per_doctor"], 2)
+
     def test_j_partial_month_does_not_cap_free_doctors_at_zero(self):
         cfg = {
             "rules": {

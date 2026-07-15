@@ -614,14 +614,10 @@ def assign_reperibilita_C(cfg: dict, days: List[DayRow], slots: List[Slot],
                 break
             desired[doc] += 1
             remaining -= 1
-    # Nei periodi parziali (es. 1-6 settembre dentro una generazione 1/8-6/9),
-    # il target mensile serve solo a ordinare le preferenze: non può diventare
-    # un limite hard, altrimenti assegna capacità zero a molti medici e può
-    # rendere impossibile C anche quando il pool è sufficiente.
-    hard_cap_by_doc = {
-        doc: (max_per if min_per == 0 else desired[doc])
-        for doc in pool
-    }
+    # Il target/desiderato serve solo a ordinare le preferenze: non può diventare
+    # un limite hard. Con molte ferie il pattern ideale 2/3 per medico può essere
+    # impossibile anche quando max_per_doctor ha capacità sufficiente.
+    hard_cap_by_doc = {doc: max_per for doc in pool}
 
     # Backtracking DFS con retry su spacing rilassato
     assigned: Dict[dt.date, str] = {}
@@ -671,20 +667,33 @@ def assign_reperibilita_C(cfg: dict, days: List[DayRow], slots: List[Slot],
 
     solved = False
     _spacing_tried = spacing_min
-    for _sp in ([spacing_min] + list(range(spacing_min - 1, -1, -1))):
-        solved = _run_dfs_attempt(_sp)
+    _cap_tried = max_per
+    cap_values = list(range(max_per, total_days + 1))
+    for _cap in cap_values:
+        hard_cap_by_doc = {doc: _cap for doc in pool}
+        for _sp in ([spacing_min] + list(range(spacing_min - 1, -1, -1))):
+            solved = _run_dfs_attempt(_sp)
+            if solved:
+                _spacing_tried = _sp
+                _cap_tried = _cap
+                if _sp < spacing_min:
+                    _c_relaxation_warnings.append(
+                        f"C reperibilità: spacing rilassato a {_sp} giorni (originale {spacing_min})."
+                    )
+                if _cap > max_per:
+                    _c_relaxation_warnings.append(
+                        f"C reperibilità: max_per_doctor rilassato a {_cap} per compatibilità con ferie/vincoli."
+                    )
+                break
         if solved:
-            if _sp < spacing_min:
-                _c_relaxation_warnings.append(
-                    f"C reperibilità: spacing rilassato a {_sp} giorni (originale {spacing_min})."
-                )
             break
 
     if not solved:
         raise ValueError(
             "C_reperibilita: impossibile assegnare la reperibilità anche con vincoli rilassati. "
-            f"Pool: {pool}, pool_size={n_docs}, giorni={total_days}. "
-            "Verifica che il pool C non sia vuoto e che max_per_doctor sia sufficiente."
+            f"Pool: {pool}, pool_size={n_docs}, giorni={total_days}, "
+            f"max_per_doctor provato fino a {total_days}. "
+            "Verifica giorni senza candidati o esclusioni del pool C."
         )
 
     # Write back into assignment
@@ -704,6 +713,8 @@ def assign_reperibilita_C(cfg: dict, days: List[DayRow], slots: List[Slot],
         "pool_size": n_docs,
         "total_days": total_days,
         "spacing_min_days": spacing_min,
+        "effective_spacing_days": _spacing_tried,
+        "effective_max_per_doctor": _cap_tried,
     }
     diag["counts"] = {k: v for k, v in sorted(_assigned_cnt.items(), key=lambda kv: (-kv[1], kv[0].lower())) if v}
     if _c_relaxation_warnings:
