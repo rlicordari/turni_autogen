@@ -7,6 +7,7 @@ from pool_config_store import audit_pool_config, normalize_pool_config
 from turni_generator import (
     DayRow,
     Slot,
+    _repair_heavy_festive_assignments,
     assign_reperibilita_C,
     apply_pool_config,
     create_period_template_xlsx,
@@ -179,6 +180,856 @@ class SolverRegressionTests(unittest.TestCase):
 
         self.assertEqual(merged["rules"]["D_F"]["allowed"], [])
 
+    def test_pool_config_f_only_doctor_does_not_enter_df_primary_pair(self):
+        cfg_yaml = {
+            "columns": {"D": "UTIC mattina", "F": "Supporto 118"},
+            "rules": {"D_F": {"allowed": ["Old"]}},
+            "global_constraints": {},
+        }
+        pool_cfg = {
+            "schema_version": 1,
+            "doctors": {
+                "Grimaldi": {
+                    "active": True,
+                    "columns": ["D", "F"],
+                    "festivi_diurni": False,
+                    "festivi_notti": False,
+                    "excluded_from_reperibilita": False,
+                    "university_doctor": None,
+                    "column_overrides": {},
+                },
+                "Rubino": {
+                    "active": True,
+                    "columns": ["F"],
+                    "festivi_diurni": True,
+                    "festivi_notti": True,
+                    "excluded_from_reperibilita": False,
+                    "university_doctor": None,
+                    "column_overrides": {},
+                },
+            },
+        }
+
+        merged = apply_pool_config(cfg_yaml, pool_cfg)
+
+        self.assertEqual(merged["rules"]["D_F"]["allowed"], ["Grimaldi"])
+
+    def test_l_relief_blank_penalty_has_solver_floor(self):
+        cfg = {
+            "rules": {"L": {"days": ["Mon"], "pool_other": ["A"]}},
+            "global_constraints": {
+                "relief_valves": {"allow_blank_columns": {"L": 20000}},
+            },
+        }
+        day = DayRow(dt.date(2026, 8, 3), "Mon", 2)
+
+        slots = slots_for_month(cfg, [day], {})
+        l_slot = next(s for s in slots if s.columns == ["L"])
+
+        self.assertFalse(l_slot.required)
+        self.assertGreaterEqual(l_slot.blank_penalty, 20_000_000)
+
+    def test_df_fallback_prefers_stable_consecutive_block(self):
+        cfg = {
+            "rules": {
+                "D_F": {
+                    "allowed": ["Grimaldi", "Calabrò"],
+                    "days": "Mon-Sat",
+                    "pattern_3_3": True,
+                    "pattern_doc1": "Grimaldi",
+                    "pattern_doc2": "Calabrò",
+                    "enable_df_share": True,
+                    "fallback_balance_penalty": 1,
+                    "fallback_switch_penalty": 1000,
+                    "fallback_block_days": 3,
+                },
+                "H": {"pool_mon_fri": ["A", "B", "C"]},
+            },
+            "global_constraints": {},
+        }
+        days = [
+            DayRow(dt.date(2026, 8, 3), "Mon", 2),
+            DayRow(dt.date(2026, 8, 4), "Tue", 3),
+            DayRow(dt.date(2026, 8, 5), "Wed", 4),
+        ]
+        unav = {
+            "Grimaldi": {d.date: {"Any"} for d in days},
+            "Calabrò": {d.date: {"Any"} for d in days},
+        }
+
+        slots = slots_for_month(cfg, days, unav)
+        assignment, stats = solve_with_ortools(cfg, days, slots)
+
+        self.assertNotEqual(stats["status"], "PARTIAL")
+        d_docs = [assignment[f"{d.date}-D"] for d in days]
+        f_docs = [assignment[f"{d.date}-F"] for d in days]
+        self.assertEqual(d_docs, f_docs)
+        self.assertEqual(len(set(d_docs)), 1)
+
+    def test_df_fallback_uses_h_pool_before_any_available_doctor(self):
+        cfg = {
+            "rules": {
+                "D_F": {
+                    "allowed": ["Grimaldi", "Calabrò"],
+                    "days": "Mon-Sat",
+                },
+                "H": {"pool_mon_fri": ["Rubino"]},
+                "J": {"pool_other": ["Dattilo"]},
+            },
+            "global_constraints": {},
+        }
+        day = DayRow(dt.date(2026, 8, 3), "Mon", 2)
+        unav = {
+            "Grimaldi": {day.date: {"Any"}},
+            "Calabrò": {day.date: {"Any"}},
+        }
+
+        slots = slots_for_month(cfg, [day], unav)
+        d_slot = next(s for s in slots if s.columns == ["D"])
+        f_slot = next(s for s in slots if s.columns == ["F"])
+
+        self.assertEqual(d_slot.allowed, ["Rubino"])
+        self.assertEqual(f_slot.allowed, ["Rubino"])
+
+    def test_df_single_available_primary_covers_both_columns(self):
+        cfg = {
+            "rules": {
+                "D_F": {
+                    "allowed": ["Grimaldi", "Calabrò"],
+                    "days": "Mon-Sat",
+                    "pattern_3_3": True,
+                    "pattern_doc1": "Grimaldi",
+                    "pattern_doc2": "Calabrò",
+                    "enable_df_share": True,
+                },
+                "H": {"pool_mon_fri": ["Rubino", "Manganaro"]},
+            },
+            "global_constraints": {},
+        }
+        day = DayRow(dt.date(2026, 8, 21), "Fri", 2)
+        unav = {"Calabrò": {day.date: {"Any"}}}
+
+        slots = slots_for_month(cfg, [day], unav)
+        assignment, stats = solve_with_ortools(cfg, [day], slots)
+
+        self.assertNotEqual(stats["status"], "PARTIAL")
+        self.assertEqual(assignment[f"{day.date}-D"], "Grimaldi")
+        self.assertEqual(assignment[f"{day.date}-F"], "Grimaldi")
+
+    def test_h_prefers_dedicated_candidate_to_preserve_k_pool(self):
+        cfg = {
+            "rules": {
+                "H": {
+                    "pool_mon_fri": ["Migliorato", "Manganaro"],
+                    "reserve_multi_service_penalty": 1_000_000,
+                    "reserve_for_columns": ["K"],
+                },
+                "K": {"pool": ["Manganaro", "Altro"]},
+            },
+            "global_constraints": {},
+        }
+        day = DayRow(dt.date(2026, 8, 20), "Thu", 2)
+        slots = [
+            Slot(day, f"{day.date}-H", ["H"], ["Migliorato", "Manganaro"], required=True, shift="Pomeriggio", rule_tag="H"),
+            Slot(day, f"{day.date}-K", ["K"], ["Manganaro", "Altro"], required=True, shift="Mattina", rule_tag="K"),
+        ]
+
+        assignment, stats = solve_with_ortools(cfg, [day], slots)
+
+        self.assertNotEqual(stats["status"], "PARTIAL")
+        self.assertEqual(assignment[f"{day.date}-H"], "Migliorato")
+        self.assertNotEqual(assignment[f"{day.date}-H"], "Manganaro")
+
+    def test_k_blank_is_avoided_by_reshuffling_flexible_services(self):
+        cfg = {
+            "rules": {
+                "H": {"pool_mon_fri": ["Migliorato", "Licordari", "Manganaro"]},
+                "K": {"pool": ["Licordari", "Manganaro"], "no_consecutive_days_same_doctor": True},
+                "Q": {"pool": ["Manganaro", "Zito"]},
+            },
+            "global_constraints": {
+                "solver_max_time_seconds": 10,
+                "k_pool_preserve_threshold": 5,
+                "k_pool_preserve_penalty": 80_000_000,
+            },
+        }
+        day20 = DayRow(dt.date(2026, 8, 20), "Thu", 2)
+        day21 = DayRow(dt.date(2026, 8, 21), "Fri", 3)
+        slots = [
+            Slot(day20, "2026-08-20-H", ["H"], ["Migliorato"], required=True, shift="Pomeriggio", rule_tag="H"),
+            Slot(day20, "2026-08-20-K", ["K"], ["Manganaro"], required=True, shift="Mattina", rule_tag="K"),
+            Slot(day21, "2026-08-21-H", ["H"], ["Migliorato", "Licordari", "Manganaro"], required=True, shift="Pomeriggio", rule_tag="H"),
+            Slot(day21, "2026-08-21-K", ["K"], ["Licordari", "Manganaro"], required=True, shift="Mattina", rule_tag="K"),
+            Slot(day21, "2026-08-21-Q", ["Q"], ["Manganaro", "Zito"], required=True, shift="Mattina", rule_tag="Q"),
+        ]
+
+        assignment, stats = solve_with_ortools(cfg, [day20, day21], slots)
+
+        self.assertNotEqual(stats["status"], "PARTIAL")
+        self.assertEqual(assignment["2026-08-21-K"], "Licordari")
+        self.assertEqual(assignment["2026-08-21-H"], "Manganaro")
+        self.assertEqual(assignment["2026-08-21-Q"], "Zito")
+
+    def test_eg_pool_is_preserved_for_k_when_k_has_outside_alternative(self):
+        cfg = {
+            "rules": {
+                "E_G": {
+                    "allowed": ["Manganaro", "Allegra"],
+                    "protect_pool_penalty": 35_000_000,
+                },
+                "K": {"pool": ["Manganaro", "Colarusso"]},
+            },
+            "global_constraints": {},
+        }
+        day = DayRow(dt.date(2026, 8, 20), "Thu", 2)
+        slots = [
+            Slot(day, f"{day.date}-EG", ["E", "G"], ["Manganaro", "Allegra"], required=True, shift="Mattina", rule_tag="E_G"),
+            Slot(day, f"{day.date}-K", ["K"], ["Manganaro", "Colarusso"], required=True, shift="Mattina", rule_tag="K"),
+        ]
+
+        assignment, stats = solve_with_ortools(cfg, [day], slots)
+
+        self.assertNotEqual(stats["status"], "PARTIAL")
+        self.assertEqual(assignment[f"{day.date}-K"], "Colarusso")
+        self.assertIn(assignment[f"{day.date}-EG"], {"Manganaro", "Allegra"})
+
+    def test_j_blank_week_overrides_are_reported_in_month_stats(self):
+        cfg = {
+            "columns": {"J": "Notte"},
+            "rules": {"J": {"pool_other": ["A"], "thursday_blank": True}},
+            "global_constraints": {"night_spacing_days_min": 1},
+        }
+        days = [
+            DayRow(dt.date(2026, 8, 26), "Wed", 2),
+            DayRow(dt.date(2026, 8, 27), "Thu", 3),
+            DayRow(dt.date(2026, 8, 30), "Sun", 6),
+        ]
+
+        _slots, _assignment, stats = solve_across_months(
+            cfg,
+            days,
+            {},
+            j_blank_week_overrides={"2026-W35": ["2026-08-26", "2026-08-30"]},
+        )
+
+        self.assertEqual(
+            stats["months"]["2026-08"]["j_blank_week_overrides"]["2026-W35"],
+            ["2026-08-26", "2026-08-30"],
+        )
+
+    def test_generic_weekend_night_cap_is_soft_not_forced_blank(self):
+        cfg = {
+            "rules": {
+                "J": {
+                    "pool_other": ["A", "B", "C"],
+                    "weekend_night_cap_penalty": 30_000_000,
+                }
+            },
+            "global_constraints": {
+                "night_spacing_days_min": 1,
+                "night_off": {"same_day": True, "next_day": True},
+            },
+        }
+        days = [
+            DayRow(dt.date(2026, 8, 23) + dt.timedelta(days=i),
+                   ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][(dt.date(2026, 8, 23) + dt.timedelta(days=i)).weekday()],
+                   i + 2)
+            for i in range(8)
+        ]
+        day1 = days[0]
+        day2 = days[-1]
+        slots = [
+            Slot(day1, "2026-08-23-J", ["J"], ["A"], required=True, shift="Notte", rule_tag="J"),
+            Slot(day2, "2026-08-30-J", ["J"], ["A"], required=True, shift="Notte", rule_tag="J"),
+        ]
+
+        assignment, stats = solve_with_ortools(cfg, days, slots)
+
+        self.assertNotEqual(stats["status"], "PARTIAL")
+        self.assertEqual(assignment["2026-08-30-J"], "A")
+
+    def test_sunday_j_balance_rotates_eligible_doctors(self):
+        cfg = {
+            "rules": {
+                "J": {
+                    "pool_other": ["A", "B"],
+                    "free_night_quota_penalty": 0,
+                    "free_night_spread_penalty": 0,
+                    "weekend_night_cap_penalty": 0,
+                    "sunday_night_balance_penalty": 40_000_000,
+                }
+            },
+            "global_constraints": {"night_spacing_days_min": 1},
+        }
+        days = [
+            DayRow(dt.date(2026, 8, 2), "Sun", 2),
+            DayRow(dt.date(2026, 8, 9), "Sun", 9),
+        ]
+        slots = [
+            Slot(day, f"{day.date}-J", ["J"], ["A", "B"], required=True, shift="Notte", rule_tag="J")
+            for day in days
+        ]
+
+        assignment, stats = solve_with_ortools(cfg, days, slots)
+
+        self.assertNotEqual(stats["status"], "PARTIAL")
+        self.assertNotEqual(assignment["2026-08-02-J"], assignment["2026-08-09-J"])
+
+    def test_free_j_spread_penalty_avoids_three_to_one_distribution(self):
+        cfg = {
+            "rules": {
+                "J": {
+                    "pool_other": ["A", "B"],
+                    "free_night_quota_penalty": 0,
+                    "free_night_spread_penalty": 20_000_000,
+                    "weekend_night_cap_penalty": 0,
+                    "sunday_night_balance_penalty": 0,
+                }
+            },
+            "global_constraints": {"night_spacing_days_min": 1},
+        }
+        days = [
+            DayRow(dt.date(2026, 8, 3), "Mon", 2),
+            DayRow(dt.date(2026, 8, 4), "Tue", 3),
+            DayRow(dt.date(2026, 8, 5), "Wed", 4),
+            DayRow(dt.date(2026, 8, 6), "Thu", 5),
+        ]
+        slots = [
+            Slot(day, f"{day.date}-J", ["J"], ["A", "B"], required=True, shift="Notte", rule_tag="J")
+            for day in days
+        ]
+
+        assignment, stats = solve_with_ortools(cfg, days, slots)
+
+        self.assertNotEqual(stats["status"], "PARTIAL")
+        counts = {"A": 0, "B": 0}
+        for day in days:
+            counts[assignment[f"{day.date}-J"]] += 1
+        self.assertEqual(sorted(counts.values()), [2, 2])
+
+    def test_j_weekday_and_weekend_balances_are_independent(self):
+        cfg = {
+            "rules": {
+                "J": {
+                    "pool_other": ["A", "B"],
+                    "free_night_quota_penalty": 0,
+                    "free_night_spread_penalty": 0,
+                    "weekday_night_spread_penalty": 25_000_000,
+                    "weekend_night_cap_penalty": 0,
+                    "weekend_night_spread_penalty": 30_000_000,
+                    "sunday_night_balance_penalty": 0,
+                }
+            },
+            "global_constraints": {"night_spacing_days_min": 1},
+        }
+        days = [
+            DayRow(dt.date(2026, 8, 3), "Mon", 2),
+            DayRow(dt.date(2026, 8, 4), "Tue", 3),
+            DayRow(dt.date(2026, 8, 8), "Sat", 7),
+            DayRow(dt.date(2026, 8, 9), "Sun", 8),
+        ]
+        slots = [
+            Slot(day, f"{day.date}-J", ["J"], ["A", "B"], required=True, shift="Notte", rule_tag="J")
+            for day in days
+        ]
+
+        assignment, stats = solve_with_ortools(cfg, days, slots)
+
+        self.assertNotEqual(stats["status"], "PARTIAL")
+        weekday_counts = {"A": 0, "B": 0}
+        weekend_counts = {"A": 0, "B": 0}
+        for day in days:
+            doc = assignment[f"{day.date}-J"]
+            if day.dow in ("Sat", "Sun"):
+                weekend_counts[doc] += 1
+            else:
+                weekday_counts[doc] += 1
+        self.assertEqual(sorted(weekday_counts.values()), [1, 1])
+        self.assertEqual(sorted(weekend_counts.values()), [1, 1])
+
+    def test_j_prefers_two_weekday_two_festive_over_three_one_split(self):
+        cfg = {
+            "rules": {
+                "J": {
+                    "pool_other": ["A", "B"],
+                    "free_night_quota_penalty": 0,
+                    "free_night_spread_penalty": 20_000_000,
+                    "weekday_night_spread_penalty": 0,
+                    "weekend_night_cap_penalty": 0,
+                    "weekend_night_spread_penalty": 0,
+                    "sunday_night_balance_penalty": 0,
+                    "j_type_split_penalty": 35_000_000,
+                }
+            },
+            "global_constraints": {"night_spacing_days_min": 1},
+        }
+        raw_days = [
+            (dt.date(2026, 8, 3), "Mon"),
+            (dt.date(2026, 8, 4), "Tue"),
+            (dt.date(2026, 8, 5), "Wed"),
+            (dt.date(2026, 8, 6), "Thu"),
+            (dt.date(2026, 8, 8), "Sat"),
+            (dt.date(2026, 8, 9), "Sun"),
+            (dt.date(2026, 8, 15), "Sat"),
+            (dt.date(2026, 8, 16), "Sun"),
+        ]
+        days = [DayRow(day, dow, i + 2) for i, (day, dow) in enumerate(raw_days)]
+        slots = [
+            Slot(day, f"{day.date}-J", ["J"], ["A", "B"], required=True, shift="Notte", rule_tag="J")
+            for day in days
+        ]
+
+        assignment, stats = solve_with_ortools(cfg, days, slots)
+
+        self.assertNotEqual(stats["status"], "PARTIAL")
+        split = {"A": {"weekday": 0, "festive": 0}, "B": {"weekday": 0, "festive": 0}}
+        for day in days:
+            doc = assignment[f"{day.date}-J"]
+            key = "festive" if day.dow in ("Sat", "Sun") else "weekday"
+            split[doc][key] += 1
+        self.assertEqual(split["A"], {"weekday": 2, "festive": 2})
+        self.assertEqual(split["B"], {"weekday": 2, "festive": 2})
+
+    def test_festive_de_hi_balance_counts_morning_and_afternoon_together(self):
+        cfg = {
+            "rules": {
+                "Festivi": {
+                    "pool": ["A", "B", "C", "D"],
+                    "sunday_de_hi_balance_penalty": 25_000_000,
+                }
+            },
+            "global_constraints": {},
+        }
+        days = [
+            DayRow(dt.date(2026, 8, 2), "Sun", 2),
+            DayRow(dt.date(2026, 8, 9), "Sun", 9),
+        ]
+        slots = []
+        for day in days:
+            slots.append(Slot(day, f"{day.date}-DE", ["D", "E"], ["A", "B", "C", "D"], required=True, shift="Mattina", rule_tag="Festivo_DE"))
+            slots.append(Slot(day, f"{day.date}-HI", ["H", "I"], ["A", "B", "C", "D"], required=True, shift="Pomeriggio", rule_tag="Festivo_HI"))
+
+        assignment, stats = solve_with_ortools(cfg, days, slots)
+
+        self.assertNotEqual(stats["status"], "PARTIAL")
+        counts = {"A": 0, "B": 0, "C": 0, "D": 0}
+        for value in assignment.values():
+            counts[value] += 1
+        self.assertEqual(sorted(counts.values()), [1, 1, 1, 1])
+
+    def test_festive_day_quota_avoids_reusing_doctor_with_forced_festive(self):
+        cfg = {
+            "rules": {
+                "Festivi": {
+                    "pool": ["A", "B", "C", "D"],
+                    "festivi_diurni_quota_penalty": 70_000_000,
+                }
+            },
+            "global_constraints": {},
+        }
+        days = [
+            DayRow(dt.date(2026, 8, 2), "Sun", 2),
+            DayRow(dt.date(2026, 8, 9), "Sun", 9),
+            DayRow(dt.date(2026, 8, 15), "Sat", 15),
+            DayRow(dt.date(2026, 8, 16), "Sun", 16),
+        ]
+        slots = [
+            Slot(days[0], "2026-08-02-DE", ["D", "E"], ["A"], required=True, shift="Mattina", rule_tag="Festivo_DE"),
+            Slot(days[1], "2026-08-09-HI", ["H", "I"], ["A", "B", "C", "D"], required=True, shift="Pomeriggio", rule_tag="Festivo_HI"),
+            Slot(days[2], "2026-08-15-DE", ["D", "E"], ["A", "B", "C", "D"], required=True, shift="Mattina", rule_tag="Festivo_DE"),
+            Slot(days[3], "2026-08-16-HI", ["H", "I"], ["A", "B", "C", "D"], required=True, shift="Pomeriggio", rule_tag="Festivo_HI"),
+        ]
+
+        assignment, stats = solve_with_ortools(cfg, days, slots)
+
+        self.assertNotEqual(stats["status"], "PARTIAL")
+        counts = {"A": 0, "B": 0, "C": 0, "D": 0}
+        for value in assignment.values():
+            counts[value] += 1
+        self.assertEqual(counts["A"], 1)
+        self.assertEqual(sorted(counts.values()), [1, 1, 1, 1])
+
+    def test_festive_day_balance_carries_across_custom_period_months(self):
+        cfg = {
+            "rules": {
+                "Festivi": {
+                    "pool": ["A", "B", "C", "D"],
+                    "festivi_diurni_quota_penalty": 250_000_000,
+                    "festivi_diurni_concentration_penalty": 90_000_000,
+                }
+            },
+            "global_constraints": {},
+        }
+        days = [
+            DayRow(dt.date(2026, 8, 2), "Sun", 2),
+            DayRow(dt.date(2026, 9, 6), "Sun", 3),
+        ]
+
+        _slots, assignment, stats = solve_across_months(
+            cfg,
+            days,
+            {},
+            fixed_assignments=[
+                {"doctor": "A", "date": "2026-08-02", "column": "D"},
+                {"doctor": "B", "date": "2026-08-02", "column": "H"},
+            ],
+        )
+
+        self.assertNotEqual(stats["status"], "PARTIAL")
+        september_docs = {
+            assignment["2026-09-06-DE"],
+            assignment["2026-09-06-HI"],
+        }
+        self.assertEqual(september_docs, {"C", "D"})
+
+    def test_festive_j_and_festive_day_duties_are_alternatives(self):
+        cfg = {
+            "rules": {
+                "J": {
+                    "pool_other": ["A", "B", "C", "D"],
+                    "free_night_quota_penalty": 0,
+                    "free_night_spread_penalty": 0,
+                    "weekday_night_spread_penalty": 0,
+                    "weekend_night_cap_penalty": 0,
+                    "weekend_night_spread_penalty": 0,
+                    "sunday_night_balance_penalty": 0,
+                    "j_type_split_penalty": 0,
+                    "festive_j_day_overlap_penalty": 80_000_000,
+                    "festive_total_spread_penalty": 35_000_000,
+                },
+                "Festivi": {"pool": ["A", "B", "C", "D"]},
+            },
+            "global_constraints": {"night_spacing_days_min": 1},
+        }
+        raw_slots = [
+            (dt.date(2026, 8, 2), "Sun", "J", ["J"], "Notte", "J"),
+            (dt.date(2026, 8, 9), "Sun", "J", ["J"], "Notte", "J"),
+            (dt.date(2026, 8, 16), "Sun", "DE", ["D", "E"], "Mattina", "Festivo_DE"),
+            (dt.date(2026, 8, 23), "Sun", "HI", ["H", "I"], "Pomeriggio", "Festivo_HI"),
+        ]
+        days = [DayRow(day, dow, i + 2) for i, (day, dow, *_rest) in enumerate(raw_slots)]
+        slots = [
+            Slot(
+                days[i],
+                f"{day}-{suffix}",
+                columns,
+                ["A", "B", "C", "D"],
+                required=True,
+                shift=shift,
+                rule_tag=tag,
+            )
+            for i, (day, _dow, suffix, columns, shift, tag) in enumerate(raw_slots)
+        ]
+
+        assignment, stats = solve_with_ortools(cfg, days, slots)
+
+        self.assertNotEqual(stats["status"], "PARTIAL")
+        counts = {"A": 0, "B": 0, "C": 0, "D": 0}
+        for value in assignment.values():
+            counts[value] += 1
+        self.assertEqual(sorted(counts.values()), [1, 1, 1, 1])
+
+    def test_weekend_j_and_festive_day_share_one_heavy_festive_quota(self):
+        cfg = {
+            "rules": {
+                "J": {
+                    "pool_other": ["A", "B", "C", "D"],
+                    "free_night_quota_penalty": 0,
+                    "free_night_spread_penalty": 0,
+                    "weekday_night_spread_penalty": 0,
+                    "weekend_night_cap_penalty": 0,
+                    "weekend_night_spread_penalty": 0,
+                    "sunday_night_balance_penalty": 0,
+                    "j_type_split_penalty": 0,
+                    "festive_j_day_overlap_penalty": 0,
+                    "festive_total_spread_penalty": 0,
+                    "heavy_festive_quota_penalty": 300_000_000,
+                    "heavy_festive_concentration_penalty": 120_000_000,
+                },
+                "Festivi": {"pool": ["A", "B", "C", "D"]},
+            },
+            "global_constraints": {"night_spacing_days_min": 1},
+        }
+        raw_slots = [
+            (dt.date(2026, 8, 2), "Sun", "J", ["J"], "Notte", "J"),
+            (dt.date(2026, 8, 9), "Sun", "J", ["J"], "Notte", "J"),
+            (dt.date(2026, 8, 16), "Sun", "DE", ["D", "E"], "Mattina", "Festivo_DE"),
+            (dt.date(2026, 8, 23), "Sun", "HI", ["H", "I"], "Pomeriggio", "Festivo_HI"),
+        ]
+        days = [DayRow(day, dow, i + 2) for i, (day, dow, *_rest) in enumerate(raw_slots)]
+        slots = [
+            Slot(days[i], f"{day}-{suffix}", columns, ["A", "B", "C", "D"], required=True, shift=shift, rule_tag=tag)
+            for i, (day, _dow, suffix, columns, shift, tag) in enumerate(raw_slots)
+        ]
+
+        assignment, stats = solve_with_ortools(cfg, days, slots)
+
+        self.assertNotEqual(stats["status"], "PARTIAL")
+        counts = {"A": 0, "B": 0, "C": 0, "D": 0}
+        for value in assignment.values():
+            counts[value] += 1
+        self.assertEqual(sorted(counts.values()), [1, 1, 1, 1])
+
+    def test_heavy_festive_load_uses_all_candidate_doctors_before_reusing_one(self):
+        cfg = {
+            "rules": {
+                "J": {
+                    "pool_other": ["A", "B", "C"],
+                    "free_night_quota_penalty": 0,
+                    "free_night_spread_penalty": 0,
+                    "weekend_night_cap_penalty": 0,
+                    "weekend_night_spread_penalty": 0,
+                    "sunday_night_balance_penalty": 0,
+                    "festive_total_spread_penalty": 0,
+                    "heavy_festive_quota_penalty": 0,
+                    "heavy_festive_concentration_penalty": 0,
+                    "heavy_festive_consecutive_penalty": 0,
+                    "heavy_festive_unused_candidate_penalty": 450_000_000,
+                },
+                "Festivi": {"pool": ["A", "B", "C"]},
+            },
+            "global_constraints": {"night_spacing_days_min": 1},
+        }
+        days = [
+            DayRow(dt.date(2026, 8, 2), "Sun", 2),
+            DayRow(dt.date(2026, 8, 9), "Sun", 9),
+            DayRow(dt.date(2026, 8, 16), "Sun", 16),
+        ]
+        slots = [
+            Slot(days[0], "2026-08-02-J", ["J"], ["A"], required=True, shift="Notte", rule_tag="J"),
+            Slot(days[1], "2026-08-09-DE", ["D", "E"], ["A", "B", "C"], required=True, shift="Mattina", rule_tag="Festivo_DE"),
+            Slot(days[2], "2026-08-16-HI", ["H", "I"], ["A", "B", "C"], required=True, shift="Pomeriggio", rule_tag="Festivo_HI"),
+        ]
+
+        assignment, stats = solve_with_ortools(cfg, days, slots)
+
+        self.assertNotEqual(stats["status"], "PARTIAL")
+        counts = {"A": 0, "B": 0, "C": 0}
+        for value in assignment.values():
+            counts[value] += 1
+        self.assertEqual(sorted(counts.values()), [1, 1, 1])
+
+    def test_second_look_moves_heavy_slot_to_unused_available_candidate(self):
+        cfg = {
+            "rules": {"J": {"pool_other": ["Cusmà", "Licordari"]}},
+            "global_constraints": {
+                "night_spacing_days_min": 5,
+                "night_off": {"same_day": True, "next_day": True},
+            },
+        }
+        days = [
+            DayRow(dt.date(2026, 8, 2), "Sun", 2),
+            DayRow(dt.date(2026, 8, 9), "Sun", 9),
+        ]
+        slots = [
+            Slot(days[0], "2026-08-02-J", ["J"], ["Cusmà", "Licordari"], required=True, shift="Notte", rule_tag="J"),
+            Slot(days[1], "2026-08-09-HI", ["H", "I"], ["Cusmà"], required=True, shift="Pomeriggio", rule_tag="Festivo_HI"),
+        ]
+        assignment = {
+            "2026-08-02-J": "Cusmà",
+            "2026-08-09-HI": "Cusmà",
+        }
+
+        repaired, swaps = _repair_heavy_festive_assignments(cfg, slots, assignment)
+
+        self.assertEqual(repaired["2026-08-02-J"], "Licordari")
+        self.assertEqual(repaired["2026-08-09-HI"], "Cusmà")
+        self.assertEqual(len(swaps), 1)
+
+    def test_second_look_does_not_change_fixed_heavy_slot(self):
+        cfg = {
+            "rules": {"Festivi": {"pool": ["A", "B"]}},
+            "global_constraints": {},
+        }
+        day = DayRow(dt.date(2026, 8, 2), "Sun", 2)
+        slots = [
+            Slot(day, "2026-08-02-DE", ["D", "E"], ["A", "B"], required=True, shift="Mattina", rule_tag="Festivo_DE"),
+            Slot(day, "2026-08-02-HI", ["H", "I"], ["A"], required=True, shift="Pomeriggio", rule_tag="Festivo_HI"),
+        ]
+        assignment = {
+            "2026-08-02-DE": "A",
+            "2026-08-02-HI": "A",
+        }
+
+        repaired, swaps = _repair_heavy_festive_assignments(
+            cfg,
+            slots,
+            assignment,
+            fixed_assignments=[{"doctor": "A", "date": "2026-08-02", "column": "D"}],
+        )
+
+        self.assertEqual(repaired["2026-08-02-DE"], "A")
+        self.assertEqual(swaps, [])
+
+    def test_heavy_festive_duty_avoids_consecutive_j_then_hi_same_doctor(self):
+        cfg = {
+            "rules": {
+                "J": {
+                    "pool_other": ["A", "B"],
+                    "free_night_quota_penalty": 0,
+                    "free_night_spread_penalty": 0,
+                    "weekend_night_cap_penalty": 0,
+                    "weekend_night_spread_penalty": 0,
+                    "sunday_night_balance_penalty": 0,
+                    "festive_total_spread_penalty": 0,
+                    "heavy_festive_quota_penalty": 0,
+                    "heavy_festive_concentration_penalty": 0,
+                    "heavy_festive_consecutive_penalty": 220_000_000,
+                },
+                "Festivi": {"pool": ["A", "B"]},
+            },
+            "global_constraints": {"night_spacing_days_min": 1},
+        }
+        days = [
+            DayRow(dt.date(2026, 8, 2), "Sun", 2),
+            DayRow(dt.date(2026, 8, 9), "Sun", 9),
+        ]
+        slots = [
+            Slot(days[0], "2026-08-02-J", ["J"], ["A"], required=True, shift="Notte", rule_tag="J"),
+            Slot(days[1], "2026-08-09-HI", ["H", "I"], ["A", "B"], required=True, shift="Pomeriggio", rule_tag="Festivo_HI"),
+        ]
+
+        assignment, stats = solve_with_ortools(cfg, days, slots)
+
+        self.assertNotEqual(stats["status"], "PARTIAL")
+        self.assertEqual(assignment["2026-08-02-J"], "A")
+        self.assertEqual(assignment["2026-08-09-HI"], "B")
+
+    def test_repeated_same_festive_day_type_is_penalized(self):
+        cfg = {
+            "rules": {
+                "J": {
+                    "pool_other": ["A", "B"],
+                    "festive_j_day_overlap_penalty": 0,
+                    "festive_total_spread_penalty": 0,
+                    "festive_same_type_repeat_penalty": 45_000_000,
+                },
+                "Festivi": {"pool": ["A", "B"]},
+            },
+            "global_constraints": {},
+        }
+        days = [
+            DayRow(dt.date(2026, 8, 2), "Sun", 2),
+            DayRow(dt.date(2026, 8, 9), "Sun", 9),
+        ]
+        slots = [
+            Slot(days[0], "2026-08-02-DE", ["D", "E"], ["A", "B"], required=True, shift="Mattina", rule_tag="Festivo_DE"),
+            Slot(days[1], "2026-08-09-DE", ["D", "E"], ["A", "B"], required=True, shift="Mattina", rule_tag="Festivo_DE"),
+        ]
+
+        assignment, stats = solve_with_ortools(cfg, days, slots)
+
+        self.assertNotEqual(stats["status"], "PARTIAL")
+        self.assertNotEqual(assignment["2026-08-02-DE"], assignment["2026-08-09-DE"])
+
+    def test_festive_day_duty_avoids_consecutive_festive_dates_even_if_type_changes(self):
+        cfg = {
+            "rules": {
+                "J": {
+                    "pool_other": ["A", "B"],
+                    "festive_j_day_overlap_penalty": 0,
+                    "festive_total_spread_penalty": 0,
+                    "festive_same_type_repeat_penalty": 0,
+                    "festive_day_consecutive_penalty": 70_000_000,
+                },
+                "Festivi": {"pool": ["A", "B"]},
+            },
+            "global_constraints": {},
+        }
+        days = [
+            DayRow(dt.date(2026, 8, 2), "Sun", 2),
+            DayRow(dt.date(2026, 8, 9), "Sun", 9),
+        ]
+        slots = [
+            Slot(days[0], "2026-08-02-DE", ["D", "E"], ["A", "B"], required=True, shift="Mattina", rule_tag="Festivo_DE"),
+            Slot(days[1], "2026-08-09-HI", ["H", "I"], ["A", "B"], required=True, shift="Pomeriggio", rule_tag="Festivo_HI"),
+        ]
+
+        assignment, stats = solve_with_ortools(cfg, days, slots)
+
+        self.assertNotEqual(stats["status"], "PARTIAL")
+        self.assertNotEqual(assignment["2026-08-02-DE"], assignment["2026-08-09-HI"])
+
+    def test_provisional_c_reperibilita_does_not_force_nearby_j_blank(self):
+        cfg = {
+            "rules": {
+                "C_reperibilita": {
+                    "excluded": [],
+                    "constraints": ["not_night_next_2_days", "not_night_prev_2_days", "not_night_same_day"],
+                    "max_per_doctor": 3,
+                    "spacing_min_days": 0,
+                },
+                "J": {"pool_other": ["A"]},
+            },
+            "global_constraints": {
+                "night_spacing_days_min": 1,
+                "night_off": {"same_day": True, "next_day": True},
+            },
+        }
+        days = [
+            DayRow(dt.date(2026, 8, 22), "Sat", 2),
+            DayRow(dt.date(2026, 8, 23), "Sun", 3),
+            DayRow(dt.date(2026, 8, 24), "Mon", 4),
+        ]
+        slots = [
+            Slot(days[0], "2026-08-22-C", ["C"], ["A"], required=True, shift="Any", rule_tag="C_reperibilita"),
+            Slot(days[2], "2026-08-24-J", ["J"], ["A"], required=True, shift="Notte", rule_tag="J"),
+        ]
+
+        assignment, stats = solve_with_ortools(cfg, days, slots)
+
+        self.assertNotEqual(stats["status"], "PARTIAL")
+        self.assertEqual(assignment["2026-08-24-J"], "A")
+
+    def test_tiny_i_ab_pool_is_preserved_for_k_when_k_has_outside_alternative(self):
+        cfg = {
+            "rules": {
+                "I": {"distribution_pool": ["Allegra", "Crea"]},
+                "AB": {"fallback_pool": ["Allegra", "Crea"]},
+                "K": {"pool": ["Allegra", "Colarusso"]},
+            },
+            "global_constraints": {"tiny_pool_protect_penalty": 45_000_000},
+        }
+        day = DayRow(dt.date(2026, 8, 20), "Thu", 2)
+        slots = [
+            Slot(day, f"{day.date}-I", ["I"], ["Allegra", "Crea"], required=True, shift="Pomeriggio", rule_tag="I"),
+            Slot(day, f"{day.date}-AB", ["AB"], ["Allegra", "Crea"], required=True, shift="Mattina", rule_tag="AB"),
+            Slot(day, f"{day.date}-K", ["K"], ["Allegra", "Colarusso"], required=True, shift="Mattina", rule_tag="K"),
+        ]
+
+        assignment, stats = solve_with_ortools(cfg, [day], slots)
+
+        self.assertNotEqual(stats["status"], "PARTIAL")
+        self.assertEqual(assignment[f"{day.date}-K"], "Colarusso")
+        self.assertEqual({assignment[f"{day.date}-I"], assignment[f"{day.date}-AB"]}, {"Allegra", "Crea"})
+
+    def test_night_before_tiny_i_ab_pool_prefers_outside_doctor(self):
+        cfg = {
+            "rules": {
+                "J": {"pool_other": ["Allegra", "Zito"]},
+                "I": {"distribution_pool": ["Allegra", "Crea"]},
+                "AB": {"fallback_pool": ["Allegra", "Crea"]},
+            },
+            "global_constraints": {
+                "night_off": {"same_day": True, "next_day": True},
+                "night_spacing_days_min": 1,
+                "next_day_tiny_pool_night_penalty": 60_000_000,
+            },
+        }
+        day1 = DayRow(dt.date(2026, 8, 19), "Wed", 2)
+        day2 = DayRow(dt.date(2026, 8, 20), "Thu", 3)
+        slots = [
+            Slot(day1, f"{day1.date}-J", ["J"], ["Allegra", "Zito"], required=True, shift="Notte", rule_tag="J"),
+            Slot(day2, f"{day2.date}-I", ["I"], ["Allegra", "Crea"], required=True, shift="Pomeriggio", rule_tag="I"),
+            Slot(day2, f"{day2.date}-AB", ["AB"], ["Allegra", "Crea"], required=True, shift="Mattina", rule_tag="AB"),
+        ]
+
+        assignment, stats = solve_with_ortools(cfg, [day1, day2], slots)
+
+        self.assertNotEqual(stats["status"], "PARTIAL")
+        self.assertEqual(assignment[f"{day1.date}-J"], "Zito")
+        self.assertEqual({assignment[f"{day2.date}-I"], assignment[f"{day2.date}-AB"]}, {"Allegra", "Crea"})
+
     def test_pool_config_audit_blocks_never_in_j_from_gui(self):
         cfg_yaml = {
             "columns": {"J": "Notte"},
@@ -282,6 +1133,30 @@ class SolverRegressionTests(unittest.TestCase):
         self.assertIn("A", sat_j.allowed)
         self.assertIn("A", sat_c.allowed)
         self.assertIn("A", fri_k.allowed)
+
+    def test_calabro_can_cover_saturday_df_unless_gui_flag_excludes_her(self):
+        cfg = {
+            "columns": {"D": "UTIC mattina", "F": "Supporto 118"},
+            "rules": {
+                "D_F": {
+                    "allowed": ["Grimaldi", "Calabrò"],
+                    "days": "Mon-Sat",
+                }
+            },
+            "global_constraints": {},
+        }
+        sat = DayRow(dt.date(2026, 8, 29), "Sat", 2)
+
+        slots = slots_for_month(cfg, [sat], {})
+        sat_d = next(s for s in slots if s.slot_id == "2026-08-29-D")
+
+        self.assertIn("Calabrò", sat_d.allowed)
+
+        cfg_flagged = {**cfg, "pool_saturday_day_excluded": {"Calabrò"}}
+        flagged_slots = slots_for_month(cfg_flagged, [sat], {})
+        flagged_d = next(s for s in flagged_slots if s.slot_id == "2026-08-29-D")
+
+        self.assertNotIn("Calabrò", flagged_d.allowed)
 
     def test_saturday_day_exclusion_applies_after_critical_fallback(self):
         cfg = {

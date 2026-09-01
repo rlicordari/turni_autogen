@@ -26,8 +26,10 @@ AUTO_COLUMNS = {"AA", "AC"}
 
 _COL_RULE_TARGETS: dict[str, list[tuple[str, str | None]]] = {
     "C": [("C_reperibilita", None)],
+    # D/F share one solver rule, but D is the primary ward column.
+    # Doctors enabled only on F must not become primary D/F pair doctors.
     "D": [("D_F", "allowed")],
-    "F": [("D_F", "allowed")],
+    "F": [],
     "E": [("E_G", "allowed")],
     "G": [("E_G", "allowed")],
     "H": [("H", "pool_mon_fri"), ("H", "distribution_pool")],

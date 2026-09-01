@@ -788,8 +788,11 @@ def apply_pool_config(cfg_yaml: dict, pool_cfg: Optional[dict]) -> dict:
     _COL_RULE: dict[str, list[tuple[str, str]]] = {
         # (rule_key, pool_field)
         "C":  [("C_reperibilita", None)],         # C si gestisce via excluded, non pool
+        # D/F share one solver rule, but D is the primary ward column.
+        # A doctor enabled only on F must remain a fallback/support candidate,
+        # not become part of the primary Grimaldi/Calabro pair.
         "D":  [("D_F", "allowed")],
-        "F":  [("D_F", "allowed")],
+        "F":  [],
         "E":  [("E_G", "allowed")],
         "G":  [("E_G", "allowed")],
         "H":  [("H", "pool_mon_fri"), ("H", "distribution_pool")],
@@ -1379,10 +1382,18 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                 blank_penalties[str(_k).strip().upper()] = int(_v)
             except Exception:
                 pass
+    optional_blank_floor: Dict[str, int] = {
+        # These columns may stay blank as a relief valve, but the solver should
+        # first try hard to reshuffle flexible assignments (for example H -> K/L).
+        "L": 20_000_000,
+        "R": 10_000_000,
+        "Z": 10_000_000,
+    }
+
     def req_and_blank(col_letter: str) -> Tuple[bool, int]:
         col_letter = str(col_letter).strip().upper()
         if col_letter in blank_penalties:
-            return False, blank_penalties[col_letter]
+            return False, max(blank_penalties[col_letter], optional_blank_floor.get(col_letter, 0))
         return True, 0
     # YAML also has inline date-only unavailability (full-day)
     for doc, dates in (cfg.get("unavailability") or {}).items():
@@ -1519,10 +1530,6 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                 # Rimuovi i medici forzati in J quel giorno (night_off same_day li esclude da D/F)
                 forced_j_today = forced_j_by_date.get(day.date, set())
                 pair_avail = [d for d in pair_avail if d not in forced_j_today]
-                # Calabrò non lavora mai in D/F di sabato
-                if day.dow == "Sat":
-                    _calabro_n = norm_name("Calabrò")
-                    pair_avail = [d for d in pair_avail if d != _calabro_n]
 
                 # Fallback source = H.pool_mon_fri (as requested)
                 h_rule = rules.get("H", {}) if isinstance(rules.get("H", {}), dict) else {}
@@ -1535,24 +1542,16 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                     [d for d in sorted(doctors_set) if d != _recupero_n], day, "Mattina", unav
                 )
 
-                # Build a robust shared domain (never empty for required slots)
-                allowed_base = sorted({*pair_avail, *h_avail, *any_pool})
-                if not allowed_base:
-                    allowed_base = sorted(doctors_set)
-
                 # Se solo uno del pair disponibile → share obbligatorio (lui fa D e F)
-                # Se nessuno del pair → pool completo (H pool + qualsiasi medico libero al mattino)
+                # Se nessuno del pair → fallback ordinato:
+                #   1. H pool disponibile, bilanciato/stabilizzato dal solver
+                #   2. qualsiasi medico disponibile solo se il pool H non può coprire
                 # Se entrambi → solo il pair, no share
                 if len(pair_avail) == 1:
                     allowed_df = pair_avail
                     prefer_share = True
                 elif len(pair_avail) == 0:
-                    # Fallback a cascata:
-                    # 1. Pool H (preferito)
-                    # 2. Qualsiasi medico disponibile al mattino (allowed_base = H + any_pool)
-                    # Questo evita che un solo medico (es. Migliorato) sia l'unico per D/F
-                    # bloccandosi poi per H pomeriggio.
-                    allowed_df = allowed_base if allowed_base else sorted(doctors_set)
+                    allowed_df = h_avail or any_pool or sorted(doctors_set)
                     prefer_share = True
                 else:
                     allowed_df = pair_avail
@@ -2112,6 +2111,195 @@ def build_daily_diagnostic(
 
     return diagnostics
 
+def _is_heavy_festive_slot(cfg: dict, slot: Slot) -> bool:
+    """Return True for the burdens the user expects to be pooled together."""
+    if slot.rule_tag in {"Festivo_DE", "Festivo_HI"}:
+        return True
+    if slot.columns == ["J"]:
+        return slot.day.dow in {"Sat", "Sun"} or is_festivo(slot.day, cfg)
+    return False
+
+
+def _fixed_heavy_slot_ids(slots: List[Slot], fixed_assignments: Optional[List[dict]]) -> Set[str]:
+    fixed_ids: Set[str] = set()
+    if not fixed_assignments:
+        return fixed_ids
+    for raw in fixed_assignments:
+        try:
+            fdate = dt.date.fromisoformat(str(raw.get("date", "")).strip())
+            fcol = str(raw.get("column", "")).strip().upper()
+        except Exception:
+            continue
+        if not fcol:
+            continue
+        for s in slots:
+            if s.day.date == fdate and fcol in {str(c).upper() for c in (s.columns or [])}:
+                fixed_ids.add(s.slot_id)
+    return fixed_ids
+
+
+def _repair_heavy_festive_assignments(
+    cfg: dict,
+    slots: List[Slot],
+    assignment: Dict[str, Optional[str]],
+    fixed_assignments: Optional[List[dict]] = None,
+    max_passes: int = 80,
+) -> Tuple[Dict[str, Optional[str]], List[Dict]]:
+    """Second-look local repair for J weekend/festive + festive D/E/H/I.
+
+    The CP-SAT objective already carries these penalties, but large real-world
+    models can still settle on a locally unpleasant distribution. This pass only
+    accepts moves that improve the unified heavy-duty distribution and only
+    moves a slot to a doctor already present in that slot's solved domain.
+    """
+    if not slots or not assignment:
+        return assignment, []
+
+    fixed_ids = _fixed_heavy_slot_ids(slots, fixed_assignments)
+    heavy_slots = [
+        s for s in slots
+        if _is_heavy_festive_slot(cfg, s) and assignment.get(s.slot_id)
+    ]
+    if len(heavy_slots) < 2:
+        return assignment, []
+
+    candidates_by_slot = {
+        s.slot_id: [norm_name(d) for d in dict.fromkeys(s.allowed or []) if norm_name(d) and norm_name(d) != "Recupero"]
+        for s in heavy_slots
+    }
+    candidate_docs = sorted({d for vals in candidates_by_slot.values() for d in vals})
+    if len(candidate_docs) < 2:
+        return assignment, []
+
+    slots_by_date: Dict[dt.date, List[Slot]] = defaultdict(list)
+    j_slots = []
+    for s in slots:
+        slots_by_date[s.day.date].append(s)
+        if s.columns == ["J"]:
+            j_slots.append(s)
+
+    gc = cfg.get("global_constraints") or {}
+    night_gap = int(gc.get("night_spacing_days_min", 5) or 5)
+    night_off = gc.get("night_off") if isinstance(gc.get("night_off"), dict) else {}
+    night_off_next_day = bool(night_off.get("next_day", True))
+
+    def assigned_on_date(assign: Dict[str, Optional[str]], doc: str, day: dt.date, exclude_sid: Optional[str] = None) -> bool:
+        for ds in slots_by_date.get(day, []):
+            if ds.slot_id == exclude_sid:
+                continue
+            if ds.columns == ["C"]:
+                continue
+            if norm_name(assign.get(ds.slot_id)) == doc:
+                return True
+        return False
+
+    def has_j_on(assign: Dict[str, Optional[str]], doc: str, day: dt.date, exclude_sid: Optional[str] = None) -> bool:
+        for js in j_slots:
+            if js.slot_id == exclude_sid:
+                continue
+            if js.day.date == day and norm_name(assign.get(js.slot_id)) == doc:
+                return True
+        return False
+
+    def safe_replacement(s: Slot, doc: str, assign: Dict[str, Optional[str]]) -> bool:
+        if s.slot_id in fixed_ids:
+            return False
+        if doc not in candidates_by_slot.get(s.slot_id, []):
+            return False
+        if assigned_on_date(assign, doc, s.day.date, exclude_sid=s.slot_id):
+            return False
+        if s.columns == ["J"]:
+            for js in j_slots:
+                if js.slot_id == s.slot_id:
+                    continue
+                if norm_name(assign.get(js.slot_id)) != doc:
+                    continue
+                delta = abs((js.day.date - s.day.date).days)
+                if 0 < delta < night_gap:
+                    return False
+            if night_off_next_day and assigned_on_date(assign, doc, s.day.date + dt.timedelta(days=1)):
+                return False
+        else:
+            if has_j_on(assign, doc, s.day.date):
+                return False
+            if night_off_next_day and has_j_on(assign, doc, s.day.date - dt.timedelta(days=1)):
+                return False
+        return True
+
+    heavy_dates = sorted({s.day.date for s in heavy_slots})
+
+    def score(assign: Dict[str, Optional[str]]) -> Tuple[int, int, int, int, int, int]:
+        load = Counter()
+        by_doc_dates: Dict[str, Set[dt.date]] = defaultdict(set)
+        for hs in heavy_slots:
+            doc = norm_name(assign.get(hs.slot_id))
+            if not doc or doc == "Recupero":
+                continue
+            if doc not in candidate_docs:
+                continue
+            load[doc] += 1
+            by_doc_dates[doc].add(hs.day.date)
+        zero_candidates = sum(1 for doc in candidate_docs if load.get(doc, 0) == 0)
+        max_load = max((load.get(doc, 0) for doc in candidate_docs), default=0)
+        duplicate_load = sum(max(0, load.get(doc, 0) - 1) for doc in candidate_docs)
+        sum_squares = sum(load.get(doc, 0) ** 2 for doc in candidate_docs)
+        consecutive = 0
+        for doc in candidate_docs:
+            dates = by_doc_dates.get(doc, set())
+            for a, b in zip(heavy_dates, heavy_dates[1:]):
+                if a in dates and b in dates:
+                    consecutive += 1
+        repeated_same_date = 0
+        for doc in candidate_docs:
+            per_date = Counter(
+                hs.day.date
+                for hs in heavy_slots
+                if norm_name(assign.get(hs.slot_id)) == doc
+            )
+            repeated_same_date += sum(max(0, n - 1) for n in per_date.values())
+        return (zero_candidates, max_load, duplicate_load, consecutive, repeated_same_date, sum_squares)
+
+    repaired = dict(assignment)
+    swaps: List[Dict] = []
+    current_score = score(repaired)
+
+    for _ in range(max_passes):
+        best = None
+        best_score = current_score
+        for s in sorted(heavy_slots, key=lambda x: (x.day.date, x.slot_id)):
+            if s.slot_id in fixed_ids:
+                continue
+            current_doc = norm_name(repaired.get(s.slot_id))
+            if not current_doc:
+                continue
+            for cand in candidates_by_slot.get(s.slot_id, []):
+                if cand == current_doc:
+                    continue
+                if not safe_replacement(s, cand, repaired):
+                    continue
+                trial = dict(repaired)
+                trial[s.slot_id] = cand
+                trial_score = score(trial)
+                if trial_score < best_score:
+                    best_score = trial_score
+                    best = (s, current_doc, cand, trial, trial_score)
+        if best is None:
+            break
+        s, old_doc, new_doc, repaired, new_score = best
+        swaps.append({
+            "date": s.day.date.isoformat(),
+            "slot_id": s.slot_id,
+            "columns": list(s.columns),
+            "from": old_doc,
+            "to": new_doc,
+            "score_before": current_score,
+            "score_after": new_score,
+        })
+        current_score = new_score
+
+    return repaired, swaps
+
+
 def solve_with_ortools(
     cfg: dict,
     days: List[DayRow],
@@ -2141,6 +2329,7 @@ def solve_with_ortools(
     model = cp_model.CpModel()
     # Collect extra objective terms built during constraint setup
     extra_obj = []
+    heavy_priority_terms = []
     # Warnings raccolti durante la costruzione del modello (non bloccanti)
     pre_solve_warnings: List[str] = []
 
@@ -2179,16 +2368,41 @@ def solve_with_ortools(
             period_month_fraction = 1.0
             period_is_partial_month = False
 
+    def _date_is_j_festive(d: dt.date) -> bool:
+        if d.weekday() in (5, 6):
+            return True
+        try:
+            if d in italy_public_holidays(int(d.year)):
+                return True
+        except Exception:
+            pass
+        for raw in cfg.get("festivi_extra", []) or []:
+            try:
+                if parse_date(raw) == d:
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _day_is_j_festive(day: DayRow) -> bool:
+        return _date_is_j_festive(day.date)
+
     def _prior_count(doc: Optional[str], col: Optional[str]) -> int:
         if not doc or not col:
             return 0
         doc_n = norm_name(doc)
         col_n = str(col).strip().upper()
         by_col = prior_counts_month.get(doc_n) or prior_counts_month.get(str(doc).strip()) or {}
+        period_by_col = ((prior_usage.get("period_counts") or {}).get(doc_n)
+                         or (prior_usage.get("period_counts") or {}).get(str(doc).strip())
+                         or {})
         try:
             if col_n == "FESTIVI":
-                return sum(int(by_col.get(c, 0) or 0) for c in ("D", "E", "H", "I"))
-            return int(by_col.get(col_n, 0) or 0)
+                direct = int(by_col.get("Festivi", by_col.get("FESTIVI", 0)) or 0)
+                if direct <= 0:
+                    direct = sum(int(by_col.get(c, 0) or 0) for c in ("D", "E", "H", "I"))
+                return direct + int(period_by_col.get("Festivi", period_by_col.get("FESTIVI", 0)) or 0)
+            return int(by_col.get(col_n, 0) or 0) + int(period_by_col.get(col_n, 0) or 0)
         except Exception:
             return 0
 
@@ -2209,6 +2423,25 @@ def solve_with_ortools(
         if not doc:
             return 0
         doc_n = norm_name(doc)
+        period_by_col = ((prior_usage.get("period_counts") or {}).get(doc_n)
+                         or (prior_usage.get("period_counts") or {}).get(str(doc).strip())
+                         or {})
+        by_doc = ((prior_usage.get("night_dates_by_doc") or {}).get(month_key_for_solver) or {})
+        dates = by_doc.get(doc_n) or by_doc.get(str(doc).strip()) or []
+        total = int(period_by_col.get("J_FESTIVI", 0) or 0)
+        for ds in dates:
+            try:
+                d = dt.date.fromisoformat(str(ds)[:10])
+            except Exception:
+                continue
+            if _date_is_j_festive(d):
+                total += 1
+        return total
+
+    def _prior_j_weekday_count(doc: Optional[str]) -> int:
+        if not doc:
+            return 0
+        doc_n = norm_name(doc)
         by_doc = ((prior_usage.get("night_dates_by_doc") or {}).get(month_key_for_solver) or {})
         dates = by_doc.get(doc_n) or by_doc.get(str(doc).strip()) or []
         total = 0
@@ -2217,7 +2450,23 @@ def solve_with_ortools(
                 d = dt.date.fromisoformat(str(ds)[:10])
             except Exception:
                 continue
-            if d.weekday() in (5, 6):
+            if not _date_is_j_festive(d):
+                total += 1
+        return total
+
+    def _prior_j_sunday_count(doc: Optional[str]) -> int:
+        if not doc:
+            return 0
+        doc_n = norm_name(doc)
+        by_doc = ((prior_usage.get("night_dates_by_doc") or {}).get(month_key_for_solver) or {})
+        dates = by_doc.get(doc_n) or by_doc.get(str(doc).strip()) or []
+        total = 0
+        for ds in dates:
+            try:
+                d = dt.date.fromisoformat(str(ds)[:10])
+            except Exception:
+                continue
+            if d.weekday() == 6:
                 total += 1
         return total
 
@@ -2300,26 +2549,30 @@ def solve_with_ortools(
     # which slots genuinely cannot be filled (they show up blank in the output).
     #
     # Gerarchia sacrifici (crescente = si sacrifica per primo):
-    #   K=T share: 4M  →  preferenze/quote/target  →  slot obbligatorio vuoto.
-    # Il vuoto obbligatorio deve restare una vera ultima spiaggia, ma senza usare
-    # coefficienti enormi che rallentano molto CP-SAT sul caso reale.
-    BLANK_REQUIRED_PENALTY = 50_000_000   # default per slot non classificati
+    #   K=T share/preferenze/quote/target  →  slot obbligatorio vuoto.
+    # Il vuoto obbligatorio deve restare una vera ultima spiaggia: in particolare
+    # una J copribile non deve mai saltare per "migliorare" un bilanciamento.
+    BLANK_REQUIRED_PENALTY = 500_000_000   # default per slot non classificati
     _BLANK_PENALTY_BY_TAG: Dict[str, int] = {
         # Critici — quasi mai vuoti
-        "J":          200_000_000,
-        "H":          200_000_000,
-        "D_F.D":      200_000_000,
-        "D_F.F":      200_000_000,
-        "Festivo_HI": 200_000_000,
+        "J":        2_000_000_000,
+        "K":        1_500_000_000,
+        "H":        1_500_000_000,
+        "D_F.D":    1_500_000_000,
+        "D_F.F":    1_500_000_000,
+        "Festivo_HI": 1_500_000_000,
         # Alti — solo se davvero nessun medico disponibile
-        "I":          120_000_000,
-        "E_G":        120_000_000,
-        "Festivo_DE": 120_000_000,
+        "I":        1_000_000_000,
+        "E_G":      1_000_000_000,
+        "Festivo_DE": 1_000_000_000,
+        "T":          800_000_000,
+        "Q":          800_000_000,
+        "V":          800_000_000,
         # Bassi — possono cedere prima degli altri required
-        "Q":           50_000_000,
-        "W":           50_000_000,
+        "W":          300_000_000,
     }
     blank_required_vars: Dict[str, object] = {}  # slot_id -> b_blank var (for diagnostics)
+    coverage_obj_terms: List = []
     for s in slots:
         vars_ = [x[(s.slot_id, d)] for d in s.allowed if (s.slot_id, d) in x]
         if not vars_:
@@ -2329,7 +2582,7 @@ def solve_with_ortools(
             b_blank = model.NewBoolVar(f"blank_req_{hash(s.slot_id)%10**8}")
             model.Add(sum(vars_) + b_blank == 1)
             penalty = _BLANK_PENALTY_BY_TAG.get(s.rule_tag, BLANK_REQUIRED_PENALTY)
-            extra_obj.append(penalty * b_blank)
+            coverage_obj_terms.append(penalty * b_blank)
             blank_required_vars[s.slot_id] = b_blank
         else:
             # Optional slot: can be left blank. If blank_penalty>0, we penalize blanks so it is used only as a last resort.
@@ -2470,6 +2723,7 @@ def solve_with_ortools(
     enable_df_share = bool(r_df.get("enable_df_share", True))
     df_share_penalty = int(r_df.get("df_share_penalty", 8000))
     prefer_df_share_penalty = int(r_df.get("prefer_df_share_penalty", 15000))
+    df_share_vars_by_date: Dict[dt.date, Dict[str, object]] = {}
 
     daily_exempt_cols = {str(c).strip().upper() for c in (gc.get('daily_uniqueness_exempt_columns') or [])}
     def _slot_is_exempt_daily(s: Slot) -> bool:
@@ -2527,6 +2781,7 @@ def solve_with_ortools(
                     model.Add(y >= x[(slotD.slot_id, d)] + x[(slotF.slot_id, d)] - 1)
                     df_y_by_doc[d] = y
             if df_y_by_doc:
+                df_share_vars_by_date[day.date] = df_y_by_doc
                 model.Add(sum(df_y_by_doc.values()) <= 1)
 
                 # If D/F is in an "emergency" mode (both Grimaldi/Calabrò unavailable, or H pool empty with only one available),
@@ -2595,6 +2850,208 @@ def solve_with_ortools(
                     v2 = [v for v in v2 if v is not None]
                     if v1 or v2:
                         model.Add(sum(v1) + sum(v2) <= 1)
+    except Exception:
+        pass
+
+    # H is a flexible afternoon slot, but several H doctors are also the scarce
+    # morning pool for K/L/T/Q/R/E+G/etc. Prefer using the H candidate with fewer
+    # same-day morning alternatives (e.g. Migliorato) so multi-service doctors
+    # remain available for bottleneck columns.
+    try:
+        rH_pref = rules_map.get("H", {}) if isinstance(rules_map.get("H", {}), dict) else {}
+        h_reserve_penalty = int(rH_pref.get("reserve_multi_service_penalty", 1_000_000) or 0)
+        h_reserve_cols_raw = rH_pref.get("reserve_for_columns")
+        if h_reserve_cols_raw is None:
+            h_reserve_cols = {"E", "G", "K", "L", "Q", "R", "S", "T", "U", "V", "W", "Y", "Z", "AB"}
+        else:
+            h_reserve_cols = {
+                str(c).strip().upper()
+                for c in h_reserve_cols_raw
+                if str(c).strip()
+            }
+        if h_reserve_penalty > 0 and h_reserve_cols:
+            for day in days:
+                h_slot = next((s for s in slots_by_day.get(day.date, []) if s.columns == ["H"]), None)
+                if not h_slot:
+                    continue
+                pressure_slots = [
+                    s for s in slots_by_day.get(day.date, [])
+                    if s.slot_id != h_slot.slot_id
+                    and getattr(s, "shift", None) == "Mattina"
+                    and any(str(c).strip().upper() in h_reserve_cols for c in (s.columns or []))
+                ]
+                if not pressure_slots:
+                    continue
+                scores: Dict[str, int] = {}
+                for doc in h_slot.allowed:
+                    hv = x.get((h_slot.slot_id, doc))
+                    if hv is None:
+                        continue
+                    scores[doc] = sum(
+                        1
+                        for ps in pressure_slots
+                        if x.get((ps.slot_id, doc)) is not None
+                    )
+                if len(scores) < 2:
+                    continue
+                min_score = min(scores.values())
+                max_score = max(scores.values())
+                if max_score <= min_score:
+                    continue
+                for doc, score in scores.items():
+                    if score <= min_score:
+                        continue
+                    hv = x.get((h_slot.slot_id, doc))
+                    if hv is not None:
+                        extra_obj.append(h_reserve_penalty * (score - min_score) * hv)
+    except Exception:
+        pass
+
+    # K is often the bottleneck during heavy vacation periods. When the same-day
+    # K pool is already narrow, avoid spending K-capable doctors on flexible
+    # H/Q/T-style services if that service has an alternative outside the K pool.
+    try:
+        k_preserve_penalty = int(gc.get("k_pool_preserve_penalty", 80_000_000) or 0)
+        k_preserve_threshold = int(gc.get("k_pool_preserve_threshold", 5) or 0)
+        k_pressure_cols = {
+            "H", "L", "Q", "R", "S", "T", "U", "V", "W", "Y", "Z", "AB"
+        }
+        if k_preserve_penalty > 0:
+            for day in days:
+                k_slot = next((s for s in slots_by_day.get(day.date, []) if s.columns == ["K"]), None)
+                if not k_slot or not k_slot.allowed:
+                    continue
+                k_docs = {norm_name(d) for d in k_slot.allowed if x.get((k_slot.slot_id, norm_name(d))) is not None}
+                if not k_docs:
+                    continue
+                if k_preserve_threshold > 0 and len(k_docs) > k_preserve_threshold:
+                    continue
+                for other in slots_by_day.get(day.date, []):
+                    if other.slot_id == k_slot.slot_id:
+                        continue
+                    if any(str(c).strip().upper() in {"C", "J", "D", "E", "F", "G", "I"} for c in (other.columns or [])):
+                        continue
+                    if not any(str(c).strip().upper() in k_pressure_cols for c in (other.columns or [])):
+                        continue
+                    other_docs = {norm_name(d) for d in other.allowed if x.get((other.slot_id, norm_name(d))) is not None}
+                    if not (other_docs & k_docs):
+                        continue
+                    if not (other_docs - k_docs):
+                        continue
+                    for doc in sorted(other_docs & k_docs):
+                        ov = x.get((other.slot_id, doc))
+                        if ov is not None:
+                            extra_obj.append(k_preserve_penalty * ov)
+    except Exception:
+        pass
+
+    # Protect very constrained morning services such as E+G. If a doctor is one
+    # of the few candidates for E+G, avoid spending that doctor on another
+    # morning service that has alternatives outside the E+G pool.
+    try:
+        scarce_penalty = int(((rules_map.get("E_G", {}) or {}).get("protect_pool_penalty", 35_000_000)) or 0)
+        protected_other_cols = {"K", "L", "Q", "R", "S", "T", "U", "V", "W", "Y", "Z"}
+        if scarce_penalty > 0:
+            for day in days:
+                eg_slot = next((s for s in slots_by_day.get(day.date, []) if s.columns == ["E", "G"]), None)
+                if not eg_slot or not eg_slot.allowed:
+                    continue
+                protected_docs = set(eg_slot.allowed)
+                for other in slots_by_day.get(day.date, []):
+                    if other.slot_id == eg_slot.slot_id:
+                        continue
+                    if getattr(other, "shift", None) != "Mattina":
+                        continue
+                    if not any(str(c).strip().upper() in protected_other_cols for c in (other.columns or [])):
+                        continue
+                    other_has_outside_choice = any(
+                        doc not in protected_docs and x.get((other.slot_id, doc)) is not None
+                        for doc in other.allowed
+                    )
+                    if not other_has_outside_choice:
+                        continue
+                    for doc in protected_docs:
+                        ov = x.get((other.slot_id, doc))
+                        if ov is not None:
+                            extra_obj.append(scarce_penalty * ov)
+    except Exception:
+        pass
+
+    # Same idea for tiny pools such as I and AB. If only Allegra/Crea can cover
+    # I/AB on a day, do not spend them on K/T/Q/R/etc. when those services have
+    # alternatives outside that tiny pool.
+    try:
+        tiny_pool_penalty = int((gc.get("tiny_pool_protect_penalty", 45_000_000) or 45_000_000))
+        tiny_pool_tags = {"I", "AB"}
+        tiny_other_cols = {"C", "K", "L", "Q", "R", "S", "T", "U", "V", "W", "Y", "Z"}
+        if tiny_pool_penalty > 0:
+            for day in days:
+                scarce_slots = [
+                    s for s in slots_by_day.get(day.date, [])
+                    if s.required
+                    and s.rule_tag in tiny_pool_tags
+                    and 1 <= len(s.allowed or []) <= 3
+                ]
+                if not scarce_slots:
+                    continue
+                scarce_slot_ids = {s.slot_id for s in scarce_slots}
+                protected_docs = {doc for s in scarce_slots for doc in (s.allowed or [])}
+                if not protected_docs:
+                    continue
+                for other in slots_by_day.get(day.date, []):
+                    if other.slot_id in scarce_slot_ids:
+                        continue
+                    if not any(str(c).strip().upper() in tiny_other_cols for c in (other.columns or [])):
+                        continue
+                    other_has_outside_choice = any(
+                        doc not in protected_docs and x.get((other.slot_id, doc)) is not None
+                        for doc in other.allowed
+                    )
+                    if not other_has_outside_choice:
+                        continue
+                    for doc in protected_docs:
+                        ov = x.get((other.slot_id, doc))
+                        if ov is not None:
+                            extra_obj.append(tiny_pool_penalty * ov)
+    except Exception:
+        pass
+
+    # Also protect tiny next-day pools from night assignments: if Allegra/Crea
+    # are the only doctors for I/AB tomorrow, avoid assigning them to J tonight
+    # when the night pool has alternatives, because night_off_next_day would
+    # remove them from tomorrow's scarce service.
+    try:
+        next_day_tiny_penalty = int((gc.get("next_day_tiny_pool_night_penalty", 60_000_000) or 60_000_000))
+        if next_day_tiny_penalty > 0:
+            day_by_date = {d.date: d for d in days}
+            for day in days:
+                tomorrow = day.date + dt.timedelta(days=1)
+                if tomorrow not in day_by_date:
+                    continue
+                j_slot = next((s for s in slots_by_day.get(day.date, []) if s.columns == ["J"]), None)
+                if not j_slot:
+                    continue
+                scarce_slots = [
+                    s for s in slots_by_day.get(tomorrow, [])
+                    if s.required
+                    and s.rule_tag in {"I", "AB"}
+                    and 1 <= len(s.allowed or []) <= 3
+                ]
+                if not scarce_slots:
+                    continue
+                protected_docs = {doc for s in scarce_slots for doc in (s.allowed or [])}
+                if not protected_docs:
+                    continue
+                j_has_outside_choice = any(
+                    doc not in protected_docs and x.get((j_slot.slot_id, doc)) is not None
+                    for doc in j_slot.allowed
+                )
+                if not j_has_outside_choice:
+                    continue
+                for doc in protected_docs:
+                    jv = x.get((j_slot.slot_id, doc))
+                    if jv is not None:
+                        extra_obj.append(next_day_tiny_penalty * jv)
     except Exception:
         pass
 
@@ -2751,29 +3208,10 @@ def solve_with_ortools(
                 v2 = night_var_by_day_doc.get((d2, doc))
                 if v1 is not None and v2 is not None:
                     model.Add(v1 + v2 <= 1)
-    # Reperibilità constraints: not night same day + next 2 days
-    if "rules" in cfg and "C_reperibilita" in cfg["rules"]:
-        rC = cfg["rules"]["C_reperibilita"]
-        constraints = set(rC.get("constraints") or [])
-        if any(c in constraints for c in ("not_night_same_day", "not_night_next_2_days", "not_night_prev_2_days")):
-            pos = {d.date: i for i, d in enumerate(days)}
-            for day in days:
-                c_slot = next((s for s in slots_by_day[day.date] if s.columns == ["C"]), None)
-                if not c_slot:
-                    continue
-                for doc in doctors:
-                    if (c_slot.slot_id, doc) not in x:
-                        continue
-                    cvar = x[(c_slot.slot_id, doc)]
-                    i = pos[day.date]
-                    # enforce no-night within ±2 days of a Reperibilità assignment
-                    for off in [-2, -1, 0, 1, 2]:
-                        j = i + off
-                        if j < 0 or j >= len(days):
-                            continue
-                        nvar = night_var_by_day_doc.get((days[j].date, doc))
-                        if nvar is not None:
-                            model.Add(nvar == 0).OnlyEnforceIf(cvar)
+    # Reperibilità C is reassigned after the CP-SAT solve by assign_reperibilita_C.
+    # Do not let provisional C variables impose hard C↔J proximity constraints here:
+    # they can make a real night J appear infeasible even though the final C layer
+    # could simply choose a different reperibilità doctor.
     # K no consecutive days same doctor
     if "rules" in cfg and "K" in cfg["rules"] and cfg["rules"]["K"].get("no_consecutive_days_same_doctor", False):
         for i in range(len(days)-1):
@@ -2802,13 +3240,17 @@ def solve_with_ortools(
             doc1 = norm_name(rDF.get("pattern_doc1") or "Grimaldi")
             doc2 = norm_name(rDF.get("pattern_doc2") or "Calabrò")
             pair = {doc1, doc2}
+            fallback_share_by_date: Dict[dt.date, Dict[str, object]] = {}
+            fallback_share_by_doc: Dict[str, List[object]] = defaultdict(list)
 
             # Penalties (tunable in YAML)
             pen_pattern = int(rDF.get("pattern_penalty", 80) or 80)
             pen_outside_pair = int(rDF.get("outside_pair_penalty", 6000) or 6000)
             pen_missing_pair_doc = int(rDF.get("missing_pair_doc_penalty", 12000) or 12000)
-            pen_d_not_available = int(rDF.get("d_not_available_penalty", 15000) or 15000)
             pen_outside_hpool = int(rDF.get("outside_hpool_penalty", 5000) or 5000)
+            pen_fallback_balance = int(rDF.get("fallback_balance_penalty", 1_000_000) or 1_000_000)
+            pen_fallback_switch = int(rDF.get("fallback_switch_penalty", 2_000_000) or 2_000_000)
+            fallback_block_days = max(int(rDF.get("fallback_block_days", 3) or 3), 2)
 
             hpool = set(norm_name(d) for d in ((cfg.get("rules", {}).get("H", {}) or {}).get("pool_mon_fri") or []))
 
@@ -2822,6 +3264,7 @@ def solve_with_ortools(
 
                 vD1 = x.get((sD.slot_id, doc1)); vF1 = x.get((sF.slot_id, doc1))
                 vD2 = x.get((sD.slot_id, doc2)); vF2 = x.get((sF.slot_id, doc2))
+                df_y_for_day = df_share_vars_by_date.get(day.date) or {}
                 avail_pair = []
                 if vD1 is not None and vF1 is not None:
                     avail_pair.append(doc1)
@@ -2873,17 +3316,12 @@ def solve_with_ortools(
                     vD_only = x.get((sD.slot_id, only_doc))
                     vF_only = x.get((sF.slot_id, only_doc))
 
-                    # SOFT: forte preferenza che l'unico del pair stia in D e F
-                    # (no hard per evitare conflitto con night_off_next_day quando il medico ha fatto J ieri)
-                    _prefer_d_pen = int(rDF.get("d_not_available_penalty", 15000) or 15000)
-                    if vD_only is not None:
-                        _nd = model.NewBoolVar(f"df_alone_d_miss_{day.date}")
-                        model.Add(_nd + vD_only >= 1)  # almeno uno dei due è 1
-                        extra_obj.append(_prefer_d_pen * _nd)
-                    if vF_only is not None:
-                        _nf = model.NewBoolVar(f"df_alone_f_miss_{day.date}")
-                        model.Add(_nf + vF_only >= 1)
-                        extra_obj.append(_prefer_d_pen * _nf)
+                    # HARD: if exactly one primary doctor is available in both D and F,
+                    # that doctor covers the pair. `pair_avail` already excludes
+                    # unavailability, forced J same-day and Saturday Calabro cases.
+                    if vD_only is not None and vF_only is not None:
+                        model.Add(vD_only == 1)
+                        model.Add(vF_only == 1)
 
                     # NON penalizzare altri medici in F (l'unico del pair li occupa entrambi)
 
@@ -2895,14 +3333,65 @@ def solve_with_ortools(
                     penalize_outside(sD, hpool, pen_outside_hpool)
                     penalize_outside(sF, hpool, pen_outside_hpool)
                     # Forza D=F tramite il meccanismo df_share già presente
-                    if df_y_by_doc:
+                    if df_y_for_day:
                         share_any = model.NewBoolVar(f"df_share_none_{day.date.isoformat()}")
-                        model.AddMaxEquality(share_any, list(df_y_by_doc.values()))
+                        model.AddMaxEquality(share_any, list(df_y_for_day.values()))
                         model.Add(share_any == 1)  # HARD: deve esserci un medico che copre sia D che F
+                        fallback_share_by_date[day.date] = dict(df_y_for_day)
+                        for _doc, _share_var in df_y_for_day.items():
+                            fallback_share_by_doc[_doc].append(_share_var)
                     else:
                         pre_solve_warnings.append(
                             f"D/F il {day.date}: nessun medico disponibile per coprire entrambe le colonne (D e F lasciate scoperte)"
                         )
+            # When D/F falls back because both primary doctors are unavailable,
+            # balance fallback doctors and prefer stable consecutive blocks.
+            if fallback_share_by_doc:
+                loads = []
+                max_prior = max((_prior_rule_balance_count(d, "D_F_fallback") for d in fallback_share_by_doc), default=0)
+                for _doc, _vars in sorted(fallback_share_by_doc.items()):
+                    if not _vars:
+                        continue
+                    prior = _prior_rule_balance_count(_doc, "D_F_fallback")
+                    load = model.NewIntVar(0, len(_vars) + prior, f"df_fb_load_{hash(_doc)%10**6}")
+                    model.Add(load == sum(_vars) + prior)
+                    loads.append(load)
+                if loads:
+                    max_fb = model.NewIntVar(0, len(fallback_share_by_date) + max_prior, "df_fb_max_load")
+                    min_fb = model.NewIntVar(0, len(fallback_share_by_date) + max_prior, "df_fb_min_load")
+                    spread_fb = model.NewIntVar(0, len(fallback_share_by_date) + max_prior, "df_fb_spread")
+                    model.AddMaxEquality(max_fb, loads)
+                    model.AddMinEquality(min_fb, loads)
+                    model.Add(spread_fb == max_fb - min_fb)
+                    extra_obj.append(pen_fallback_balance * (max_fb + spread_fb))
+
+                fb_dates = sorted(fallback_share_by_date)
+                runs: List[List[dt.date]] = []
+                for _date in fb_dates:
+                    if not runs or (runs[-1][-1] + dt.timedelta(days=1)) != _date:
+                        runs.append([_date])
+                    else:
+                        runs[-1].append(_date)
+                for run in runs:
+                    for i in range(0, len(run), fallback_block_days):
+                        chunk = run[i:i + fallback_block_days]
+                        if len(chunk) < 2:
+                            continue
+                        for d1, d2 in zip(chunk, chunk[1:]):
+                            m1 = fallback_share_by_date.get(d1) or {}
+                            m2 = fallback_share_by_date.get(d2) or {}
+                            common_docs = sorted(set(m1) & set(m2))
+                            same_terms = []
+                            for _doc in common_docs:
+                                same = model.NewBoolVar(f"df_fb_same_{d1}_{d2}_{hash(_doc)%10**6}")
+                                model.Add(same <= m1[_doc])
+                                model.Add(same <= m2[_doc])
+                                model.Add(same >= m1[_doc] + m2[_doc] - 1)
+                                same_terms.append(same)
+                            if same_terms:
+                                switch = model.NewBoolVar(f"df_fb_switch_{d1}_{d2}")
+                                model.Add(sum(same_terms) + switch == 1)
+                                extra_obj.append(pen_fallback_switch * switch)
 # E/G weekly blocks (Mon-Sat) if block_days=6
     if "rules" in cfg and "E_G" in cfg["rules"]:
         block_days = int(cfg["rules"]["E_G"].get("block_days", 0) or 0)
@@ -3171,20 +3660,77 @@ def solve_with_ortools(
                         pre_solve_warnings.append(
                             f"Festivi quota {doc}: richiesti {q} ma solo {len(vars_)} slot disponibili."
                         )
-    # Soft balance festivi — minimizza il massimo carico tra i medici del pool
-    # senza quota fissa (evita Crea=3, Trio=0 ecc.)
+    # Soft balance festivi — bilancia D+E e H+I insieme.
+    # Le domeniche/festivi diurni vengono percepiti come un unico carico: non
+    # basta bilanciare D/E separatamente da H/I.
     if "rules" in cfg and "Festivi" in cfg["rules"]:
         try:
             rFest = cfg["rules"]["Festivi"]
-            fest_pool_raw = [norm_name(d) for d in (rFest.get("pool") or [])
-                             if norm_name(d) in doctors and norm_name(d) != "Recupero"]
-            fest_fixed = {norm_name(k) for k in (rFest.get("quotas") or {}).keys()}
-            balance_pool = [d for d in fest_pool_raw if d not in fest_fixed]
             festivo_slots_all = [s for s in slots if s.rule_tag in ("Festivo_DE", "Festivo_HI")]
-            fest_bal_w = int(rFest.get("balance_weight") or 500)
+            balance_pool = sorted({
+                doc
+                for s in festivo_slots_all
+                for doc in (s.allowed or [])
+                if doc in doctors and doc != "Recupero"
+            })
+            fest_bal_w = int(
+                rFest.get("sunday_de_hi_balance_penalty")
+                or rFest.get("festivi_diurni_spread_penalty")
+                or 25_000_000
+            )
             if balance_pool and festivo_slots_all:
+                fest_quota_penalty = int(rFest.get("festivi_diurni_quota_penalty") or 250_000_000)
+                fest_concentration_penalty = int(rFest.get("festivi_diurni_concentration_penalty") or 90_000_000)
+                fest_fixed_docs = {norm_name(k) for k in (rFest.get("quotas") or {}).keys()}
+                free_fest_docs = [d for d in balance_pool if d not in fest_fixed_docs]
+                if fest_quota_penalty > 0 and free_fest_docs:
+                    fixed_total = sum(
+                        _monthly_target_for_period(int(v), norm_name(doc), "Festivi")
+                        for doc, v in (rFest.get("quotas") or {}).items()
+                        if norm_name(doc) in doctors
+                    )
+                    free_total = max(0, len(festivo_slots_all) - fixed_total)
+                    n_free = len(free_fest_docs)
+                    min_per = free_total // n_free
+                    remainder = free_total - min_per * n_free
+                    max_per = min_per + (1 if remainder > 0 else 0)
+                    for d in free_fest_docs:
+                        vars_d = [
+                            x[(s.slot_id, d)]
+                            for s in festivo_slots_all
+                            if (s.slot_id, d) in x
+                        ]
+                        if not vars_d:
+                            continue
+                        prior_fest = _prior_count(d, "Festivi")
+                        total_upper = len(vars_d) + prior_fest
+                        if fest_concentration_penalty > 0:
+                            fest_cnt = model.NewIntVar(0, total_upper, f"fest_cnt_{hash(d)%10**6}")
+                            model.Add(fest_cnt == sum(vars_d) + prior_fest)
+                            for threshold in range(2, total_upper + 1):
+                                over_threshold = model.NewIntVar(
+                                    0,
+                                    total_upper,
+                                    f"fest_conc_{threshold}_{hash(d)%10**6}",
+                                )
+                                model.Add(over_threshold >= fest_cnt - (threshold - 1))
+                                model.Add(over_threshold >= 0)
+                                extra_obj.append(fest_concentration_penalty * threshold * over_threshold)
+                        cur_min = max(0, min_per - prior_fest)
+                        cur_max = max(0, max_per - prior_fest)
+                        cur_sum = sum(vars_d)
+                        if cur_min > 0:
+                            under = model.NewIntVar(0, len(vars_d), f"fest_under_{hash(d)%10**6}")
+                            model.Add(under >= cur_min - cur_sum)
+                            model.Add(under >= 0)
+                            extra_obj.append(fest_quota_penalty * under)
+                        over = model.NewIntVar(0, len(vars_d), f"fest_over_{hash(d)%10**6}")
+                        model.Add(over >= cur_sum - cur_max)
+                        model.Add(over >= 0)
+                        extra_obj.append(fest_quota_penalty * over)
+
                 max_prior_fest = max((_prior_count(d, "Festivi") for d in balance_pool), default=0)
-                max_fest = model.NewIntVar(0, len(festivo_slots_all) + max_prior_fest, "max_fest_load")
+                fest_loads = []
                 for d in balance_pool:
                     vars_d = [x[(s.slot_id, d)] for s in festivo_slots_all
                               if (s.slot_id, d) in x]
@@ -3194,8 +3740,15 @@ def solve_with_ortools(
                     load_d = model.NewIntVar(0, len(festivo_slots_all) + prior_fest,
                                             f"fest_load_{hash(d) % 10**6}")
                     model.Add(load_d == sum(vars_d) + prior_fest)
-                    model.Add(load_d <= max_fest)
-                extra_obj.append(fest_bal_w * max_fest)
+                    fest_loads.append(load_d)
+                if len(fest_loads) > 1:
+                    max_fest = model.NewIntVar(0, len(festivo_slots_all) + max_prior_fest, "max_fest_load")
+                    min_fest = model.NewIntVar(0, len(festivo_slots_all) + max_prior_fest, "min_fest_load")
+                    diff_fest = model.NewIntVar(0, len(festivo_slots_all) + max_prior_fest, "diff_fest_load")
+                    model.AddMaxEquality(max_fest, fest_loads)
+                    model.AddMinEquality(min_fest, fest_loads)
+                    model.Add(diff_fest == max_fest - min_fest)
+                    extra_obj.append(fest_bal_w * diff_fest)
         except Exception:
             pass
     # Soft: alcuni medici devono preferibilmente avere almeno N notti weekend (sab/dom)
@@ -3271,6 +3824,8 @@ def solve_with_ortools(
                 # max_per = min_per se il resto è 0, altrimenti min_per+1
                 max_per = min_per + (1 if remainder > 0 else 0)
                 max_per = max(max_per, 0)  # sicurezza: mai negativo
+                free_quota_penalty = int(rJ.get("free_night_quota_penalty", 30_000_000) or 0)
+                free_spread_penalty = int(rJ.get("free_night_spread_penalty", 20_000_000) or 0)
 
                 for doc in free_docs:
                     vars_ = [night_var_by_day_doc.get((d.date, doc)) for d in days
@@ -3279,13 +3834,22 @@ def solve_with_ortools(
                         prior_j = _prior_count(doc, "J")
                         cur_min = max(0, min_per - prior_j)
                         cur_max = max(0, max_per - prior_j)
-                        if cur_min > 0:
-                            model.Add(sum(vars_) >= cur_min)   # HARD: minimo residuo
-                        model.Add(sum(vars_) <= cur_max)   # HARD: massimo residuo
+                        cur_sum = sum(vars_)
+                        if free_quota_penalty > 0:
+                            if cur_min > 0:
+                                under_free = model.NewIntVar(0, len(vars_), f"j_free_under_{hash(doc)%10**6}")
+                                model.Add(under_free >= cur_min - cur_sum)
+                                model.Add(under_free >= 0)
+                                extra_obj.append(free_quota_penalty * under_free)
+                            over_free = model.NewIntVar(0, len(vars_), f"j_free_over_{hash(doc)%10**6}")
+                            model.Add(over_free >= cur_sum - cur_max)
+                            model.Add(over_free >= 0)
+                            extra_obj.append(free_quota_penalty * over_free)
 
-                # Soft balance: minimizza la differenza max-min tra i medici liberi
-                # per distribuire equamente il "resto"
-                if remainder > 0 and len(free_docs) > 1:
+                # Soft balance: minimizza la differenza max-min tra i medici liberi.
+                # Deve avere un peso reale: con pesi bassi il solver può accettare
+                # distribuzioni 3/3/1/1 pur di ottimizzare dettagli secondari.
+                if free_spread_penalty > 0 and len(free_docs) > 1:
                     cnt_vars = []
                     for doc in free_docs:
                         vars_ = [night_var_by_day_doc.get((d.date, doc)) for d in days
@@ -3301,15 +3865,50 @@ def solve_with_ortools(
                         model.AddMinEquality(min_cnt, cnt_vars)
                         diff_cnt = model.NewIntVar(0, month_free_total, "night_diff_free")
                         model.Add(diff_cnt == max_cnt - min_cnt)
-                        extra_obj.append(200 * diff_cnt)
+                        extra_obj.append(free_spread_penalty * diff_cnt)
 
-        # Weekend nights: cap hard per-dottore = ceil(totale_weekend / n_pool)
-        # + soft spread per equidistribuzione.
+        # Weekday J balance: separate from weekend nights. The total J balance
+        # alone can hide an uneven split between Mon-Fri nights and Sat/Sun.
+        weekday_spread_penalty = int(rJ.get("weekday_night_spread_penalty", 25_000_000) or 0)
+        if weekday_spread_penalty > 0:
+            weekday_cnt_vars = []
+            max_prior_weekday = max((_prior_j_weekday_count(doc) for doc in night_pool), default=0)
+            weekday_upper = sum(1 for day in days if not _day_is_j_festive(day)) + max_prior_weekday
+            for doc in sorted(night_pool):
+                weekday_vars = []
+                for day in days:
+                    if not _day_is_j_festive(day):
+                        v = night_var_by_day_doc.get((day.date, doc))
+                        if v is not None:
+                            weekday_vars.append(v)
+                if not weekday_vars:
+                    continue
+                prior_weekday_doc = _prior_j_weekday_count(doc)
+                weekday_cnt = model.NewIntVar(
+                    0,
+                    len(weekday_vars) + prior_weekday_doc,
+                    f"weekday_j_{hash(doc)%10**6}",
+                )
+                model.Add(weekday_cnt == sum(weekday_vars) + prior_weekday_doc)
+                weekday_cnt_vars.append(weekday_cnt)
+            if len(weekday_cnt_vars) > 1:
+                weekday_max = model.NewIntVar(0, max(weekday_upper, 1), "weekday_j_max")
+                weekday_min = model.NewIntVar(0, max(weekday_upper, 1), "weekday_j_min")
+                weekday_diff = model.NewIntVar(0, max(weekday_upper, 1), "weekday_j_diff")
+                model.AddMaxEquality(weekday_max, weekday_cnt_vars)
+                model.AddMinEquality(weekday_min, weekday_cnt_vars)
+                model.Add(weekday_diff == weekday_max - weekday_min)
+                extra_obj.append(weekday_spread_penalty * weekday_diff)
+
+        # Weekend nights: the generic fair-share cap must be SOFT. In vacation
+        # periods it is common that the only available Sunday-night candidates
+        # already have one weekend night; leaving J blank is worse than breaking
+        # the generic cap. Explicit per-doctor caps above (e.g. Zito) remain hard.
         _j_wex = {norm_name(d) for d in (rJ.get("weekend_excluded_doctors") or ["Calabrò"])}
         weekend_docs = night_pool - _j_wex
         import math as _math
         total_we_nights = sum(
-            1 for day in days if day.dow in ["Sat", "Sun"]
+            1 for day in days if _day_is_j_festive(day)
             if any(night_var_by_day_doc.get((day.date, doc)) is not None for doc in weekend_docs)
         )
         prior_we_nights = sum(_prior_j_weekend_count(doc) for doc in weekend_docs)
@@ -3317,11 +3916,13 @@ def solve_with_ortools(
         n_we_docs = len(weekend_docs)
         we_hard_cap = _math.ceil(month_we_nights / n_we_docs) if n_we_docs > 0 else 1
         we_soft_target = (month_we_nights // n_we_docs) if n_we_docs > 0 else 1
+        we_cap_penalty = int(rJ.get("weekend_night_cap_penalty", 30_000_000) or 0)
+        we_spread_penalty = int(rJ.get("weekend_night_spread_penalty", 30_000_000) or 0)
         we_cnt_vars = []
         for doc in sorted(weekend_docs):
             we_vars = []
             for day in days:
-                if day.dow in ["Sat", "Sun"]:
+                if _day_is_j_festive(day):
                     v = night_var_by_day_doc.get((day.date, doc))
                     if v is not None:
                         we_vars.append(v)
@@ -3329,23 +3930,309 @@ def solve_with_ortools(
                 prior_we_doc = _prior_j_weekend_count(doc)
                 we_cnt = model.NewIntVar(0, len(we_vars) + prior_we_doc, f"we_night_{hash(doc)%10**6}")
                 model.Add(we_cnt == sum(we_vars) + prior_we_doc)
-                model.Add(we_cnt <= we_hard_cap)
+                if we_cap_penalty > 0:
+                    over_cap = model.NewIntVar(0, len(we_vars) + prior_we_doc, f"we_over_cap_{hash(doc)%10**6}")
+                    model.Add(over_cap >= we_cnt - we_hard_cap)
+                    model.Add(over_cap >= 0)
+                    extra_obj.append(we_cap_penalty * over_cap)
                 we_cnt_vars.append(we_cnt)
                 if we_hard_cap > we_soft_target:
                     over_tgt = model.NewIntVar(0, len(we_vars) + prior_we_doc, f"we_over_tgt_{hash(doc)%10**6}")
                     model.Add(over_tgt >= we_cnt - we_soft_target)
                     model.Add(over_tgt >= 0)
-                    extra_obj.append(5000 * over_tgt)
+                    extra_obj.append(max(we_spread_penalty // 4, 1) * over_tgt)
         if we_cnt_vars:
-            we_max = model.NewIntVar(0, 10, "we_night_max")
+            we_upper = max(month_we_nights, 1)
+            we_max = model.NewIntVar(0, we_upper, "we_night_max")
             model.AddMaxEquality(we_max, we_cnt_vars)
-            extra_obj.append(500 * we_max)
             if len(we_cnt_vars) > 1:
-                we_min = model.NewIntVar(0, 10, "we_night_min")
+                we_min = model.NewIntVar(0, we_upper, "we_night_min")
                 model.AddMinEquality(we_min, we_cnt_vars)
-                we_diff = model.NewIntVar(0, 10, "we_night_diff")
+                we_diff = model.NewIntVar(0, we_upper, "we_night_diff")
                 model.Add(we_diff == we_max - we_min)
-                extra_obj.append(8000 * we_diff)
+                if we_spread_penalty > 0:
+                    extra_obj.append(we_spread_penalty * we_diff)
+
+        # Per-doctor J type split: for the same total number of J, prefer a
+        # balanced split between feriali and festive/weekend nights. This makes
+        # 2+2 better than 3+1 when both are feasible.
+        type_split_penalty = int(rJ.get("j_type_split_penalty", 35_000_000) or 0)
+        if type_split_penalty > 0:
+            for doc in sorted(weekend_docs):
+                weekday_vars = []
+                festive_vars = []
+                for day in days:
+                    v = night_var_by_day_doc.get((day.date, doc))
+                    if v is None:
+                        continue
+                    if _day_is_j_festive(day):
+                        festive_vars.append(v)
+                    else:
+                        weekday_vars.append(v)
+                if not weekday_vars or not festive_vars:
+                    continue
+                prior_weekday_doc = _prior_j_weekday_count(doc)
+                prior_festive_doc = _prior_j_weekend_count(doc)
+                weekday_cnt = model.NewIntVar(
+                    0,
+                    len(weekday_vars) + prior_weekday_doc,
+                    f"jtype_weekday_{hash(doc)%10**6}",
+                )
+                festive_cnt = model.NewIntVar(
+                    0,
+                    len(festive_vars) + prior_festive_doc,
+                    f"jtype_festive_{hash(doc)%10**6}",
+                )
+                split_upper = len(weekday_vars) + len(festive_vars) + prior_weekday_doc + prior_festive_doc
+                split_diff = model.NewIntVar(0, max(split_upper, 1), f"jtype_diff_{hash(doc)%10**6}")
+                model.Add(weekday_cnt == sum(weekday_vars) + prior_weekday_doc)
+                model.Add(festive_cnt == sum(festive_vars) + prior_festive_doc)
+                model.Add(split_diff >= weekday_cnt - festive_cnt)
+                model.Add(split_diff >= festive_cnt - weekday_cnt)
+                extra_obj.append(type_split_penalty * split_diff)
+
+        # Festive burden coupling: festive J and festive day duties (D/E, H/I)
+        # should be distributed as alternatives, not stacked on the same doctor
+        # while another eligible doctor gets none of either.
+        festive_day_slots = [s for s in slots if s.rule_tag in ("Festivo_DE", "Festivo_HI")]
+        festive_coupling_penalty = int(rJ.get("festive_j_day_overlap_penalty", 80_000_000) or 0)
+        festive_total_spread_penalty = int(rJ.get("festive_total_spread_penalty", 35_000_000) or 0)
+        festive_same_type_repeat_penalty = int(rJ.get("festive_same_type_repeat_penalty", 45_000_000) or 0)
+        festive_day_consecutive_penalty = int(rJ.get("festive_day_consecutive_penalty", 70_000_000) or 0)
+        heavy_quota_penalty = int(rJ.get("heavy_festive_quota_penalty", 300_000_000) or 0)
+        heavy_concentration_penalty = int(rJ.get("heavy_festive_concentration_penalty", 120_000_000) or 0)
+        heavy_consecutive_penalty = int(rJ.get("heavy_festive_consecutive_penalty", 220_000_000) or 0)
+        heavy_unused_penalty = int(rJ.get("heavy_festive_unused_candidate_penalty", 450_000_000) or 0)
+        if festive_day_slots and (
+            festive_coupling_penalty > 0
+            or festive_total_spread_penalty > 0
+            or festive_same_type_repeat_penalty > 0
+            or festive_day_consecutive_penalty > 0
+            or heavy_quota_penalty > 0
+            or heavy_concentration_penalty > 0
+            or heavy_consecutive_penalty > 0
+            or heavy_unused_penalty > 0
+        ):
+            festive_docs = sorted({
+                doc
+                for s in festive_day_slots
+                for doc in (s.allowed or [])
+                if doc in doctors and doc != "Recupero"
+            } | set(weekend_docs))
+            festive_load_vars = []
+            festive_load_by_doc = {}
+            festive_used_by_doc = {}
+            max_prior_festive_load = 0
+            for doc in festive_docs:
+                j_vars = []
+                for day in days:
+                    if _day_is_j_festive(day):
+                        v = night_var_by_day_doc.get((day.date, doc))
+                        if v is not None:
+                            j_vars.append(v)
+                day_vars = [
+                    x[(s.slot_id, doc)]
+                    for s in festive_day_slots
+                    if (s.slot_id, doc) in x
+                ]
+                prior_festive_j = _prior_j_weekend_count(doc)
+                prior_festive_day = _prior_count(doc, "Festivi")
+                if not j_vars and not day_vars and (prior_festive_j + prior_festive_day) <= 0:
+                    continue
+
+                j_cnt = model.NewIntVar(
+                    0,
+                    len(j_vars) + prior_festive_j,
+                    f"fest_j_cnt_{hash(doc)%10**6}",
+                )
+                day_cnt = model.NewIntVar(
+                    0,
+                    len(day_vars) + prior_festive_day,
+                    f"fest_day_cnt_{hash(doc)%10**6}",
+                )
+                model.Add(j_cnt == (sum(j_vars) if j_vars else 0) + prior_festive_j)
+                model.Add(day_cnt == (sum(day_vars) if day_vars else 0) + prior_festive_day)
+
+                load_upper = len(j_vars) + len(day_vars) + prior_festive_j + prior_festive_day
+                load = model.NewIntVar(0, max(load_upper, 1), f"fest_total_load_{hash(doc)%10**6}")
+                model.Add(load == j_cnt + day_cnt)
+                festive_load_vars.append(load)
+                festive_load_by_doc[doc] = load
+                max_prior_festive_load = max(max_prior_festive_load, prior_festive_j + prior_festive_day)
+
+                if heavy_unused_penalty > 0:
+                    used = model.NewBoolVar(f"heavy_fest_used_{hash(doc)%10**6}")
+                    unused = model.NewBoolVar(f"heavy_fest_unused_{hash(doc)%10**6}")
+                    model.Add(load >= 1).OnlyEnforceIf(used)
+                    model.Add(load == 0).OnlyEnforceIf(used.Not())
+                    model.Add(used + unused == 1)
+                    festive_used_by_doc[doc] = used
+                    term = heavy_unused_penalty * unused
+                    extra_obj.append(term)
+                    heavy_priority_terms.append(term)
+
+                if heavy_concentration_penalty > 0:
+                    for threshold in range(2, max(load_upper, 1) + 1):
+                        over_threshold = model.NewIntVar(
+                            0,
+                            max(load_upper, 1),
+                            f"heavy_fest_conc_{threshold}_{hash(doc)%10**6}",
+                        )
+                        model.Add(over_threshold >= load - (threshold - 1))
+                        model.Add(over_threshold >= 0)
+                        term = heavy_concentration_penalty * threshold * over_threshold
+                        extra_obj.append(term)
+                        heavy_priority_terms.append(term)
+
+                if festive_coupling_penalty > 0 and (j_vars or prior_festive_j > 0) and (day_vars or prior_festive_day > 0):
+                    has_j = model.NewBoolVar(f"has_fest_j_{hash(doc)%10**6}")
+                    has_day = model.NewBoolVar(f"has_fest_day_{hash(doc)%10**6}")
+                    both = model.NewBoolVar(f"has_fest_both_{hash(doc)%10**6}")
+                    model.Add(j_cnt >= 1).OnlyEnforceIf(has_j)
+                    model.Add(j_cnt == 0).OnlyEnforceIf(has_j.Not())
+                    model.Add(day_cnt >= 1).OnlyEnforceIf(has_day)
+                    model.Add(day_cnt == 0).OnlyEnforceIf(has_day.Not())
+                    model.Add(both <= has_j)
+                    model.Add(both <= has_day)
+                    model.Add(both >= has_j + has_day - 1)
+                    extra_obj.append(festive_coupling_penalty * both)
+
+                if festive_same_type_repeat_penalty > 0:
+                    for tag in ("Festivo_DE", "Festivo_HI"):
+                        tag_vars = [
+                            x[(s.slot_id, doc)]
+                            for s in festive_day_slots
+                            if s.rule_tag == tag and (s.slot_id, doc) in x
+                        ]
+                        if len(tag_vars) < 2:
+                            continue
+                        tag_cnt = model.NewIntVar(0, len(tag_vars), f"fest_{tag}_cnt_{hash(doc)%10**6}")
+                        tag_repeat = model.NewIntVar(0, len(tag_vars), f"fest_{tag}_repeat_{hash(doc)%10**6}")
+                        model.Add(tag_cnt == sum(tag_vars))
+                        model.Add(tag_repeat >= tag_cnt - 1)
+                        model.Add(tag_repeat >= 0)
+                        extra_obj.append(festive_same_type_repeat_penalty * tag_repeat)
+
+                if festive_day_consecutive_penalty > 0:
+                    festive_dates = sorted({s.day.date for s in festive_day_slots})
+                    day_flags = []
+                    for fdate in festive_dates:
+                        date_vars = [
+                            x[(s.slot_id, doc)]
+                            for s in festive_day_slots
+                            if s.day.date == fdate and (s.slot_id, doc) in x
+                        ]
+                        if not date_vars:
+                            continue
+                        has_festive_day = model.NewBoolVar(f"has_fest_day_{fdate}_{hash(doc)%10**6}")
+                        model.AddMaxEquality(has_festive_day, date_vars)
+                        day_flags.append((fdate, has_festive_day))
+                    for (_date_a, flag_a), (_date_b, flag_b) in zip(day_flags, day_flags[1:]):
+                        consecutive = model.NewBoolVar(
+                            f"fest_day_consec_{_date_a}_{_date_b}_{hash(doc)%10**6}"
+                        )
+                        model.Add(consecutive <= flag_a)
+                        model.Add(consecutive <= flag_b)
+                        model.Add(consecutive >= flag_a + flag_b - 1)
+                        extra_obj.append(festive_day_consecutive_penalty * consecutive)
+
+                if heavy_consecutive_penalty > 0:
+                    heavy_dates = sorted(
+                        {s.day.date for s in festive_day_slots}
+                        | {day.date for day in days if _day_is_j_festive(day)}
+                    )
+                    heavy_flags = []
+                    for hdate in heavy_dates:
+                        date_vars = [
+                            x[(s.slot_id, doc)]
+                            for s in festive_day_slots
+                            if s.day.date == hdate and (s.slot_id, doc) in x
+                        ]
+                        jv = night_var_by_day_doc.get((hdate, doc))
+                        if jv is not None:
+                            date_vars.append(jv)
+                        if not date_vars:
+                            continue
+                        has_heavy = model.NewBoolVar(f"has_heavy_fest_{hdate}_{hash(doc)%10**6}")
+                        model.AddMaxEquality(has_heavy, date_vars)
+                        heavy_flags.append((hdate, has_heavy))
+                    for (_date_a, flag_a), (_date_b, flag_b) in zip(heavy_flags, heavy_flags[1:]):
+                        consecutive = model.NewBoolVar(
+                            f"heavy_fest_consec_{_date_a}_{_date_b}_{hash(doc)%10**6}"
+                        )
+                        model.Add(consecutive <= flag_a)
+                        model.Add(consecutive <= flag_b)
+                        model.Add(consecutive >= flag_a + flag_b - 1)
+                        term = heavy_consecutive_penalty * consecutive
+                        extra_obj.append(term)
+                        heavy_priority_terms.append(term)
+
+            if festive_total_spread_penalty > 0 and len(festive_load_vars) > 1:
+                load_upper = len(festive_day_slots) + total_we_nights + max_prior_festive_load
+                fest_total_max = model.NewIntVar(0, max(load_upper, 1), "fest_total_max")
+                fest_total_min = model.NewIntVar(0, max(load_upper, 1), "fest_total_min")
+                fest_total_diff = model.NewIntVar(0, max(load_upper, 1), "fest_total_diff")
+                model.AddMaxEquality(fest_total_max, festive_load_vars)
+                model.AddMinEquality(fest_total_min, festive_load_vars)
+                model.Add(fest_total_diff == fest_total_max - fest_total_min)
+                extra_obj.append(festive_total_spread_penalty * fest_total_diff)
+            if heavy_quota_penalty > 0 and festive_load_by_doc:
+                heavy_prior_total = sum(
+                    _prior_j_weekend_count(doc) + _prior_count(doc, "Festivi")
+                    for doc in festive_load_by_doc
+                )
+                heavy_total = len(festive_day_slots) + total_we_nights + heavy_prior_total
+                n_heavy_docs = len(festive_load_by_doc)
+                min_per = heavy_total // n_heavy_docs
+                remainder = heavy_total - min_per * n_heavy_docs
+                max_per = min_per + (1 if remainder > 0 else 0)
+                for doc, load in festive_load_by_doc.items():
+                    prior_load = _prior_j_weekend_count(doc) + _prior_count(doc, "Festivi")
+                    cur_min = max(0, min_per - prior_load)
+                    cur_max = max(0, max_per - prior_load)
+                    # `load` already includes prior_load, so compare against period totals.
+                    if min_per > 0:
+                        under = model.NewIntVar(0, heavy_total, f"heavy_fest_under_{hash(doc)%10**6}")
+                        model.Add(under >= min_per - load)
+                        model.Add(under >= 0)
+                        term = heavy_quota_penalty * under
+                        extra_obj.append(term)
+                        heavy_priority_terms.append(term)
+                    over = model.NewIntVar(0, heavy_total, f"heavy_fest_over_{hash(doc)%10**6}")
+                    model.Add(over >= load - max_per)
+                    model.Add(over >= 0)
+                    term = heavy_quota_penalty * over
+                    extra_obj.append(term)
+                    heavy_priority_terms.append(term)
+        # Sunday J balance: Sundays are the weekend nights users inspect most.
+        # Keep this separate from the generic Sat/Sun spread so a doctor does
+        # not get repeated Sundays while another eligible doctor remains at 0.
+        sunday_balance_penalty = int(rJ.get("sunday_night_balance_penalty", 40_000_000) or 0)
+        if sunday_balance_penalty > 0:
+            sunday_cnt_vars = []
+            max_prior_sun = max((_prior_j_sunday_count(doc) for doc in weekend_docs), default=0)
+            sunday_upper = sum(1 for day in days if day.dow == "Sun") + max_prior_sun
+            for doc in sorted(weekend_docs):
+                sun_vars = []
+                for day in days:
+                    if day.dow == "Sun":
+                        v = night_var_by_day_doc.get((day.date, doc))
+                        if v is not None:
+                            sun_vars.append(v)
+                if not sun_vars:
+                    continue
+                prior_sun_doc = _prior_j_sunday_count(doc)
+                sun_cnt = model.NewIntVar(0, len(sun_vars) + prior_sun_doc, f"sun_j_{hash(doc)%10**6}")
+                model.Add(sun_cnt == sum(sun_vars) + prior_sun_doc)
+                sunday_cnt_vars.append(sun_cnt)
+            if len(sunday_cnt_vars) > 1:
+                sun_max = model.NewIntVar(0, max(sunday_upper, 1), "sun_j_max")
+                sun_min = model.NewIntVar(0, max(sunday_upper, 1), "sun_j_min")
+                sun_diff = model.NewIntVar(0, max(sunday_upper, 1), "sun_j_diff")
+                model.AddMaxEquality(sun_max, sunday_cnt_vars)
+                model.AddMinEquality(sun_min, sunday_cnt_vars)
+                model.Add(sun_diff == sun_max - sun_min)
+                extra_obj.append(sunday_balance_penalty * sun_diff)
     # H monthly quotas Mon-Fri
     # MODIFICA 1: Grimaldi e Calabrò sono esclusi da H; ignora eventuali quote riferite a loro
     _h_df_pair = {norm_name("Grimaldi"), norm_name("Calabrò")}
@@ -3998,10 +4885,50 @@ def solve_with_ortools(
                     model.Add(_fcnt == sum(_fvars))
                     extra_obj.append(HIST_DEHI_PENALTY * _hist_dehi * _fcnt)
 
-    model.Minimize(sum(objective_terms + extra_obj))
+    full_objective_terms = objective_terms + extra_obj + coverage_obj_terms
+    coverage_expr = sum(coverage_obj_terms) if coverage_obj_terms else 0
+
     solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = 30.0
+    solver.parameters.max_time_in_seconds = float((gc.get("solver_max_time_seconds", 60.0) or 60.0))
     solver.parameters.num_search_workers = 1
+    coverage_status = None
+    coverage_cost = None
+    heavy_status = None
+    heavy_cost = None
+
+    def _status_name(st) -> Optional[str]:
+        if st is None:
+            return None
+        try:
+            return solver.StatusName(st)
+        except Exception:
+            return str(st)
+
+    if coverage_obj_terms:
+        model.Minimize(coverage_expr)
+        coverage_status = solver.Solve(model)
+        if coverage_status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            coverage_cost = int(solver.Value(coverage_expr))
+            if coverage_status == cp_model.OPTIMAL:
+                model.Add(coverage_expr == coverage_cost)
+            else:
+                # If coverage proof times out, keep the best found coverage as
+                # a non-worsening ceiling. Otherwise the final objective can
+                # drift back to a schedule with more blanks.
+                model.Add(coverage_expr <= coverage_cost)
+
+    heavy_priority_expr = sum(heavy_priority_terms) if heavy_priority_terms else 0
+    if heavy_priority_terms:
+        model.Minimize(heavy_priority_expr)
+        heavy_status = solver.Solve(model)
+        if heavy_status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            heavy_cost = int(solver.Value(heavy_priority_expr))
+            if heavy_status == cp_model.OPTIMAL:
+                model.Add(heavy_priority_expr == heavy_cost)
+            else:
+                model.Add(heavy_priority_expr <= heavy_cost)
+
+    model.Minimize(sum(full_objective_terms))
     status = solver.Solve(model)
     if status not in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
         # ── Diagnostica: retry senza vincoli di quota hard per identificare la causa ──
@@ -4287,6 +5214,13 @@ def solve_with_ortools(
         "status": "OPTIMAL" if status == cp_model.OPTIMAL else "FEASIBLE",
         "objective": solver.ObjectiveValue(),
         "warnings": pre_solve_warnings,
+        "lexicographic": {
+            "coverage_status": _status_name(coverage_status),
+            "coverage_cost": coverage_cost,
+            "heavy_status": _status_name(heavy_status),
+            "heavy_cost": heavy_cost,
+            "final_status": _status_name(status),
+        },
     }
     if has_forced_blanks:
         stats["status"] = "PARTIAL"
@@ -5068,6 +6002,16 @@ def write_solver_log(out_path: Path, stats: Dict) -> Optional[Path]:
         lines.append(f"Output: {out_path}")
         lines.append(f"Generated: {dt.datetime.now().isoformat(timespec='seconds')}")
         lines.append(f"Overall status: {stats.get('status')}")
+        second_look = stats.get("heavy_festive_second_look") or []
+        if second_look:
+            lines.append("")
+            lines.append("Second-look pesanti festivi/weekend applicato:")
+            for item in second_look:
+                cols = "+".join(item.get("columns") or [])
+                lines.append(
+                    f"  - {item.get('date')} {cols}: "
+                    f"{item.get('from')} -> {item.get('to')}"
+                )
         months = stats.get("months") or {}
         for mk in sorted(months.keys()):
             sm = months.get(mk) or {}
@@ -5076,10 +6020,24 @@ def write_solver_log(out_path: Path, stats: Dict) -> Optional[Path]:
             lines.append(f"status: {sm.get('status')}")
             if "objective" in sm:
                 lines.append(f"objective: {sm.get('objective')}")
+            lex = sm.get("lexicographic") or {}
+            if lex:
+                lines.append(
+                    "lexicographic: "
+                    f"coverage={lex.get('coverage_status')} cost={lex.get('coverage_cost')}; "
+                    f"heavy={lex.get('heavy_status')} cost={lex.get('heavy_cost')}; "
+                    f"final={lex.get('final_status')}"
+                )
             if sm.get("autorelax"):
                 lines.append(f"autorelax: {sm.get('autorelax')}")
             if sm.get("solver_error"):
                 lines.append(f"solver_error: {sm.get('solver_error')}")
+            j_overrides = sm.get("j_blank_week_overrides") or {}
+            if j_overrides:
+                lines.append("Eccezioni J applicate dalla GUI:")
+                for wk_key in sorted(j_overrides.keys()):
+                    vals = j_overrides.get(wk_key) or []
+                    lines.append(f"  - {wk_key}: {', '.join(vals) if vals else 'nessuna J vuota'}")
             # Slot obbligatori lasciati bianchi (PARTIAL)
             fbs = sm.get("forced_blank_slots") or []
             if fbs:
@@ -5192,6 +6150,8 @@ def solve_across_months(
         local[docn][day].update(shifts)
 
     generated_carryover_by_month: Dict[str, dict] = {}
+    running_prior_usage = deepcopy(prior_usage or {})
+    running_prior_usage.setdefault("period_counts", {})
 
     for _month_idx, (yy, mm) in enumerate(month_keys):
         days_m = [d for d in days if (d.date.year, d.date.month) == (yy, mm)]
@@ -5285,7 +6245,7 @@ def solve_across_months(
                 availability_preferences=avail_m,
                 unav_map=local_unav,
                 historical_stats=historical_stats,
-                prior_usage=prior_usage,
+                prior_usage=running_prior_usage,
             )
         except Exception as e:
             # MODIFICA 2: niente Greedy. Se OR-Tools fallisce, propaga l'errore
@@ -5301,6 +6261,25 @@ def solve_across_months(
         # Track where relief valves / blanks were used (useful for logs)
         try:
             stats_m = dict(stats_m or {})
+            if j_blank_week_overrides:
+                month_j_overrides: Dict[str, List[str]] = {}
+                month_iso_weeks = {d.date.isocalendar()[:2] for d in days_m}
+                for wk_key, vals in (j_blank_week_overrides or {}).items():
+                    wk_tuple = None
+                    try:
+                        parts = str(wk_key).split("-W")
+                        wk_tuple = (int(parts[0]), int(parts[1]))
+                    except Exception:
+                        pass
+                    vals_in_month = []
+                    for raw in vals or []:
+                        dd = _parse_iso_date(str(raw))
+                        if dd is not None and dd.year == yy and dd.month == mm:
+                            vals_in_month.append(dd.isoformat())
+                    if vals_in_month or wk_tuple in month_iso_weeks:
+                        month_j_overrides[str(wk_key)] = sorted(vals_in_month)
+                if month_j_overrides:
+                    stats_m["j_blank_week_overrides"] = month_j_overrides
             stats_m["relief_used"] = build_relief_log(days_m, slots_m, assignment_m)
         except Exception:
             pass
@@ -5314,6 +6293,25 @@ def solve_across_months(
         slots_all.extend(slots_m)
         assignment_all.update(assignment_m)
         stats_all["months"][mk] = stats_m
+        try:
+            period_counts = running_prior_usage.setdefault("period_counts", {})
+            for s in slots_m:
+                doc = assignment_m.get(s.slot_id)
+                if not doc:
+                    continue
+                doc_n = norm_name(doc)
+                if s.rule_tag in ("Festivo_DE", "Festivo_HI"):
+                    period_counts.setdefault(doc_n, {})
+                    period_counts[doc_n]["Festivi"] = int(period_counts[doc_n].get("Festivi", 0) or 0) + 1
+                elif s.columns == ["J"]:
+                    period_counts.setdefault(doc_n, {})
+                    period_counts[doc_n]["J"] = int(period_counts[doc_n].get("J", 0) or 0) + 1
+                    if is_festivo(s.day, cfg) or s.day.date.weekday() == 5:
+                        period_counts[doc_n]["J_FESTIVI"] = int(
+                            period_counts[doc_n].get("J_FESTIVI", 0) or 0
+                        ) + 1
+        except Exception:
+            pass
         st = str(stats_m.get("status", "")).upper()
         if "INFEAS" in st:
             stats_all["status"] = "INFEASIBLE"
@@ -5349,6 +6347,31 @@ def solve_across_months(
                         "blocked_day1_doctors": [last_night_doc] if last_night_doc else [],
                         "recent_nights_by_doc": recent_by_doc,
                     }
+
+    try:
+        repaired_assignment, swaps = _repair_heavy_festive_assignments(
+            cfg,
+            slots_all,
+            assignment_all,
+            fixed_assignments=fixed_assignments,
+        )
+        if swaps:
+            assignment_all = repaired_assignment
+            stats_all["heavy_festive_second_look"] = swaps
+            slots_by_month: Dict[str, List[Slot]] = defaultdict(list)
+            days_by_month: Dict[str, List[DayRow]] = defaultdict(list)
+            for s in slots_all:
+                slots_by_month[_norm_key(s.day.date.year, s.day.date.month)].append(s)
+            for d in days:
+                days_by_month[_norm_key(d.date.year, d.date.month)].append(d)
+            for mk, sm in (stats_all.get("months") or {}).items():
+                try:
+                    sm["relief_used"] = build_relief_log(days_by_month.get(mk, []), slots_by_month.get(mk, []), assignment_all)
+                    sm["daily_diagnostic"] = build_daily_diagnostic(days_by_month.get(mk, []), slots_by_month.get(mk, []), assignment_all, cfg)
+                except Exception:
+                    pass
+    except Exception as e:
+        stats_all.setdefault("warnings", []).append(f"second-look pesanti non applicato: {e}")
 
     return slots_all, assignment_all, stats_all
 
