@@ -41,13 +41,21 @@ streamlit run streamlit_app.py
 python turni_generator.py --gui
 ```
 
+**Test** (unittest, include un end-to-end dell'app con `streamlit.testing.v1.AppTest` e GitHub/SMTP finti):
+```bash
+.venv/bin/python -m unittest discover -s tests -t .
+```
+
 ## Architettura
 
 | File | Ruolo |
 |---|---|
 | `turni_generator.py` | Solver principale: legge template Excel + regole YAML + indisponibilità, costruisce il modello CP-SAT, scrive l'Excel di output |
 | `streamlit_app.py` | UI Streamlit: login medico (PIN + OTP email), inserimento indisponibilità, generazione turni per admin |
-| `unavailability_store.py` | Funzioni pure per il datastore CSV: parsing, filtraggio, deduplicazione, serializzazione |
+| `unavailability_store.py` | Funzioni pure per il datastore CSV: parsing, filtraggio, deduplicazione, serializzazione, firme mese e `save_doctor_months()` (salvataggio con controllo conflitti) |
+| `unavailability_drafts.py` | Bozze delle modifiche non ancora inviate (autosalvataggio), ripresa al login, riepilogo bozze pendenti per l'admin |
+| `unavailability_receipts.py` | Mail di resoconto dopo ogni salvataggio (contenuto dai dati riletti dal server, niente note) |
+| `generation_memory.py` | Memoria delle generazioni salvate: uso pregresso per periodi parziali, carryover notti, storico provvisorio |
 | `github_utils.py` | Lettura/scrittura via GitHub Contents API (archivia il CSV delle indisponibilità su una repo privata) |
 | `xlsx_utils.py` | Genera il file XLSX delle indisponibilità dal CSV usando `unavailability_template.xlsx` |
 | `Regole_Turni.yml` | File regole mensile: definizione colonne, pool medici, quote, vincoli, penalità |
@@ -60,6 +68,28 @@ python turni_generator.py --gui
 2. Le **indisponibilità** sono archiviate come CSV per-medico in una repo GitHub privata, uno per file (`data/unavailability/unavail_<slug>.csv`, vedi `_doctor_unavail_path()` in `streamlit_app.py`) — evita conflitti di scrittura concorrente tra medici. `load_store_from_github()` aggrega tutti i file della cartella; se la cartella è vuota usa come fallback legacy il vecchio file unico `data/unavailability_store.csv` (path configurabile via `github_unavailability.path`). Stessa logica a coppie per le **preferenze di disponibilità** (`data/availability/avail_<slug>.csv`, aggregate da `load_avail_store_from_github()`, fallback legacy `data/availability_store.csv`). I medici inseriscono indisponibilità/preferenze via Streamlit; l'admin può anche caricare un file Excel.
 3. Il **solver** (`turni_generator.py`) traduce regole + indisponibilità in variabili e vincoli CP-SAT, risolve e compila il workbook openpyxl.
 4. **Streamlit** (`streamlit_app.py`) orchestra il tutto per gli utenti web: gestisce auth PIN, OTP via SMTP, lease di sessione per medico (kick-out in caso di login concorrente) e invoca `turni_generator` in-process.
+
+### Salvataggio indisponibilità (regole da non rompere)
+
+- **Salva sostituisce l'intero mese**, quindi ogni editor memorizza la firma del mese da cui è partito (`<rows_key>__base_sig`). `ustore.save_doctor_months()` rifiuta con `MonthConflictError` se nel frattempo il mese è cambiato sul server (altro dispositivo, scheda vecchia, lease scaduto): **mai** riapplicare l'editor su dati freschi dopo un 409. Il lease di sessione da solo NON basta (commit 67c3aca aveva tolto il controllo: una scheda vecchia cancellava in silenzio giorni salvati altrove).
+- Mese già uguale all'editor → nessuna scrittura (il doppio tap è un no-op).
+- **Bozze**: le modifiche non inviate vengono scritte in `data/unavailability_drafts/draft_<slug>.json` (al cambio, max ogni 15 s, più un fragment `run_every=20`). Al login la bozza viene ripresa (se costruita sui dati attuali) o proposta (se il server è cambiato). Il solver usa SOLO i CSV ufficiali; il pannello "Genera turni" mostra le bozze non inviate.
+- Dopo un salvataggio riuscito, baseline/audit/pulizia bozza/mail passano da un'outbox in `session_state` (`_process_unav_outbox`): un doppio tap che interrompe l'esecuzione non fa perdere audit o mail.
+- **Mail di resoconto** al medico (email da `doctor_contacts.yml`) + copie da impostazioni (`receipt_cc_emails`, modificabile nel pannello admin, default `utic@polime.it`) e da secrets `[notifications] receipt_cc`. Best-effort: se fallisce il salvataggio resta valido.
+- Nessuna riga precompilata negli editor: una riga "1 del mese, Mattina" lasciata lì veniva salvata come indisponibilità vera.
+
+### GitHub: limiti, concorrenza, coda (regole da non rompere)
+
+Tutta l'app usa **un solo token**: 5.000 richieste/ora, 80 scritture/minuto e 500/ora (limiti secondari), risposte 403/429 con `retry-after` quando si sforano.
+
+- **Ogni chiamata passa da `github_utils`** (`request()`): retry su rate limit / 5xx / errori di rete rispettando `retry-after` e `x-ratelimit-reset` entro `max_wait`; oltre, `GithubUnavailable(retry_at)` e fail-fast fino a quel momento. Le **scritture sono serializzate nel processo** e distanziate di `WRITE_MIN_INTERVAL` (≤60/min): i commit dell'app non si pestano mai sul branch. 409/422 (sha) e 403 di permessi NON vengono ritentati lì.
+- **Lease di sessione in memoria** (`session_leases.py`, `st.cache_resource`): niente più commit a ogni login/heartbeat né lettura ogni 5 s. L'heartbeat (`touch`) non ruba mai il lease a una sessione più recente.
+- **Letture in cache**: impostazioni (60 s), pool config per l'elenco medici (120 s), record PIN (5 min), contatti (120 s); ognuna si svuota al salvataggio corrispondente.
+- **Bozze in memoria** (`MemoryDraftStore`), copia su GitHub al massimo ogni 120 s come *merge* per mese (un load fallito non può cancellare una bozza su GitHub).
+- **Salva** passa da `SaveQueue.save_or_enqueue()` (`unavailability_service.py`): se GitHub resta indisponibile oltre ~25 s il salvataggio va **in coda** (persistita in `/tmp`), un worker thread lo completa e solo allora manda la mail. Salvataggi dell'app e del worker per lo stesso medico sono serializzati (lock per medico). Un mese in coda (o appena registrato dalla coda) da **un'altra sessione** è un conflitto: mai sovrascritto. Se in background risulta un conflitto, non viene applicato e parte una mail "NON salvate" al medico + copie.
+- Il worker non chiama mai `st.*`: tutto ciò che gli serve è in `ServiceConfig` catturata nel thread della pagina.
+- Audit idempotente: una risposta persa dopo il commit + retry non duplica la riga.
+- Test: `tests/fakes.py` simula GitHub a livello HTTP con disturbi (rate limit, 5xx, timeout anche dopo il commit); `tests/test_unavailability_service.py` fa salvataggi concorrenti di 25 medici sotto disturbi; `tests/test_streamlit_unavailability_flow.py` esegue l'app vera con e senza disturbi (AppTest non regge sessioni in thread paralleli: la concorrenza vera è coperta dai test del servizio).
 
 ### Secrets Streamlit (necessari per il funzionamento completo)
 
@@ -79,6 +109,10 @@ path   = "data/unavailability_store.csv"          # fallback legacy, solo se per
 per_doctor_dir = "data/unavailability"             # default, opzionale se non rinominata
 availability_path = "data/availability_store.csv"  # fallback legacy preferenze
 per_doctor_avail_dir = "data/availability"         # default, opzionale se non rinominata
+drafts_dir = "data/unavailability_drafts"          # default, bozze non inviate
+
+[notifications]
+receipt_cc = ["..."]                               # opzionale: copie extra della mail di resoconto
 
 [smtp]
 host     = "smtp.gmail.com"
@@ -91,7 +125,7 @@ starttls = true
 
 ### IMPORTANTE: `num_search_workers` del CP-SAT solver
 
-In `solve_with_ortools()` (`turni_generator.py`) tutte le istanze di `cp_model.CpSolver()` usano `num_search_workers = 1`. **Non aumentare questo valore.** Con `num_search_workers > 1` (testato con 8) il `max_time_in_seconds` non viene rispettato: il `solver.Solve()` può bloccarsi indefinitamente (osservato >125s contro un limite di 30s), sia in locale (macOS arm64) sia su Streamlit Cloud — bug della ricerca multi-thread di OR-Tools su questa combinazione di piattaforma/versione (`ortools` 9.15.6755), non un problema delle regole/vincoli. Con `num_search_workers = 1` il timeout è sempre rispettato (verificato: 30.0s esatti). Se si aggiorna `ortools` in futuro e si vuole ritentare il multi-thread, verificare prima con un test di carico che il timeout venga rispettato in modo affidabile.
+In `solve_with_ortools()` (`turni_generator.py`) tutte le istanze di `cp_model.CpSolver()` — **comprese quelle del retry diagnostico** — usano `num_search_workers = 1` (fino a settembre 2026 cinque solver diagnostici non lo avevano e un mese infeasible bloccava la generazione per sempre; test `test_diagnostic_retry_terminates_when_only_night_constraints_conflict`). **Non aumentare questo valore.** Con `num_search_workers > 1` (testato con 8) il `max_time_in_seconds` non viene rispettato: il `solver.Solve()` può bloccarsi indefinitamente (osservato >125s contro un limite di 30s), sia in locale (macOS arm64) sia su Streamlit Cloud — bug della ricerca multi-thread di OR-Tools su questa combinazione di piattaforma/versione (`ortools` 9.15.6755), non un problema delle regole/vincoli. Con `num_search_workers = 1` il timeout è sempre rispettato (verificato: 30.0s esatti). Se si aggiorna `ortools` in futuro e si vuole ritentare il multi-thread, verificare prima con un test di carico che il timeout venga rispettato in modo affidabile.
 
 ### Keep-alive (GitHub Actions)
 
