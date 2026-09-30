@@ -10,7 +10,9 @@ import hashlib
 import io
 import json
 import smtplib
+import tempfile
 import unittest
+import uuid
 from pathlib import Path
 from unittest import mock
 
@@ -46,6 +48,40 @@ def official_rows(gh):
     return list(csv.DictReader(io.StringIO(text))) if text.strip() else []
 
 
+class FakeCalendar:
+    """Stand-in for the calendar component, same protocol as the JS one:
+    every edit is resent until the page acknowledges it in the payload."""
+
+    def __init__(self):
+        self.cid = uuid.uuid4().hex
+        self.seq = 0
+        self.edits = []
+        self.nav = None
+        self.last = None
+
+    def __call__(self, payload=None, key=None, default=None):
+        self.last = payload
+        ack = (payload or {}).get("ack") or {}
+        if ack.get("cid") == self.cid:
+            self.edits = [e for e in self.edits if e["seq"] > ack["seq"]]
+            if self.nav and self.nav["seq"] <= ack["seq"]:
+                self.nav = None
+        if not self.seq:
+            return default
+        return {"cid": self.cid, "edits": list(self.edits), "nav": self.nav}
+
+    def send(self, event: dict) -> None:
+        self.seq += 1
+        self.edits.append({**event, "seq": self.seq, "year": self.last["year"], "month": self.last["month"]})
+
+    def go_to(self, year: int, month: int) -> None:
+        self.seq += 1
+        self.nav = {"seq": self.seq, "year": year, "month": month}
+
+    def day(self, n: int) -> dict:
+        return self.last["days"][n - 1]
+
+
 class DoctorUnavailabilityFlowTests(unittest.TestCase):
     chaos = 0.0
 
@@ -55,8 +91,9 @@ class DoctorUnavailabilityFlowTests(unittest.TestCase):
         st.cache_data.clear()
         st.cache_resource.clear()
         github_utils.reset_state()
-        self.addCleanup(usvc.stop_all_workers)
         self.addCleanup(github_utils.reset_state)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
         self.clock = FakeClock()
         self.gh = FakeGithubHTTP(chaos=self.chaos)
         salt = b"0123456789abcdef"
@@ -76,22 +113,32 @@ class DoctorUnavailabilityFlowTests(unittest.TestCase):
             "receipt_cc_emails:\n- admin@example.org\n- utic@polime.it\n",
         )
         FakeSMTP.sent = []
+        self.calendar = FakeCalendar()
         patches = [
             mock.patch.object(github_utils, "_http", self.gh),
             mock.patch.object(github_utils, "_now", self.clock.now),
             mock.patch.object(github_utils, "_sleep", self.clock.sleep),
             mock.patch.object(smtplib, "SMTP", FakeSMTP),
-            mock.patch.dict(os.environ, {"TURNI_QUEUE_WORKER_INTERVAL": "0.05"}),
+            mock.patch("streamlit.components.v1.declare_component", lambda *a, **k: self.calendar),
+            mock.patch.dict(os.environ, {
+                "TURNI_QUEUE_WORKER_INTERVAL": "0.05",
+                "TURNI_QUEUE_PERSIST_PATH": os.path.join(self.tmp.name, "queue.json"),
+            }),
         ]
         for p in patches:
             p.start()
             self.addCleanup(p.stop)
+        # Registrato dopo le patch → eseguito prima di rimuoverle: il worker non
+        # deve mai girare con rete/orologio veri.
+        self.addCleanup(usvc.stop_all_workers)
 
-    def new_session(self) -> AppTest:
+    def new_session(self, smtp: bool = True) -> AppTest:
         at = AppTest.from_file(APP, default_timeout=60)
         at.secrets["auth"] = {"admin_pin": "9999"}
         at.secrets["github_unavailability"] = {"token": "t", "owner": "o", "repo": "r", "branch": "main"}
-        at.secrets["smtp"] = {"host": "smtp.test", "port": 587, "from": "turni@example.org", "starttls": False}
+        if smtp:
+            at.secrets["smtp"] = {"host": "smtp.test", "port": 587, "from": "turni@example.org", "starttls": False,
+                                  "username": "turni@example.org", "password": "segreta"}
         at.run()
         self.assertFalse(at.exception, at.exception)
         return at
@@ -109,6 +156,11 @@ class DoctorUnavailabilityFlowTests(unittest.TestCase):
         at.date_input(key=f"{ROWS_KEY}__ferie_start").set_value(start)
         at.date_input(key=f"{ROWS_KEY}__ferie_end").set_value(end)
         at.button(key=f"{ROWS_KEY}__ferie_add").click()
+        at.run()
+        self.assertFalse(at.exception, at.exception)
+
+    def tap(self, at: AppTest, event: dict) -> None:
+        self.calendar.send(event)
         at.run()
         self.assertFalse(at.exception, at.exception)
 
@@ -151,6 +203,58 @@ class DoctorUnavailabilityFlowTests(unittest.TestCase):
         self.assertEqual(self.gh.files[OFFICIAL][1], official_sha_before)
         self.assertEqual(len(FakeSMTP.sent), 1)
         self.assertIn("Nessuna modifica da inviare", self.page_text(at))
+
+    def test_calendar_day_with_several_shifts_is_saved(self):
+        at = self.login(self.new_session())
+        self.tap(at, {"type": "set_day", "kind": "unav", "day": 15, "shifts": ["Pomeriggio", "Notte"], "note": "corso"})
+
+        self.assertTrue(self.calendar.day(15)["pending"])
+        self.assertEqual(official_rows(self.gh), [])
+        self.save(at)
+
+        saved = sorted((r["date"], r["shift"], r["note"]) for r in official_rows(self.gh))
+        self.assertEqual(saved, [(day(15).isoformat(), "Notte", "corso"), (day(15).isoformat(), "Pomeriggio", "corso")])
+        self.assertFalse(self.calendar.day(15)["pending"])
+
+    def test_two_quick_taps_in_one_rerun_are_both_kept(self):
+        at = self.login(self.new_session())
+        self.calendar.send({"type": "set_day", "kind": "unav", "day": 3, "shifts": ["Mattina"]})
+        self.calendar.send({"type": "set_day", "kind": "unav", "day": 4, "shifts": ["Notte"]})
+        at.run()
+
+        self.assertEqual(self.calendar.day(3)["unav"], [{"shift": "Mattina", "note": ""}])
+        self.assertEqual(self.calendar.day(4)["unav"], [{"shift": "Notte", "note": ""}])
+        self.assertEqual(self.calendar.edits, [], "tutti confermati")
+
+    def test_month_arrows_move_between_months(self):
+        at = self.login(self.new_session())
+        nxt = (day(1) + dt.timedelta(days=32)).replace(day=1)
+
+        self.calendar.go_to(nxt.year, nxt.month)
+        at.run()
+
+        self.assertEqual((self.calendar.last["year"], self.calendar.last["month"]), (nxt.year, nxt.month))
+        self.assertIsNone(self.calendar.nav)
+
+    def test_new_calendar_edit_hides_the_previous_success_message(self):
+        at = self.login(self.new_session())
+        self.tap(at, {"type": "set_day", "kind": "unav", "day": 15, "shifts": ["Notte"]})
+        self.save(at)
+        self.assertIn("verificato sul server", self.page_text(at))
+
+        self.tap(at, {"type": "set_day", "kind": "unav", "day": 16, "shifts": ["Mattina"]})
+
+        self.assertNotIn("verificato sul server", self.page_text(at))
+        self.assertIn("Modifiche NON inviate", self.page_text(at))
+
+    def test_long_ferie_replace_other_shifts_of_those_days(self):
+        at = self.login(self.new_session())
+        self.tap(at, {"type": "set_day", "kind": "unav", "day": 8, "shifts": ["Mattina"]})
+
+        self.add_ferie(at, day(7), day(9))
+
+        self.assertEqual(self.calendar.day(8)["unav"], [{"shift": "Ferie", "note": ""}])
+        self.assertEqual(len(at.session_state[ROWS_KEY]), 3)
 
     def test_unsent_draft_is_restored_at_next_login(self):
         at = self.login(self.new_session())
@@ -265,8 +369,8 @@ class DoctorUnavailabilityFlowTests(unittest.TestCase):
         self.assertEqual(len(FakeSMTP.sent), len(self.DOCTORS))
         self.assertEqual(self.gh.max_put_in_flight, 1)
 
-    def admin_session(self, section: str) -> AppTest:
-        at = self.new_session()
+    def admin_session(self, section: str, smtp: bool = True) -> AppTest:
+        at = self.new_session(smtp=smtp)
         at.sidebar.radio[0].set_value(section)
         at.run()
         at.text_input[0].input("9999")
@@ -300,6 +404,34 @@ class DoctorUnavailabilityFlowTests(unittest.TestCase):
             "admin@example.org\nutic@polime.it",
         )
 
+
+    def test_admin_sees_the_one_email_setup_used_for_pin_codes_and_receipts(self):
+        admin = self.admin_session("🔧 Admin — Configurazione")
+
+        text = self.page_text(admin)
+        self.assertIn("smtp.test:587", text)
+        self.assertIn("turni@example.org", text)
+        self.assertNotIn("segreta", text + "".join(str(m.value) for m in list(admin.markdown) + list(admin.caption)))
+        usage = " ".join(str(c.value) for c in admin.caption)
+        self.assertIn("codici PIN", usage)
+        self.assertIn("resoconto", usage)
+
+    def test_admin_can_send_a_test_email(self):
+        admin = self.admin_session("🔧 Admin — Configurazione")
+
+        admin.text_input(key="smtp_test_to").input("prova@example.org")
+        admin.button(key="smtp_test_send").click()
+        admin.run()
+
+        self.assertFalse(admin.exception, admin.exception)
+        self.assertEqual([m["To"] for m in FakeSMTP.sent], ["prova@example.org"])
+        self.assertIn("Mail di prova inviata", self.page_text(admin))
+
+    def test_admin_is_told_when_email_is_not_configured(self):
+        admin = self.admin_session("🔧 Admin — Configurazione", smtp=False)
+
+        self.assertIn("Email non configurata", self.page_text(admin))
+        self.assertTrue(admin.button(key="smtp_test_send").disabled)
 
 
 class DoctorUnavailabilityFlowUnderChaosTests(DoctorUnavailabilityFlowTests):

@@ -2,3 +2,4 @@ streamlit_app.py
 .streamlit/secrets.toml
 .venv/
 __pycache__/
+.local_sandbox/

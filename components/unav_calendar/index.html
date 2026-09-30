@@ -1,0 +1,381 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Calendario indisponibilità</title>
+<link href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700&family=Fraunces:opsz,wght@9..144,600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --ground: #F4F1EA; --surface: #FFFFFF; --line: #E2DCCF; --line-strong: #C9C1B1;
+    --ink: #1B1A17; --muted: #5F5A50; --weekend: #ECE6DA;
+    --unav-full: #1D4E7A; --unav-part: #CFE0EF; --unav-part-ink: #10324F;
+    --pref: #F7DEC8; --pref-ink: #6B2E07; --danger: #9B1C1C; --danger-bg: #F6DCD8;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: 'Figtree', system-ui, sans-serif; color: var(--ink); background: transparent; }
+  .wrap { background: var(--ground); border-radius: 18px; padding: 14px 14px 16px; display: flex; flex-direction: column; gap: 12px; }
+  .toggle { background: #E6E0D3; border-radius: 14px; padding: 4px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px; }
+  .toggle button { border: 0; border-radius: 10px; min-height: 44px; font: inherit; font-size: 15px; font-weight: 600; background: transparent; color: var(--ink); cursor: pointer; }
+  .toggle button[aria-pressed="true"] { background: var(--ink); color: #FFFFFF; }
+  .month { display: flex; align-items: center; justify-content: space-between; }
+  .month h2 { margin: 0; font-family: 'Fraunces', Georgia, serif; font-size: 22px; font-weight: 600; }
+  .icon-btn { border: 0; background: transparent; color: var(--muted); font: inherit; font-size: 24px; min-width: 44px; min-height: 44px; cursor: pointer; border-radius: 10px; }
+  .icon-btn:disabled { opacity: 0.3; cursor: default; }
+  .grid { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 6px; }
+  .dow { font-size: 12px; font-weight: 600; color: var(--muted); text-align: center; }
+  .dow.we { color: #8A4B14; }
+  .cell { height: 54px; border-radius: 12px; border: 1px solid var(--line); background: var(--surface); color: var(--ink);
+          display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; padding: 0 2px;
+          font: inherit; cursor: pointer; min-width: 0; }
+  .cell.we { background: var(--weekend); }
+  .cell .n { font-size: 15px; font-weight: 600; line-height: 1; }
+  .cell .c { font-size: 10.5px; font-weight: 700; line-height: 1; min-height: 11px; white-space: nowrap; overflow: hidden; max-width: 100%; }
+  .cell.full { background: var(--unav-full); color: #FFFFFF; border-color: var(--unav-full); }
+  .cell.part { background: var(--unav-part); color: var(--unav-part-ink); border-color: #B5CCE0; }
+  .cell.pref { background: var(--pref); color: var(--pref-ink); border-color: #E9C3A2; }
+  .cell.pending { border: 2px dashed var(--ink); }
+  .cell.sel { outline: 3px solid #E0A106; outline-offset: 1px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip { font-size: 12px; font-weight: 600; padding: 5px 9px; border-radius: 999px; background: var(--surface); color: #3F3B34; border: 1px solid var(--line); }
+  .chip.over { background: var(--danger-bg); color: var(--danger); border-color: #E7B7B0; }
+  .legend { font-size: 12px; line-height: 1.5; color: var(--muted); }
+  .panel { background: var(--surface); border: 1px solid var(--line); border-radius: 16px; padding: 14px; display: flex; flex-direction: column; gap: 10px; }
+  .panel-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+  .panel-head h3 { margin: 0; font-family: 'Fraunces', Georgia, serif; font-size: 20px; font-weight: 600; }
+  .panel-head span { font-size: 13px; font-weight: 600; color: var(--muted); }
+  .hint { font-size: 12.5px; color: var(--muted); }
+  .opts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .opt { border: 1px solid var(--line-strong); background: var(--surface); color: var(--ink); border-radius: 12px; min-height: 48px; font: inherit; font-size: 15px; font-weight: 600; cursor: pointer; }
+  .opt[aria-pressed="true"] { border: 2px solid var(--unav-full); background: var(--unav-part); color: var(--unav-part-ink); }
+  .opt[aria-pressed="true"]::before { content: "✓ "; }
+  .grid.loading, .month.loading { opacity: 0.45; pointer-events: none; }
+  .prio { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
+  .prio button { border: 1px solid var(--line-strong); background: var(--surface); border-radius: 10px; min-height: 44px; font: inherit; font-size: 14px; font-weight: 600; cursor: pointer; color: var(--ink); }
+  .prio button[aria-pressed="true"] { background: var(--pref); border: 2px solid #C27A3C; color: var(--pref-ink); }
+  label.note { display: flex; flex-direction: column; gap: 4px; font-size: 13px; font-weight: 600; color: #3F3B34; }
+  label.note input { font: inherit; font-size: 15px; font-weight: 400; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--line-strong); min-height: 44px; }
+  .range { display: flex; gap: 6px; overflow-x: auto; padding-bottom: 2px; }
+  .range button { flex-shrink: 0; border: 1px solid var(--line-strong); background: var(--surface); color: var(--ink); border-radius: 10px; padding: 6px 10px; min-width: 56px; min-height: 44px; font: inherit; font-size: 13px; font-weight: 600; cursor: pointer; }
+  .actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .actions button { border-radius: 12px; min-height: 48px; font: inherit; font-size: 15px; font-weight: 700; cursor: pointer; }
+  .done { border: 0; background: var(--unav-full); color: #FFFFFF; }
+  .remove { border: 1px solid var(--danger); background: var(--surface); color: var(--danger); }
+  .remove:disabled { opacity: 0.4; cursor: default; }
+  button:focus-visible, input:focus-visible { outline: 3px solid #E0A106; outline-offset: 2px; }
+</style>
+</head>
+<body>
+<div class="wrap" id="root"></div>
+<script>
+(function () {
+  var DOW_SHORT = ['L', 'M', 'M', 'G', 'V', 'S', 'D'];
+  var DOW = ['lun', 'mar', 'mer', 'gio', 'ven', 'sab', 'dom'];
+  var MONTHS = ['gennaio', 'febbraio', 'marzo', 'aprile', 'maggio', 'giugno', 'luglio', 'agosto', 'settembre', 'ottobre', 'novembre', 'dicembre'];
+  var CODE = { 'Mattina': 'M', 'Pomeriggio': 'P', 'Notte': 'N', 'Diurno': 'D', 'Tutto il giorno': 'T', 'Ferie': 'F' };
+  var FULL = { 'Tutto il giorno': true, 'Ferie': true, 'Diurno': true };
+  var EXCLUSIVE = { 'Tutto il giorno': true, 'Ferie': true };
+  var PRIORITY_LABEL = { alta: 'Alta', media: 'Media', bassa: 'Bassa' };
+
+  var payload = null;
+  var view = [];          // payload days + edits not yet confirmed by the page
+  var ui = { mode: 'unav', day: null, picked: [], note: '', priority: 'media', monthKey: null };
+
+  // Every tap becomes an edit that is resent until the page confirms it
+  // (payload.ack): two quick taps merged into one Streamlit rerun are both kept.
+  var cid = Math.random().toString(36).slice(2) + Date.now().toString(36);
+  var seq = 0;
+  var edits = [];
+  var nav = null;
+  var noteTimer = null;
+
+  function send(type, data) {
+    window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type: type }, data || {}), '*');
+  }
+  function pushValue() {
+    send('streamlit:setComponentValue', { value: { cid: cid, edits: edits, nav: nav }, dataType: 'json' });
+  }
+  function addEdit(event) {
+    seq += 1;
+    event.seq = seq;
+    event.year = payload.year;
+    event.month = payload.month;
+    if (event.type === 'set_day') {
+      // only the latest state of a day matters: older unconfirmed ones can go
+      edits = edits.filter(function (e) { return !(e.type === 'set_day' && e.day === event.day && e.kind === event.kind); });
+    }
+    edits.push(event);
+    pushValue();
+    render();
+  }
+  function goMonth(delta) {
+    flushNote();
+    var y = payload.year, m = payload.month + delta;
+    if (m < 1) { m = 12; y -= 1; }
+    if (m > 12) { m = 1; y += 1; }
+    seq += 1;
+    nav = { seq: seq, year: y, month: m };
+    ui.day = null;
+    pushValue();
+    render();
+  }
+
+  // Height of the content only: the document's scrollHeight includes the iframe
+  // itself, so every resize event would grow the frame without end.
+  var lastHeight = 0;
+  function resize() {
+    var height = Math.ceil(document.getElementById('root').getBoundingClientRect().height) + 4;
+    if (height === lastHeight) return;
+    lastHeight = height;
+    send('streamlit:setFrameHeight', { height: height });
+  }
+  function el(tag, attrs, children) {
+    var node = document.createElement(tag);
+    Object.keys(attrs || {}).forEach(function (k) {
+      if (k === 'text') node.textContent = attrs[k];
+      else if (k === 'onclick') node.addEventListener('click', attrs[k]);
+      else if (k === 'oninput') node.addEventListener('input', attrs[k]);
+      else if (attrs[k] !== null && attrs[k] !== undefined && attrs[k] !== false) node.setAttribute(k, attrs[k] === true ? '' : attrs[k]);
+    });
+    (children || []).forEach(function (c) { if (c) node.appendChild(c); });
+    return node;
+  }
+
+  function order(list) {
+    return function (a, b) { return list.indexOf(a.shift) - list.indexOf(b.shift); };
+  }
+  function buildView() {
+    view = payload.days.map(function (d) {
+      return { day: d.day, weekday: d.weekday, festive: d.festive, unav: d.unav.slice(), pref: d.pref.slice(), pending: d.pending };
+    });
+    edits.forEach(function (e) {
+      if (e.year !== payload.year || e.month !== payload.month) return;
+      if (e.type === 'set_day' && view[e.day - 1]) {
+        var info = view[e.day - 1];
+        info[e.kind] = e.shifts.map(function (sh) {
+          return e.kind === 'unav' ? { shift: sh, note: e.note } : { shift: sh, note: e.note, priority: e.priority };
+        }).sort(order(e.kind === 'unav' ? payload.unav_shifts : payload.pref_shifts));
+        info.pending = true;
+      } else if (e.type === 'range') {
+        for (var d = e.from; d <= e.to; d++) {
+          if (view[d - 1]) { view[d - 1].unav = [{ shift: 'Ferie', note: '' }]; view[d - 1].pending = true; }
+        }
+      }
+    });
+  }
+  function dayInfo(d) { return view[d - 1]; }
+
+  function openDay(d) {
+    flushNote();
+    if (ui.day === d) { ui.day = null; render(); return; }
+    var info = dayInfo(d);
+    var items = ui.mode === 'unav' ? info.unav : info.pref;
+    ui.day = d;
+    ui.picked = items.map(function (it) { return it.shift; });
+    ui.note = items.length ? (items[0].note || '') : '';
+    ui.priority = (ui.mode === 'pref' && items.length) ? (items[0].priority || 'media') : 'media';
+    render();
+  }
+  function commitDay() {
+    if (!ui.day) return;
+    addEdit({ type: 'set_day', kind: ui.mode, day: ui.day, shifts: ui.picked.slice(), note: ui.note, priority: ui.priority });
+  }
+  function togglePick(shift) {
+    var on = ui.picked.indexOf(shift) >= 0;
+    if (on) {
+      ui.picked = ui.picked.filter(function (s) { return s !== shift; });
+    } else if (ui.mode === 'unav' && EXCLUSIVE[shift]) {
+      ui.picked = [shift];
+    } else {
+      ui.picked = ui.picked.filter(function (s) { return !(ui.mode === 'unav' && EXCLUSIVE[s]); }).concat([shift]);
+    }
+    if (!ui.picked.length) ui.note = '';
+    commitDay();
+  }
+  function flushNote() {
+    if (!noteTimer) return;
+    clearTimeout(noteTimer);
+    noteTimer = null;
+    if (ui.day && ui.picked.length) commitDay();
+  }
+  function closePanel() { flushNote(); ui.day = null; render(); }
+
+  function counters() {
+    var counts = {}, sat = 0, sun = 0, pref = {};
+    view.forEach(function (info) {
+      if (info.unav.length) {
+        info.unav.forEach(function (it) { counts[it.shift] = (counts[it.shift] || 0) + 1; });
+        if (info.weekday === 5) sat++;
+        if (info.weekday === 6) sun++;
+      }
+      info.pref.forEach(function (it) { pref[it.shift] = (pref[it.shift] || 0) + 1; });
+    });
+    var lim = payload.limits || {};
+    var per = lim.per_shift || 6, we = lim.weekend || 4, pper = lim.pref_per_shift || 6;
+    var out = [];
+    if (ui.mode === 'unav') {
+      ['Mattina', 'Pomeriggio', 'Notte', 'Diurno', 'Tutto il giorno'].forEach(function (sh) {
+        var n = counts[sh] || 0;
+        out.push({ text: sh + ' ' + n + '/' + per, over: n > per });
+      });
+      out.push({ text: 'Ferie ' + (counts['Ferie'] || 0), over: false });
+      out.push({ text: 'Sabati ' + sat + '/' + we, over: sat > we });
+      out.push({ text: 'Domeniche ' + sun + '/' + we, over: sun > we });
+    } else {
+      payload.pref_shifts.forEach(function (sh) {
+        var n = pref[sh] || 0;
+        out.push({ text: 'Preferirei ' + sh.toLowerCase() + ' ' + n + '/' + pper, over: n > pper });
+      });
+    }
+    return out;
+  }
+
+  function cell(info) {
+    var cls = ['cell'];
+    var code = '';
+    var label = info.day + ' ' + MONTHS[payload.month - 1];
+    if (info.weekday >= 5 || info.festive) cls.push('we');
+    if (info.unav.length) {
+      code = info.unav.map(function (it) { return CODE[it.shift] || '?'; }).join(' ');
+      cls.push(info.unav.some(function (it) { return FULL[it.shift]; }) ? 'full' : 'part');
+      label += ', non posso: ' + info.unav.map(function (it) { return it.shift; }).join(', ');
+    } else if (info.pref.length) {
+      code = info.pref.map(function (it) { return '+' + (CODE[it.shift] || '?'); }).join(' ');
+      cls.push('pref');
+      label += ', preferirei: ' + info.pref.map(function (it) { return it.shift; }).join(', ');
+    } else {
+      label += ', libero';
+    }
+    if (info.unav.length && info.pref.length) code += ' +';
+    if (info.pending) { cls.push('pending'); label += ', non ancora inviato'; }
+    if (ui.day === info.day) cls.push('sel');
+    return el('button', { type: 'button', 'class': cls.join(' '), 'aria-label': label, onclick: function () { openDay(info.day); } }, [
+      el('span', { 'class': 'n', text: String(info.day) }),
+      el('span', { 'class': 'c', text: code })
+    ]);
+  }
+
+  function panel() {
+    var d = ui.day;
+    var info = dayInfo(d);
+    var shifts = ui.mode === 'unav' ? payload.unav_shifts : payload.pref_shifts;
+    var weekday = (payload.first_weekday + d - 1) % 7;
+    var current = ui.mode === 'unav' ? info.unav : info.pref;
+    var children = [
+      el('div', { 'class': 'panel-head' }, [
+        el('h3', { text: DOW[weekday] + ' ' + d + ' ' + MONTHS[payload.month - 1] }),
+        el('span', { text: ui.mode === 'unav' ? 'Non posso' : 'Preferirei' })
+      ]),
+      el('div', { 'class': 'hint', text: ui.mode === 'unav'
+        ? 'Tocca tutte le fasce che ti servono (es. Pomeriggio e Notte): si segnano subito. Tutto il giorno e Ferie valgono da sole.'
+        : 'Tocca tutte le fasce che preferiresti: si segnano subito. Il software proverà a rispettarle, senza garanzia.' }),
+      el('div', { 'class': 'opts' }, shifts.map(function (sh) {
+        return el('button', { type: 'button', 'class': 'opt', 'aria-pressed': ui.picked.indexOf(sh) >= 0 ? 'true' : 'false',
+          text: sh, onclick: function () { togglePick(sh); } });
+      }))
+    ];
+    if (ui.mode === 'pref') {
+      children.push(el('div', { 'class': 'prio', role: 'group', 'aria-label': 'Priorità' }, ['alta', 'media', 'bassa'].map(function (p) {
+        return el('button', { type: 'button', 'aria-pressed': ui.priority === p ? 'true' : 'false', text: 'Priorità ' + PRIORITY_LABEL[p].toLowerCase(),
+          onclick: function () { ui.priority = p; if (ui.picked.length) commitDay(); else render(); } });
+      })));
+    }
+    var noteInput = el('input', { type: 'text', id: 'note', value: ui.note, maxlength: '200',
+      placeholder: ui.picked.length ? 'facoltativa' : 'scegli prima una fascia', disabled: ui.picked.length ? null : true,
+      oninput: function (e) {
+        ui.note = e.target.value;
+        if (noteTimer) clearTimeout(noteTimer);
+        noteTimer = setTimeout(function () { noteTimer = null; if (ui.picked.length) commitDay(); }, 700);
+      } });
+    children.push(el('label', { 'class': 'note' }, [document.createTextNode('Nota'), noteInput]));
+    if (ui.mode === 'unav') {
+      var last = payload.days.length;
+      var range = [];
+      for (var r = d + 1; r <= Math.min(last, d + 14); r++) {
+        (function (end) {
+          var wd = (payload.first_weekday + end - 1) % 7;
+          range.push(el('button', { type: 'button', text: DOW[wd] + ' ' + end, 'aria-label': 'Ferie dal ' + d + ' al ' + end,
+            onclick: function () { ui.day = null; addEdit({ type: 'range', from: d, to: end }); } }));
+        })(r);
+      }
+      if (range.length) {
+        children.push(el('div', { 'class': 'hint', text: 'Ferie da questo giorno fino al…' }));
+        children.push(el('div', { 'class': 'range' }, range));
+      }
+    }
+    children.push(el('div', { 'class': 'actions' }, [
+      el('button', { type: 'button', 'class': 'remove', text: 'Svuota giorno', disabled: current.length ? null : true, onclick: function () {
+        flushNote();
+        ui.picked = []; ui.note = ''; ui.priority = 'media';
+        commitDay();
+      } }),
+      el('button', { type: 'button', 'class': 'done', text: 'Fatto', onclick: closePanel })
+    ]));
+    return el('div', { 'class': 'panel', role: 'group', 'aria-label': 'Giorno ' + d }, children);
+  }
+
+  function render() {
+    var root = document.getElementById('root');
+    // keep typing in the note while the page confirms the previous tap
+    var active = document.activeElement && document.activeElement.id === 'note' ? document.activeElement : null;
+    var caret = active ? [active.selectionStart, active.selectionEnd] : null;
+    root.textContent = '';
+    if (!payload) return;
+    buildView();
+    var loading = nav !== null;
+    var navInfo = payload.nav || {};
+    root.appendChild(el('div', { 'class': 'toggle', role: 'group', 'aria-label': 'Tipo di inserimento' }, [
+      el('button', { type: 'button', 'aria-pressed': ui.mode === 'unav' ? 'true' : 'false', text: 'Non posso',
+        onclick: function () { flushNote(); ui.mode = 'unav'; ui.day = null; render(); } }),
+      el('button', { type: 'button', 'aria-pressed': ui.mode === 'pref' ? 'true' : 'false', text: 'Preferirei',
+        onclick: function () { flushNote(); ui.mode = 'pref'; ui.day = null; render(); } })
+    ]));
+    root.appendChild(el('div', { 'class': 'month' + (loading ? ' loading' : '') }, [
+      el('button', { type: 'button', 'class': 'icon-btn', 'aria-label': 'Mese precedente', text: '‹', disabled: navInfo.prev ? null : true,
+        onclick: function () { goMonth(-1); } }),
+      el('h2', { text: payload.label }),
+      el('button', { type: 'button', 'class': 'icon-btn', 'aria-label': 'Mese successivo', text: '›', disabled: navInfo.next ? null : true,
+        onclick: function () { goMonth(1); } })
+    ]));
+    root.appendChild(el('div', { 'class': 'grid', 'aria-hidden': 'true' }, DOW_SHORT.map(function (t, i) {
+      return el('div', { 'class': 'dow' + (i >= 5 ? ' we' : ''), text: t });
+    })));
+    var cells = [];
+    for (var b = 0; b < payload.first_weekday; b++) cells.push(el('div', {}));
+    view.forEach(function (info) { cells.push(cell(info)); });
+    root.appendChild(el('div', { 'class': 'grid' + (loading ? ' loading' : '') }, cells));
+    if (ui.day && !loading) root.appendChild(panel());
+    root.appendChild(el('div', { 'class': 'chips' }, counters().map(function (c) {
+      return el('span', { 'class': 'chip' + (c.over ? ' over' : ''), text: c.text });
+    })));
+    root.appendChild(el('div', { 'class': 'legend', text:
+      'Blu pieno: tutto il giorno, diurno, ferie · blu chiaro: una o più fasce · arancio con +: preferenza · bordo tratteggiato: non ancora inviato' }));
+    if (active) {
+      var input = document.getElementById('note');
+      if (input && !input.disabled) { input.focus(); input.setSelectionRange(caret[0], caret[1]); }
+    }
+    resize();
+  }
+
+  window.addEventListener('message', function (event) {
+    var data = event.data || {};
+    if (data.type !== 'streamlit:render') return;
+    var next = (data.args || {}).payload || null;
+    if (!next) return;
+    var ack = next.ack || {};
+    if (ack.cid === cid) {
+      edits = edits.filter(function (e) { return e.seq > ack.seq; });
+      if (nav && nav.seq <= ack.seq) nav = null;
+    }
+    var key = next.year + '-' + next.month;
+    if (key !== ui.monthKey) { ui.day = null; ui.monthKey = key; }
+    payload = next;
+    render();
+  });
+  window.addEventListener('resize', resize);
+  if (window.ResizeObserver) new ResizeObserver(resize).observe(document.getElementById('root'));
+  send('streamlit:componentReady', { apiVersion: 1 });
+})();
+</script>
+</body>
+</html>

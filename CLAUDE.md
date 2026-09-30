@@ -45,6 +45,12 @@ python turni_generator.py --gui
 ```bash
 .venv/bin/python -m unittest discover -s tests -t .
 ```
+Su macOS lanciarla con `caffeinate -i` davanti: se il Mac va in stop durante la suite, AppTest misura il tempo con l'orologio di sistema e al risveglio segnala "AppTest script run timed out after 60(s)" (falso blocco; verifica con `pmset -g log | grep -E " Sleep | Wake "`).
+
+**Sandbox locale** (app vera su una copia dei dati in `.local_sandbox/repo`, nessuna scrittura su GitHub, nessuna mail):
+```bash
+.venv/bin/streamlit run scripts/run_local_sandbox.py
+```
 
 ## Architettura
 
@@ -55,6 +61,7 @@ python turni_generator.py --gui
 | `unavailability_store.py` | Funzioni pure per il datastore CSV: parsing, filtraggio, deduplicazione, serializzazione, firme mese e `save_doctor_months()` (salvataggio con controllo conflitti) |
 | `unavailability_drafts.py` | Bozze delle modifiche non ancora inviate (autosalvataggio), ripresa al login, riepilogo bozze pendenti per l'admin |
 | `unavailability_receipts.py` | Mail di resoconto dopo ogni salvataggio (contenuto dai dati riletti dal server, niente note) |
+| `unavailability_calendar.py` + `components/unav_calendar/` | Calendario della pagina medico: logica pura degli eventi (`apply_event`, `calendar_payload`) + componente Streamlit in JS puro |
 | `generation_memory.py` | Memoria delle generazioni salvate: uso pregresso per periodi parziali, carryover notti, storico provvisorio |
 | `github_utils.py` | Lettura/scrittura via GitHub Contents API (archivia il CSV delle indisponibilità su una repo privata) |
 | `xlsx_utils.py` | Genera il file XLSX delle indisponibilità dal CSV usando `unavailability_template.xlsx` |
@@ -75,8 +82,10 @@ python turni_generator.py --gui
 - Mese già uguale all'editor → nessuna scrittura (il doppio tap è un no-op).
 - **Bozze**: le modifiche non inviate vengono scritte in `data/unavailability_drafts/draft_<slug>.json` (al cambio, max ogni 15 s, più un fragment `run_every=20`). Al login la bozza viene ripresa (se costruita sui dati attuali) o proposta (se il server è cambiato). Il solver usa SOLO i CSV ufficiali; il pannello "Genera turni" mostra le bozze non inviate.
 - Dopo un salvataggio riuscito, baseline/audit/pulizia bozza/mail passano da un'outbox in `session_state` (`_process_unav_outbox`): un doppio tap che interrompe l'esecuzione non fa perdere audit o mail.
+- **Email**: un'unica configurazione `[smtp]` nei Secrets per codici PIN (OTP) e resoconti; il pannello admin "📧 Email" ne mostra lo stato e manda una mail di prova. La password resta nei Secrets: il repo dati è pubblico.
 - **Mail di resoconto** al medico (email da `doctor_contacts.yml`) + copie da impostazioni (`receipt_cc_emails`, modificabile nel pannello admin, default `utic@polime.it`) e da secrets `[notifications] receipt_cc`. Best-effort: se fallisce il salvataggio resta valido.
 - Nessuna riga precompilata negli editor: una riga "1 del mese, Mattina" lasciata lì veniva salvata come indisponibilità vera.
+- **Calendario**: niente pulsante "Applica", ogni tocco su una fascia si registra subito in bozza. Il componente rinvia ogni modifica (`edits` con `seq`, più `cid` dell'istanza) finché la pagina non la conferma nel payload (`ack`, in `unav_calendar_ack::<medico>`): Streamlit può unire due tocchi rapidi in un solo rerun e nessuno dei due deve perdersi (`ucal.apply_value`). Anche "Ferie lunghe" passa dalle stesse regole (evento `range` via `_apply_calendar_edit()`), così "Ferie" e "Tutto il giorno" restano esclusive nel giorno. Nel componente l'altezza dell'iframe va misurata sul contenuto (`#root`), mai su `document.documentElement.scrollHeight`: include l'iframe stesso e cresce all'infinito. Nei test AppTest il componente è sostituito da `FakeCalendar` (patch di `declare_component`, stesso protocollo).
 
 ### GitHub: limiti, concorrenza, coda (regole da non rompere)
 
@@ -89,6 +98,7 @@ Tutta l'app usa **un solo token**: 5.000 richieste/ora, 80 scritture/minuto e 50
 - **Salva** passa da `SaveQueue.save_or_enqueue()` (`unavailability_service.py`): se GitHub resta indisponibile oltre ~25 s il salvataggio va **in coda** (persistita in `/tmp`), un worker thread lo completa e solo allora manda la mail. Salvataggi dell'app e del worker per lo stesso medico sono serializzati (lock per medico). Un mese in coda (o appena registrato dalla coda) da **un'altra sessione** è un conflitto: mai sovrascritto. Se in background risulta un conflitto, non viene applicato e parte una mail "NON salvate" al medico + copie.
 - Il worker non chiama mai `st.*`: tutto ciò che gli serve è in `ServiceConfig` catturata nel thread della pagina.
 - Audit idempotente: una risposta persa dopo il commit + retry non duplica la riga.
+- La coda persiste in `TURNI_QUEUE_PERSIST_PATH` (default `/tmp/turni_unav_save_queue.json`): test e sandbox usano un file proprio, altrimenti riprenderebbero job altrui.
 - Test: `tests/fakes.py` simula GitHub a livello HTTP con disturbi (rate limit, 5xx, timeout anche dopo il commit); `tests/test_unavailability_service.py` fa salvataggi concorrenti di 25 medici sotto disturbi; `tests/test_streamlit_unavailability_flow.py` esegue l'app vera con e senza disturbi (AppTest non regge sessioni in thread paralleli: la concorrenza vera è coperta dai test del servizio).
 
 ### Secrets Streamlit (necessari per il funzionamento completo)

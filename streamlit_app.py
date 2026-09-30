@@ -26,6 +26,8 @@ import yaml
 # Local modules
 import github_utils
 import session_leases
+import streamlit.components.v1 as components
+import unavailability_calendar as ucal
 import unavailability_drafts as udrafts
 import unavailability_service as usvc
 import unavailability_receipts as receipts
@@ -169,6 +171,10 @@ hr { margin: 0.9rem 0; }
 
 # Build / version banner
 with st.sidebar:
+    if os.environ.get("TURNI_SANDBOX"):
+        st.warning(
+            "🧪 **SANDBOX LOCALE** — copia dei dati: nessuna scrittura su GitHub, nessuna mail.",
+        )
     st.caption(f"Build: {APP_BUILD} | tg={getattr(tg, '__version__', '?')}")
     try:
         st.caption(f"tg file: {Path(tg.__file__).name}")
@@ -178,6 +184,10 @@ with st.sidebar:
 DEFAULT_RULES_PATH = Path(__file__).resolve().parent / "Regole_Turni.yml"
 DEFAULT_STYLE_TEMPLATE = Path(__file__).resolve().parent / "Style_Template.xlsx"
 DEFAULT_UNAV_TEMPLATE = Path(__file__).resolve().parent / "unavailability_template.xlsx"
+# Calendario della pagina medico (componente HTML/JS, vedi components/unav_calendar).
+_UNAV_CALENDAR = components.declare_component(
+    "unav_calendar", path=str(Path(__file__).resolve().parent / "components" / "unav_calendar")
+)
 
 # ---------------- Secrets helpers ----------------
 def _get_secret(path, default=None):
@@ -267,6 +277,47 @@ def _twilio_cfg() -> dict:
 def _email_is_configured() -> bool:
     c = _smtp_cfg()
     return bool(c.get("host") and c.get("from"))
+
+def _render_email_admin_panel() -> None:
+    """One SMTP setup (Secrets [smtp]) for PIN codes and receipts: status and test mail."""
+    c = _smtp_cfg()
+    st.caption(
+        "Una sola configurazione, usata per i codici PIN (primo accesso e recupero) "
+        "e per le mail di resoconto dopo ogni invio delle indisponibilità."
+    )
+    if _email_is_configured():
+        st.success(
+            f"Email configurata: {c.get('host')}:{c.get('port')} · mittente {c.get('from')}"
+            + (f" · account {_mask_email(str(c.get('username')))}" if c.get("username") else "")
+            + (" · password impostata" if c.get("password") else " · senza password")
+            + (" · STARTTLS" if c.get("starttls", True) else "")
+        )
+    else:
+        st.warning(
+            "Email non configurata: niente codici PIN via mail e niente mail di resoconto "
+            "(i salvataggi funzionano comunque)."
+        )
+    st.caption(
+        "Le credenziali stanno nei Secrets di Streamlit Cloud (Settings → Secrets, sezione [smtp]) "
+        "e non in questa pagina: il repository dei dati è pubblico e una password salvata lì sarebbe leggibile da chiunque."
+    )
+    _to = st.text_input("Invia una mail di prova a", key="smtp_test_to", placeholder="nome@esempio.it")
+    if st.button("✉️ Invia mail di prova", key="smtp_test_send", disabled=not _email_is_configured()):
+        valid = receipts.recipients(_to, [])[0]
+        if not valid:
+            st.error("Indirizzo non valido.")
+        else:
+            try:
+                _send_email(
+                    valid,
+                    [],
+                    "Turni UTIC – mail di prova",
+                    "Se ricevi questa mail, l'invio dei codici PIN e delle mail di resoconto funziona.\n",
+                )
+                st.success(f"Mail di prova inviata a {_mask_email(valid[0])}. Controlla anche lo spam.")
+            except Exception as e:
+                st.error(f"Invio non riuscito: {e}")
+
 
 def _sms_is_configured() -> bool:
     c = _twilio_cfg()
@@ -1173,11 +1224,36 @@ def _save_queue() -> usvc.SaveQueue:
 
     q = usvc.SaveQueue(
         _service_config(),
-        persist_path=Path(tempfile.gettempdir()) / "turni_unav_save_queue.json",
+        persist_path=Path(
+            os.environ.get("TURNI_QUEUE_PERSIST_PATH")
+            or Path(tempfile.gettempdir()) / "turni_unav_save_queue.json"
+        ),
         on_saved=_on_saved,
     )
     q.start_worker(interval=_queue_worker_interval())
     return q
+
+
+def _store_calendar_rows(doctor: str, rows_key: str, avail_key: str, unav: list, pref: list) -> None:
+    st.session_state[rows_key] = unav
+    st.session_state[avail_key] = pref
+    # Un "salvataggio completato" precedente contraddirebbe le nuove modifiche
+    # non inviate; errori e avvisi restano finché non vengono chiusi.
+    prev = st.session_state.get(_unav_flash_key(doctor))
+    if isinstance(prev, dict) and prev.get("kind") in ("success", "info"):
+        st.session_state.pop(_unav_flash_key(doctor), None)
+
+
+def _apply_calendar_edit(doctor: str, rows_key: str, avail_key: str, event: dict, yy: int, mm: int) -> None:
+    """Applies one edit of the long-ferie form with the calendar's rules."""
+    new_unav, new_pref = ucal.apply_event(
+        st.session_state.get(rows_key) or [],
+        st.session_state.get(avail_key) or [],
+        event,
+        year=yy,
+        month=mm,
+    )
+    _store_calendar_rows(doctor, rows_key, avail_key, new_unav, new_pref)
 
 
 def _draft_state_key(doctor: str) -> str:
@@ -1262,15 +1338,20 @@ def _draft_status_and_flush(doctor: str, session_id: str, mk: str) -> None:
         _draft_flush(doctor)
     unsent = (state.get("unsent") or {}).get(mk)
     if unsent:
+        parts = []
+        if unsent.get("added") or unsent.get("removed"):
+            parts.append(f"indisponibilità +{unsent.get('added', 0)} / -{unsent.get('removed', 0)}")
+        if unsent.get("pref"):
+            parts.append(f"{unsent['pref']} preferenze")
         in_draft = mk not in (state.get("pending") or {}) and bool(state.get("last_write_at"))
         where = (
-            f"Sono al sicuro nella bozza (salvata alle {_local_hhmm(state['last_write_at'])}) anche se chiudi la pagina, ma "
-            if in_draft
-            else "Salvataggio in bozza in corso… "
+            f"Le indisponibilità sono al sicuro in bozza (salvata alle {_local_hhmm(state['last_write_at'])}), ma "
+            if in_draft and (unsent.get("added") or unsent.get("removed"))
+            else ""
         )
         st.warning(
-            f"⚠️ **Modifiche NON inviate** (+{unsent['added']} / -{unsent['removed']} rispetto a quanto registrato). "
-            f"{where}**non verranno usate per i turni finché non premi 💾 Salva indisponibilità.**"
+            f"⚠️ **Modifiche NON inviate** ({', '.join(parts)}). "
+            f"{where}**non verranno usate per i turni finché non premi 📤 Invia.**"
         )
     else:
         st.caption("✅ Tutto inviato: quello che vedi è esattamente quanto registrato sul server.")
@@ -1374,6 +1455,28 @@ def _registered_details(doctor: str, result: usvc.SaveResult) -> str:
         for (yy, mm) in result.job.entries_by_month
     }
     return receipts.build_receipt(doctor, rows_by_month, {}, saved_at_utc=result.saved_at, commit_sha=result.outcome.commit_sha)[1]
+
+
+def _save_preferences(doctor: str, pref_entries_by_month: dict, store_rows: list[dict], store_sha: str | None) -> str:
+    """Save changed preference months (same Invia as unavailability). Returns a message."""
+    if not pref_entries_by_month:
+        return ""
+    updated_at = _utc_now_iso()
+    try:
+        save_doctor_availability_with_retry(
+            doctor=doctor,
+            entries_by_month=pref_entries_by_month,
+            updated_at=updated_at,
+            message=f"Update availability: {doctor} ({updated_at})",
+            initial_rows=store_rows,
+            initial_sha=store_sha,
+        )
+        fresh_rows, fresh_sha = load_doctor_avail_from_github(doctor)
+        st.session_state[f"avail_store_baseline_{doctor}"] = {"rows": fresh_rows, "sha": fresh_sha}
+        n = sum(len(v) for v in pref_entries_by_month.values())
+        return f"Preferenze registrate ({n})."
+    except Exception as e:
+        return f"⚠️ Preferenze NON salvate ({type(e).__name__}: {e}): riprova con 📤 Invia."
 
 
 def _process_unav_outbox(doctor: str, selected) -> None:
@@ -1880,7 +1983,7 @@ def _render_admin_month_rows(
             if availability:
                 p_priority = st.selectbox("Priorità periodo", ["alta", "media", "bassa"], index=1, key=f"{rows_key}_period_priority")
             with p4:
-                add_period = st.form_submit_button("Aggiungi alla lista", use_container_width=True)
+                add_period = st.form_submit_button("Aggiungi alla lista", width="stretch")
 
         if add_period:
             if p_end < p_start:
@@ -1949,7 +2052,7 @@ def _render_admin_month_rows(
 
     b1, b2 = st.columns([1, 1])
     with b1:
-        if st.button("➕ Aggiungi riga", key=f"{rows_key}_add_row", use_container_width=True):
+        if st.button("➕ Aggiungi riga", key=f"{rows_key}_add_row", width="stretch"):
             updated.append({
                 "id": str(uuid.uuid4()),
                 "Data": first_day,
@@ -1960,7 +2063,7 @@ def _render_admin_month_rows(
             st.session_state[rows_key] = updated
             _rerun_fragment_or_app()
     with b2:
-        if st.button("🧹 Pulisci", key=f"{rows_key}_clean", use_container_width=True):
+        if st.button("🧹 Pulisci", key=f"{rows_key}_clean", width="stretch"):
             st.session_state[rows_key] = [
                 r for r in updated
                 if str(r.get("Note", "") or "").strip() or r.get("Data") != first_day or r.get("Fascia") != "Mattina"
@@ -2413,7 +2516,7 @@ def render_admin_generate_panel(cfg_admin: dict, doctors: list[str], rules_path:
                 for p in _pending_drafts
             ]),
             hide_index=True,
-            use_container_width=True,
+            width="stretch",
         )
     _queued_saves = _save_queue().pending()
     if _queued_saves:
@@ -2434,7 +2537,7 @@ def render_admin_generate_panel(cfg_admin: dict, doctors: list[str], rules_path:
                 for j in _queued_saves
             ]),
             hide_index=True,
-            use_container_width=True,
+            width="stretch",
         )
     if st.button("🔄 Ricontrolla bozze non inviate", key="refresh_pending_drafts"):
         load_pending_drafts_summary.clear()
@@ -2618,7 +2721,7 @@ def render_admin_generate_panel(cfg_admin: dict, doctors: list[str], rules_path:
             },
             num_rows="dynamic",
             hide_index=True,
-            use_container_width=True,
+            width="stretch",
             key=f"fixed_assignments_draft_{mk}",
         )
 
@@ -2895,7 +2998,7 @@ def render_admin_generate_panel(cfg_admin: dict, doctors: list[str], rules_path:
             )
             try:
                 df_audit = pd.read_csv(io.StringIO(audit_text))
-                st.dataframe(df_audit.head(200), use_container_width=True, hide_index=True)
+                st.dataframe(df_audit.head(200), width="stretch", hide_index=True)
             except Exception:
                 pass
 
@@ -2920,7 +3023,7 @@ def render_admin_generate_panel(cfg_admin: dict, doctors: list[str], rules_path:
                         "ID": st.column_config.TextColumn("ID", disabled=True),
                     },
                     hide_index=True,
-                    use_container_width=True,
+                    width="stretch",
                     key=f"generation_memory_versions_{mk}",
                     num_rows="fixed",
                 )
@@ -3586,60 +3689,18 @@ if mode == "📋 Le mie indisponibilità":
     sel_default = st.session_state.get("doctor_selected_months") or [(default_year, default_month)]
     sel_set = set(sel_default)
 
-    st.subheader("Mese da compilare")
-    st.caption("Seleziona anno e mese, poi premi **▶ Aggiungi mese** per visualizzare il modulo di inserimento. Puoi aggiungere più mesi.")
-    _ms_c1, _ms_c2 = st.columns([1, 2])
-    with _ms_c1:
-        yy_sel = st.selectbox("Anno", year_options, key="doctor_year_sel")
-    with _ms_c2:
-        mm_sel = st.selectbox(
-            "Mese",
-            list(range(1, 13)),
-            format_func=lambda m: f"{m:02d} – {month_names.get(m, str(m))}",
-            key="doctor_month_sel",
-        )
-    _ms_b1, _ms_b2 = st.columns([2, 2])
-    with _ms_b1:
-        add_month = st.button("▶ Aggiungi mese", use_container_width=True, help="Aggiunge l’anno/mese selezionato all’elenco.", type="primary")
-    with _ms_b2:
-        remove_month = st.button("✕ Rimuovi mese", use_container_width=True, help="Rimuove l’anno/mese selezionato dall’elenco.")
-
-    cur = (int(yy_sel), int(mm_sel))
-    if add_month:
-        sel_set.add(cur)
-        st.session_state.doctor_active_month = cur  # passa automaticamente al mese appena aggiunto
-    if remove_month:
-        sel_set.discard(cur)
-
-    selected = sorted(sel_set)
+    # Un mese alla volta: si cambia con le frecce ‹ › del calendario
+    # (dal mese corrente fino a 12 mesi avanti).
+    _month_min = (today.year, today.month)
+    _max_first = (_first_of_this_month + timedelta(days=370)).replace(day=1)
+    _month_max = (_max_first.year, _max_first.month)
+    st.session_state.setdefault("doctor_active_month", (default_year, default_month))
+    active_month = tuple(st.session_state.doctor_active_month)
+    if not (_month_min <= active_month <= _month_max):
+        active_month = (default_year, default_month)
+        st.session_state.doctor_active_month = active_month
+    selected = [active_month]
     st.session_state.doctor_selected_months = selected
-
-    if not selected:
-        st.info("Seleziona anno e mese qui sopra e premi **Aggiungi mese ▶** per iniziare.")
-        st.stop()
-
-    # Gestione mese attivo (uno solo visualizzato per volta)
-    st.session_state.setdefault("doctor_active_month", selected[0])
-    if st.session_state.doctor_active_month not in selected:
-        st.session_state.doctor_active_month = selected[0]
-    active_month = st.session_state.doctor_active_month
-
-    # Barra di navigazione tra i mesi aggiunti
-    if len(selected) > 1:
-        st.caption("Passa da un mese all'altro:")
-        nav_cols = st.columns(min(len(selected), 3))
-        for _ni, (_syy, _smm) in enumerate(selected):
-            with nav_cols[_ni % 3]:
-                _is_active = (_syy, _smm) == active_month
-                if st.button(
-                    f"{month_names.get(_smm, str(_smm))} {_syy}",
-                    key=f"nav_{_syy}_{_smm}",
-                    type="primary" if _is_active else "secondary",
-                    use_container_width=True,
-                ):
-                    st.session_state.doctor_active_month = (_syy, _smm)
-                    st.rerun()
-        active_month = st.session_state.doctor_active_month
 
     # Completa un salvataggio eventualmente interrotto da un doppio tap
     # (audit, mail, bozza) prima di mostrare i dati.
@@ -3738,17 +3799,14 @@ if mode == "📋 Le mie indisponibilità":
     violations_by_month = {}
     weekend_violations_by_month = {}
     info_by_month = {}
-    avail_rows_by_month = {}
+    pref_entries_by_month = {}
     save = False  # inizializzato prima del loop per sicurezza
 
     for (yy, mm) in [active_month]:  # mostra solo il mese attivo
-        st.markdown("---")
-        st.subheader(f"{month_names.get(mm, str(mm))} {yy}")
         with st.container():
-            st.markdown("#### Indisponibilità")
             st.caption(
-                "Inserisci i giorni in cui NON puoi lavorare. Le modifiche vengono salvate in bozza "
-                "automaticamente, ma valgono per i turni solo dopo 💾 Salva indisponibilità."
+                "Tocca un giorno per indicare quando **non puoi** lavorare (oppure, con «Preferirei», "
+                "quando preferiresti). Le modifiche restano in bozza e valgono per i turni solo dopo **📤 Invia**."
             )
             existing = ustore.filter_doctor_month(store_rows, doctor, yy, mm)
             init = []
@@ -3771,7 +3829,7 @@ if mode == "📋 Le mie indisponibilità":
 
             if conversions:
                 st.warning("Abbiamo trovato alcune fasce non standard salvate in passato. Le abbiamo normalizzate automaticamente: controlla e, se necessario, modifica dal menu a tendina prima di salvare.")
-                st.dataframe(conversions, use_container_width=True, hide_index=True)
+                st.dataframe(conversions, width="stretch", hide_index=True)
 
 
             # --- Editor righe (UI robusta: niente st.data_editor) ---
@@ -3806,7 +3864,7 @@ if mode == "📋 Le mie indisponibilità":
                         doctor,
                         "info",
                         f"Ho ripristinato le modifiche NON inviate salvate in bozza il {_local_hhmm(start['updated_at'])}. "
-                        "Controllale e premi 💾 Salva indisponibilità per inviarle.",
+                        "Controllale e premi 📤 Invia per registrarle.",
                     )
                 elif start["action"] == "offer":
                     st.session_state[draft_offer_key] = start
@@ -3828,14 +3886,14 @@ if mode == "📋 Le mie indisponibilità":
                 )
                 _oc1, _oc2 = st.columns(2)
                 with _oc1:
-                    if st.button("↩️ Recupera bozza", key=f"{rows_key}__draft_recover", use_container_width=True):
+                    if st.button("↩️ Recupera bozza", key=f"{rows_key}__draft_recover", width="stretch"):
                         _draft_rows = [{"Data": d, "Fascia": sh, "Note": n} for d, sh, n in _offer["entries"]]
                         st.session_state[rows_key] = _editor_rows(_draft_rows)
                         st.session_state.pop(draft_offer_key, None)
                         _draft_mark_written(doctor, mk_cur, _offer["entries"])
                         st.rerun()
                 with _oc2:
-                    if st.button("🗑️ Scarta bozza", key=f"{rows_key}__draft_discard", use_container_width=True):
+                    if st.button("🗑️ Scarta bozza", key=f"{rows_key}__draft_discard", width="stretch"):
                         _draft_discard_month(doctor, mk_cur)
                         st.session_state.pop(draft_offer_key, None)
                         st.rerun()
@@ -3846,16 +3904,59 @@ if mode == "📋 Le mie indisponibilità":
             else:
                 last_day = date(yy, mm + 1, 1) - timedelta(days=1)
 
-            if unav_open:
-                # Nessuna riga precompilata: una riga "1 del mese, Mattina" lasciata lì
-                # veniva salvata come indisponibilità vera.
-                rows = list(st.session_state.get(rows_key) or [])
+            avail_key = f"avail_rows_{doctor}_{yy}_{mm}"
+            existing_avail = ustore.filter_doctor_month(avail_store_rows, doctor, yy, mm)
+            if avail_key not in st.session_state:
+                st.session_state[avail_key] = [
+                    {
+                        "id": str(uuid.uuid4()),
+                        "Data": ustore.parse_iso_date(r["date"]),
+                        "Fascia": ustore.norm_shift(r.get("shift", "")),
+                        "Priorita": ustore.norm_priority(r.get("priority", "media")),
+                        "Note": r.get("note", ""),
+                    }
+                    for r in existing_avail
+                    if r.get("date")
+                ]
+            max_avail = int(app_settings.get("max_availability_per_shift", 6))
 
-                with st.expander("📅 Aggiungi periodo ferie", expanded=False):
+            if unav_open:
+                _ack_key = f"unav_calendar_ack::{doctor}"
+                _ack_before = st.session_state.get(_ack_key) or {}
+                _cal_payload = ucal.calendar_payload(
+                    st.session_state.get(rows_key) or [],
+                    st.session_state.get(avail_key) or [],
+                    existing,
+                    existing_avail,
+                    year=yy,
+                    month=mm,
+                    limits={
+                        "per_shift": max_per_shift_for_doctor,
+                        "weekend": max_weekend_days_cfg,
+                        "pref_per_shift": max_avail,
+                    },
+                    nav={"prev": active_month > _month_min, "next": active_month < _month_max},
+                    ack=_ack_before,
+                )
+                _cal_value = _UNAV_CALENDAR(payload=_cal_payload, key=f"unav_calendar_{doctor}", default=None)
+                _new_unav, _new_pref, _ack, _target = ucal.apply_value(
+                    st.session_state.get(rows_key) or [],
+                    st.session_state.get(avail_key) or [],
+                    _cal_value,
+                    year=yy,
+                    month=mm,
+                    ack=_ack_before,
+                )
+                if _ack != _ack_before:
+                    st.session_state[_ack_key] = _ack
+                    _store_calendar_rows(doctor, rows_key, avail_key, _new_unav, _new_pref)
+                    if _target and _month_min <= _target <= _month_max:
+                        st.session_state.doctor_active_month = _target
+                    st.rerun()
+
+                with st.expander("📅 Ferie lunghe (con date)", expanded=False):
                     st.caption(
-                        "Seleziona un intervallo di date e premi **Aggiungi giorni** per inserire ogni giorno "
-                        "del periodo come riga con fascia *Ferie* nella tabella sottostante "
-                        "(poi ricordati di premere **💾 Salva indisponibilità**). "
+                        "Per periodi lunghi: scegli le date e premi **Aggiungi giorni**, poi **📤 Invia**. "
                         "Puoi usare questo strumento più volte per aggiungere periodi separati. "
                         "I sabati e le domeniche in ferie contano nel limite di "
                         f"{max_weekend_days_cfg} sabati e {max_weekend_days_cfg} domeniche al mese."
@@ -3883,115 +3984,33 @@ if mode == "📋 Le mie indisponibilità":
                         _add_ferie = st.button(
                             "Aggiungi giorni",
                             key=f"{rows_key}__ferie_add",
-                            use_container_width=True,
+                            width="stretch",
                         )
                     if _add_ferie:
                         if _ferie_end < _ferie_start:
                             st.error("La data di fine deve essere uguale o successiva alla data di inizio.")
                         else:
-                            _current_rows = list(st.session_state.get(rows_key) or [])
-                            _existing_ferie_dates = {
-                                r["Data"] for r in _current_rows if r.get("Fascia") == "Ferie"
-                            }
-                            _delta = (_ferie_end - _ferie_start).days + 1
-                            for _offset in range(_delta):
-                                _d = _ferie_start + timedelta(days=_offset)
-                                if _d not in _existing_ferie_dates:
-                                    _current_rows.append({
-                                        "id": str(uuid.uuid4()),
-                                        "Data": _d,
-                                        "Fascia": "Ferie",
-                                        "Note": "",
-                                    })
-                            st.session_state[rows_key] = _current_rows
+                            _apply_calendar_edit(
+                                doctor, rows_key, avail_key,
+                                {"type": "range", "from": _ferie_start.day, "to": _ferie_end.day}, yy, mm,
+                            )
                             st.rerun()
 
-                if rows:
-                    h1, h2, h3 = st.columns([2, 2, 1])
-                    h1.markdown("**Data**")
-                    h2.markdown("**Fascia**")
-                    h3.markdown("**Rimuovi**")
-                else:
-                    st.info(
-                        "Nessuna indisponibilità per questo mese. Usa **➕ Aggiungi riga** "
-                        "o **📅 Aggiungi periodo ferie**."
-                    )
-
-                remove_ids = []
-                new_rows = []
-
-                for r in rows:
-                    rid = str(r.get("id") or uuid.uuid4())
-                    d_key = f"{rows_key}__d__{rid}"
-                    s_key = f"{rows_key}__s__{rid}"
-                    n_key = f"{rows_key}__n__{rid}"
-                    rm_key = f"{rows_key}__rm__{rid}"
-
-                    # Seed widget state once to avoid "first change gets lost" behaviour
-                    if d_key not in st.session_state:
-                        st.session_state[d_key] = r.get("Data") or first_day
-                    if s_key not in st.session_state:
-                        st.session_state[s_key] = r.get("Fascia") or "Mattina"
-                    if n_key not in st.session_state:
-                        st.session_state[n_key] = r.get("Note", "")
-
-                    c1, c2, c3 = st.columns([2, 2, 1], vertical_alignment="bottom")
-                    with c1:
-                        d_val = st.date_input(
-                            "Data",
-                            key=d_key,
-                            min_value=first_day,
-                            max_value=last_day,
-                            label_visibility="collapsed",
-                            format="DD/MM/YYYY",
-                        )
-                    with c2:
-                        sh_val = st.selectbox(
-                            "Fascia",
-                            options=FASCIA_OPTIONS,
-                            key=s_key,
-                            label_visibility="collapsed",
-                        )
-                    with c3:
-                        if st.button("🗑️", key=rm_key, help="Rimuovi questa riga"):
-                            remove_ids.append(rid)
-                    _has_note = bool(str(st.session_state.get(n_key, "") or "").strip())
-                    with st.expander("📝 Note", expanded=_has_note):
-                        note_val = st.text_input(
-                            "Note",
-                            key=n_key,
-                            label_visibility="collapsed",
-                        )
-
-                    # Enforce month bounds (extra safety)
-                    if isinstance(d_val, date):
-                        if d_val < first_day:
-                            d_val = first_day
-                            st.session_state[d_key] = d_val
-                        if d_val > last_day:
-                            d_val = last_day
-                            st.session_state[d_key] = d_val
-
-                    new_rows.append({
-                        "id": rid,
-                        "Data": d_val,
-                        "Fascia": sh_val,
-                        "Note": note_val,
-                    })
-
-                if remove_ids:
-                    new_rows = [r for r in new_rows if str(r.get("id")) not in set(remove_ids)]
-                    st.session_state[rows_key] = new_rows
-                    st.rerun()
-
-                # Persist updated rows for this rerun (safe: not a widget key)
-                st.session_state[rows_key] = new_rows
-
-                # Build "edited" compatible with existing save/validation pipeline
-                edited = [{"Data": rr["Data"], "Fascia": rr["Fascia"], "Note": rr.get("Note", "")} for rr in new_rows]
+                edited = [
+                    {"Data": r["Data"], "Fascia": r["Fascia"], "Note": r.get("Note", "")}
+                    for r in (st.session_state.get(rows_key) or [])
+                ]
             else:
-                # Read-only view when the admin closes submissions
-                st.dataframe(init, use_container_width=True, hide_index=True)
+                # Inserimento chiuso dall'amministratore: sola lettura
+                st.info("🔒 Inserimento chiuso dall'amministratore: puoi solo visualizzare.")
+                st.dataframe(init, width="stretch", hide_index=True)
+                if existing_avail:
+                    st.caption("Preferenze registrate")
+                    st.dataframe(
+                        [{"Data": r.get("date", ""), "Fascia": r.get("shift", ""), "Priorità": r.get("priority", "")} for r in existing_avail],
+                        width="stretch",
+                        hide_index=True,
+                    )
                 edited = init
 
             edited_by_month[(yy, mm)] = edited
@@ -4021,30 +4040,48 @@ if mode == "📋 Le mie indisponibilità":
             if info.get("invalid_date"):
                 st.warning(f"⚠️ {info['invalid_date']} righe hanno una data non valida e sono state ignorate.")
 
-            _fascia_str = " · ".join([
-                f"{sh} {counts.get(sh, 0)}/{'∞' if sh == 'Ferie' else max_per_shift_for_doctor}"
-                for sh in FASCIA_OPTIONS
-                if counts.get(sh, 0) > 0
-            ]) or "nessuna indisponibilità inserita"
-            st.caption(f"Fasce: {_fascia_str}")
-            st.caption(f"Weekend: Sabati {len(sat_days)}/{max_weekend_days_cfg} · Domeniche {len(sun_days)}/{max_weekend_days_cfg}")
-
             if over:
-                pretty = ", ".join([
-                    f"{sh}: {n}/{'∞' if sh == 'Ferie' else max_per_shift_for_doctor}"
-                    for sh, n in over.items()
-                ])
-                st.error(f"Limite superato in questo mese → {pretty}. Rimuovi alcune righe prima di salvare.")
-
+                pretty = ", ".join([f"{sh}: {n}/{max_per_shift_for_doctor}" for sh, n in over.items()])
+                st.error(f"Limite superato in questo mese → {pretty}. Togli qualche giorno prima di inviare.")
             if weekend_over:
                 we_pretty = ", ".join([f"{label}: {n}/{max_weekend_days_cfg}" for label, n in weekend_over.items()])
-                st.error(f"Limite weekend superato → {we_pretty}. Puoi segnare al massimo {max_weekend_days_cfg} sabati e {max_weekend_days_cfg} domeniche al mese.")
+                st.error(
+                    f"Limite weekend superato → {we_pretty}. Puoi segnare al massimo {max_weekend_days_cfg} "
+                    f"sabati e {max_weekend_days_cfg} domeniche al mese."
+                )
+
+            # Preferenze: stesso calendario, stesso pulsante Invia.
+            pref_entries = _dedup_avail_editor_rows(st.session_state.get(avail_key) or [])
+            _pref_counts: dict[str, int] = {}
+            for _d, _sh, _n, _p in pref_entries:
+                _pref_counts[_sh] = _pref_counts.get(_sh, 0) + 1
+            pref_over = {sh: n for sh, n in _pref_counts.items() if n > max_avail}
+            if pref_over:
+                st.error(
+                    "Limite preferenze superato → "
+                    + ", ".join(f"{sh}: {n}/{max_avail}" for sh, n in pref_over.items())
+                    + ". Togli qualche preferenza prima di inviare."
+                )
+            _pref_now = {(d.isoformat(), sh, note, pri) for d, sh, note, pri in pref_entries}
+            _pref_sent = {
+                (str(r.get("date", ""))[:10], ustore.norm_shift(r.get("shift", "")), str(r.get("note") or ""),
+                 ustore.norm_priority(r.get("priority", "media")))
+                for r in existing_avail
+            }
+            pref_changes = len(_pref_now ^ _pref_sent)
+            if pref_changes:
+                pref_entries_by_month[(yy, mm)] = pref_entries
 
             # ── Bozza automatica + stato "non inviato" ─────────────────────────
             _dstate = _draft_state(doctor)
-            if ustore.entries_signature(entries_norm) != official_sig:
+            _unav_changed = ustore.entries_signature(entries_norm) != official_sig
+            if _unav_changed or pref_changes:
                 _udiff = ustore.compute_month_diff(existing, entries_norm)
-                _dstate["unsent"][mk_cur] = {"added": _udiff["added_count"], "removed": _udiff["removed_count"]}
+                _dstate["unsent"][mk_cur] = {
+                    "added": _udiff["added_count"],
+                    "removed": _udiff["removed_count"],
+                    "pref": pref_changes,
+                }
             else:
                 _dstate["unsent"].pop(mk_cur, None)
             if unav_open and not st.session_state.get(draft_offer_key):
@@ -4055,224 +4092,17 @@ if mode == "📋 Le mie indisponibilità":
             if unav_open:
                 _draft_status_and_flush(doctor, _doctor_session_id, mk_cur)
 
-            # ── Pulsante salva indisponibilità (tra le due sezioni) ──────────────
-            _can_save = bool(unav_open) and not bool(over) and not bool(weekend_over)
+            # ── Invio (indisponibilità + preferenze) ──────────────────────────
+            _can_save = bool(unav_open) and not bool(over) and not bool(weekend_over) and not bool(pref_over)
             render_unav_flash(doctor)
-            _sc1, _sc2, _sc3 = st.columns([3, 2, 2])
-            with _sc1:
-                save = st.button(
-                    "💾 Salva indisponibilità",
-                    key=f"save_unav_{yy}_{mm}",
-                    type="primary",
-                    disabled=not _can_save,
-                    use_container_width=True,
-                )
-            with _sc2:
-                add_row = st.button("➕ Aggiungi riga", key=f"{rows_key}__add", use_container_width=True, disabled=not unav_open)
-            with _sc3:
-                clean_rows = st.button("🧹 Pulisci vuote", key=f"{rows_key}__clean", use_container_width=True, disabled=not unav_open)
-
-            if add_row:
-                new_rows_state = list(st.session_state.get(rows_key) or [])
-                new_rows_state.append({
-                    "id": str(uuid.uuid4()),
-                    "Data": first_day,
-                    "Fascia": "Mattina",
-                    "Note": "",
-                })
-                st.session_state[rows_key] = new_rows_state
-                st.rerun()
-
-            if clean_rows:
-                def _is_empty(_x: dict) -> bool:
-                    d = _x.get("Data")
-                    sh = str(_x.get("Fascia") or "").strip()
-                    note = str(_x.get("Note") or "").strip()
-                    # Una riga è "vuota" se ha la data di default (primo del mese) e nessuna nota
-                    is_default_date = isinstance(d, date) and d.day == 1
-                    return is_default_date and sh in ("Mattina", "") and not note
-
-                _cleaned = [r for r in (st.session_state.get(rows_key) or []) if not _is_empty(r)]
-                st.session_state[rows_key] = _cleaned
-                st.rerun()
-
-            # ── Disponibilità (preferenze) ──────────────────────────────────────────
-            st.divider()
-            st.markdown("#### Disponibilità (preferenze)")
-            with st.container():
-                max_avail = int(app_settings.get("max_availability_per_shift", 6))
-                st.caption(
-                    f"Inserisci i giorni/fasce in cui **preferiresti** lavorare. "
-                    f"Il software **proverà** (senza garanzia) a rispettarle. "
-                    f"Limite: max **{max_avail}** per fascia al mese."
-                )
-                avail_key = f"avail_rows_{doctor}_{yy}_{mm}"
-                if avail_key not in st.session_state:
-                    _existing_avail = ustore.filter_doctor_month(avail_store_rows, doctor, yy, mm)
-                    if _existing_avail:
-                        st.session_state[avail_key] = [
-                            {
-                                "id": str(uuid.uuid4()),
-                                "Data": date.fromisoformat(r["date"]) if r.get("date") else date(yy, mm, 1),
-                                "Fascia": r.get("shift", "Mattina"),
-                                "Priorita": r.get("priority", "media"),
-                                "Note": r.get("note", ""),
-                            }
-                            for r in _existing_avail
-                        ]
-                    else:
-                        # Nessuna riga precompilata: verrebbe salvata come preferenza vera.
-                        st.session_state[avail_key] = []
-
-                if unav_open:
-                    _PRIORITY_OPTIONS = ["media", "alta", "bassa"]
-                    _PRIORITY_LABELS = {"alta": "⬆ Alta", "media": "● Media", "bassa": "⬇ Bassa"}
-                    av_rows = list(st.session_state.get(avail_key) or [])
-                    updated_av = []
-                    for av_r in av_rows:
-                        # Riga 1: Data, Fascia, bottone elimina
-                        _av_r1c1, _av_r1c2, _av_r1c3 = st.columns([2, 2, 0.5], vertical_alignment="bottom")
-                        with _av_r1c1:
-                            av_date = st.date_input(
-                                "Data",
-                                value=av_r.get("Data") or date(yy, mm, 1),
-                                min_value=date(yy, mm, 1),
-                                max_value=date(yy + 1, 1, 1) - timedelta(days=1) if mm == 12 else date(yy, mm + 1, 1) - timedelta(days=1),
-                                key=f"{avail_key}_{av_r['id']}_d",
-                                format="DD/MM/YYYY",
-                            )
-                        with _av_r1c2:
-                            av_shift = st.selectbox(
-                                "Fascia",
-                                AVAIL_FASCIA_OPTIONS,
-                                index=AVAIL_FASCIA_OPTIONS.index(av_r.get("Fascia", "Mattina"))
-                                      if av_r.get("Fascia", "Mattina") in AVAIL_FASCIA_OPTIONS else 0,
-                                key=f"{avail_key}_{av_r['id']}_s",
-                            )
-                        with _av_r1c3:
-                            del_av = st.button("🗑", key=f"{avail_key}_{av_r['id']}_del")
-
-                        # Riga 2 (collapsibile): Priorità e Note
-                        _prev_pri = av_r.get("Priorita", "media")
-                        _pri_idx = _PRIORITY_OPTIONS.index(_prev_pri) if _prev_pri in _PRIORITY_OPTIONS else 0
-                        _has_extra = _prev_pri != "media" or bool(av_r.get("Note", "").strip())
-                        with st.expander("Priorità / Note", expanded=_has_extra):
-                            _av_r2c1, _av_r2c2 = st.columns([1, 2])
-                            with _av_r2c1:
-                                av_priority = st.selectbox(
-                                    "Priorità",
-                                    [_PRIORITY_LABELS[p] for p in _PRIORITY_OPTIONS],
-                                    index=_pri_idx,
-                                    key=f"{avail_key}_{av_r['id']}_p",
-                                )
-                                av_priority_val = _PRIORITY_OPTIONS[
-                                    [_PRIORITY_LABELS[p] for p in _PRIORITY_OPTIONS].index(av_priority)
-                                ]
-                            with _av_r2c2:
-                                av_note = st.text_input(
-                                    "Note",
-                                    value=av_r.get("Note", ""),
-                                    key=f"{avail_key}_{av_r['id']}_n",
-                                )
-
-                        if not del_av:
-                            updated_av.append({
-                                "id": av_r["id"],
-                                "Data": av_date,
-                                "Fascia": av_shift,
-                                "Priorita": av_priority_val,
-                                "Note": av_note,
-                            })
-                    st.session_state[avail_key] = updated_av
-
-                    # Conta per fascia
-                    av_counts = {}
-                    for r in (st.session_state.get(avail_key) or []):
-                        sh = r.get("Fascia","")
-                        if sh: av_counts[sh] = av_counts.get(sh, 0) + 1
-                    av_over = {sh: n for sh, n in av_counts.items() if n > max_avail}
-                    if av_over:
-                        st.error(f"Limite disponibilità superato: {av_over}. Rimuovi alcune righe.")
-                    else:
-                        st.caption("Conteggi: " + ", ".join([f"{sh} {av_counts.get(sh,0)}/{max_avail}" for sh in AVAIL_FASCIA_OPTIONS if av_counts.get(sh,0)>0]))
-
-                    st.divider()
-                    _save_avail_disabled = bool(av_over)
-                    _av_sc1, _av_sc2, _av_sc3 = st.columns([3, 2, 2])
-                    with _av_sc1:
-                        _do_save_avail = st.button("💾 Salva preferenze", key=f"save_avail_{doctor}_{yy}_{mm}", type="primary", disabled=_save_avail_disabled, use_container_width=True)
-                    with _av_sc2:
-                        if st.button("➕ Aggiungi", key=f"{avail_key}__add", use_container_width=True):
-                            st.session_state[avail_key].append({
-                                "id": str(uuid.uuid4()),
-                                "Data": date(yy, mm, 1),
-                                "Fascia": "Mattina",
-                                "Note": "",
-                            })
-                            st.rerun()
-                    with _av_sc3:
-                        if st.button("🧹 Pulisci", key=f"{avail_key}__clean", use_container_width=True):
-                            st.session_state[avail_key] = [
-                                r for r in st.session_state[avail_key]
-                                if r.get("Data") or str(r.get("Note","")).strip()
-                            ]
-                            st.rerun()
-                    if _do_save_avail:
-                        _avail_entries = [
-                            (r["Data"], r.get("Fascia", "Mattina"), r.get("Note", ""), r.get("Priorita", "media"))
-                            for r in (st.session_state.get(avail_key) or [])
-                            if r.get("Data") and r.get("Fascia")
-                        ]
-                        _avail_upd = datetime.utcnow().isoformat(timespec="seconds") + "Z"
-                        try:
-                            _new_avail_sha = save_doctor_availability_with_retry(
-                                doctor=doctor,
-                                entries_by_month={(yy, mm): _avail_entries},
-                                updated_at=_avail_upd,
-                                message=f"Update availability: {doctor} ({_avail_upd})",
-                                initial_rows=avail_store_rows,
-                                initial_sha=avail_store_sha,
-                            )
-                            # Ricarica il file del medico per aggiornare SHA e rows
-                            _avail_fresh_rows, _avail_fresh_sha = load_doctor_avail_from_github(doctor)
-                            st.session_state[f"avail_store_baseline_{doctor}"] = {
-                                "rows": _avail_fresh_rows,
-                                "sha": _avail_fresh_sha or _new_avail_sha,
-                            }
-                            st.success(f"Preferenze salvate ({len(_avail_entries)} voci).")
-                        except Exception as _e:
-                            st.error(f"Errore salvataggio preferenze: {_e}")
-
-                    # Salva in sessione per trasmetterle al generate (chiave globale con medico)
-                    avail_rows_by_month[(yy, mm)] = [
-                        {"date": str(r["Data"]), "shift": r["Fascia"], "priority": r.get("Priorita", "media")}
-                        for r in (st.session_state.get(avail_key) or [])
-                        if r.get("Data") and r.get("Fascia")
-                    ]
-                    # Persiste nella sessione globale per l'admin
-                    global_avail_key = f"avail_global_{doctor}_{yy}_{mm}"
-                    st.session_state[global_avail_key] = [
-                        {"doctor": doctor, "date": str(r["Data"]), "shift": r["Fascia"],
-                         "priority": r.get("Priorita", "media")}
-                        for r in (st.session_state.get(avail_key) or [])
-                        if r.get("Data") and r.get("Fascia")
-                    ]
-                else:
-                    # Read-only view when the admin closes submissions
-                    _existing_ro = ustore.filter_doctor_month(avail_store_rows, doctor, yy, mm)
-                    if _existing_ro:
-                        _ro_df = [
-                            {
-                                "Data": r.get("date", ""),
-                                "Fascia": r.get("shift", ""),
-                                "Note": r.get("note", ""),
-                            }
-                            for r in _existing_ro
-                        ]
-                        st.info("🔒 Inserimento chiuso dall'amministratore. Visualizzazione in sola lettura.")
-                        st.dataframe(_ro_df, use_container_width=True, hide_index=True)
-                    else:
-                        st.info("🔒 Inserimento chiuso dall'amministratore. Nessuna preferenza salvata per questo mese.")
+            save = st.button(
+                "📤 Invia",
+                key=f"save_unav_{yy}_{mm}",
+                type="primary",
+                disabled=not _can_save,
+                width="stretch",
+                help="Registra sul server indisponibilità e preferenze di questo mese e invia la mail di resoconto.",
+            )
 
     if save:
         if not unav_open:
@@ -4380,6 +4210,7 @@ if mode == "📋 Le mie indisponibilità":
                 ),
             )
             st.rerun()
+        pref_msg = _save_preferences(doctor, pref_entries_by_month, avail_store_rows, avail_store_sha)
         if save_status == "queued":
             _draft_flush(doctor, force=True)
             set_unav_flash(
@@ -4388,10 +4219,16 @@ if mode == "📋 Le mie indisponibilità":
                 "⏳ GitHub è momentaneamente saturo: il salvataggio è **IN CODA** e verrà registrato "
                 "automaticamente appena possibile (di solito entro pochi minuti), anche se chiudi la pagina. "
                 "Riceverai la mail di conferma solo a registrazione avvenuta: senza mail non è registrato. "
-                "Non serve premere di nuovo Salva.",
+                "Non serve premere di nuovo Invia." + (f" {pref_msg}" if pref_msg else ""),
             )
             st.rerun()
         _process_unav_outbox(doctor, selected)
+        if pref_msg:
+            _flash = st.session_state.get(_unav_flash_key(doctor))
+            if isinstance(_flash, dict):
+                _flash["msg"] = f"{_flash.get('msg', '')} {pref_msg}".strip()
+                if pref_msg.startswith("⚠️"):
+                    _flash["kind"] = "warning"
         st.rerun()
 
 
@@ -4587,6 +4424,9 @@ else:
                     st.session_state["_cfg_flash"] = ("error", f"Errore salvataggio impostazioni su GitHub: {e}")
                     st.rerun()
 
+        with st.expander("📧 Email (codici PIN e resoconti)", expanded=False):
+            _render_email_admin_panel()
+
         with st.expander("🗂️ Gestione admin indisponibilità / preferenze", expanded=False):
             render_admin_doctor_data_editor(doctors, date.today().year, date.today().month)
 
@@ -4655,7 +4495,7 @@ else:
                             "Email": st.column_config.TextColumn("Email", help="Email per OTP/PIN (salvata in doctor_contacts.yml)"),
                         },
                         hide_index=True,
-                        use_container_width=True,
+                        width="stretch",
                         key="pool_med_editor",
                         num_rows="dynamic",
                     )
@@ -4752,7 +4592,7 @@ else:
                             "Spacing pref (gg)": st.column_config.NumberColumn("Spacing pref", min_value=0, max_value=30, step=1, help="Solo per J — soft preference"),
                             "Conta come": st.column_config.NumberColumn("Conta come", min_value=0, max_value=4, step=1, help="C=0 (bloccato), J=2, altri=1"),
                         },
-                        hide_index=True, use_container_width=True, key="pool_cs_editor", num_rows="fixed",
+                        hide_index=True, width="stretch", key="pool_cs_editor", num_rows="fixed",
                     )
                     for _, _row in _edited_cs.iterrows():
                         _cl = _row["Colonna"]
@@ -4788,7 +4628,7 @@ else:
                             "Tipo": st.column_config.SelectboxColumn("Tipo", options=["fixed", "max", "min"]),
                             "Notti weekend": st.column_config.CheckboxColumn("Notti weekend (J)", help="Solo per col. J"),
                         },
-                        hide_index=True, use_container_width=True, key="pool_ov_editor", num_rows="dynamic",
+                        hide_index=True, width="stretch", key="pool_ov_editor", num_rows="dynamic",
                     )
                     _new_overrides: dict[str, dict] = {}
                     for _, _row in _edited_ov.iterrows():
@@ -4832,7 +4672,7 @@ else:
                             "Col 2": st.column_config.SelectboxColumn("Col 2", options=_all_cols),
                             "Modalità": st.column_config.SelectboxColumn("Modalità", options=["always", "fallback", "preferred"]),
                         },
-                        hide_index=True, use_container_width=True, key="pool_combo_editor", num_rows="dynamic",
+                        hide_index=True, width="stretch", key="pool_combo_editor", num_rows="dynamic",
                     )
                     _new_combos = []
                     for _, _row in _edited_combo.iterrows():
@@ -4895,7 +4735,7 @@ else:
                         for _col, _docs in sorted((_audit.get("preview") or {}).get("column_pools", {}).items())
                     ]
                     if _pool_preview:
-                        st.dataframe(_pd_pool.DataFrame(_pool_preview), use_container_width=True, hide_index=True)
+                        st.dataframe(_pd_pool.DataFrame(_pool_preview), width="stretch", hide_index=True)
 
                 _col_save, _col_reset = st.columns([3, 1])
                 with _col_reset:
@@ -5022,7 +4862,7 @@ else:
                                 "I pom. (fer.)": _i.get("feriali", 0) if isinstance(_i, dict) else 0,
                             })
                         _df_hist = pd.DataFrame(_rows_hist)
-                        st.dataframe(_df_hist, use_container_width=True, hide_index=True)
+                        st.dataframe(_df_hist, width="stretch", hide_index=True)
                     with _tab_mese:
                         _sel_mese = st.selectbox("Mese", _sorted_months, key="hist_tab_mese", index=len(_sorted_months)-1)
                         _ms_sel = _effective_hist_data[_sel_mese]
@@ -5044,7 +4884,7 @@ else:
                                 "H pom. (fer.)": _h.get("feriali", 0) if isinstance(_h, dict) else 0,
                                 "I pom. (fer.)": _i.get("feriali", 0) if isinstance(_i, dict) else 0,
                             })
-                        st.dataframe(pd.DataFrame(_rows_mese), use_container_width=True, hide_index=True)
+                        st.dataframe(pd.DataFrame(_rows_mese), width="stretch", hide_index=True)
 
                 with st.expander("📈 Grafici", expanded=False):
                     if _rows_hist:
@@ -5055,17 +4895,17 @@ else:
                         ], key="hist_graf_sel")
                         if _graf_scelta == "Notti totali (cumulativo)":
                             _fig = px.bar(_df_hist, x="Medico", y="Notti (J)", title="Notti totali per medico (cumulativo)", color="Notti (J)", color_continuous_scale="Reds")
-                            _fig.update_layout(xaxis_tickangle=-45, height=400); st.plotly_chart(_fig, use_container_width=True)
+                            _fig.update_layout(xaxis_tickangle=-45, height=400); st.plotly_chart(_fig, width="stretch")
                         elif _graf_scelta == "Notti: feriali / sabato / domenica (cumulativo)":
                             _df_j2 = pd.DataFrame([{"Medico": r["Medico"], "Feriali": r["Notti (J)"]-r["Notti Sab"]-r["Notti Dom"], "Sabato": r["Notti Sab"], "Domenica": r["Notti Dom"]} for r in _rows_hist])
                             _fig = px.bar(_df_j2, x="Medico", y=["Feriali","Sabato","Domenica"], title="Notti: distribuzione feriali/sabato/domenica", barmode="stack")
-                            _fig.update_layout(xaxis_tickangle=-45, height=400); st.plotly_chart(_fig, use_container_width=True)
+                            _fig.update_layout(xaxis_tickangle=-45, height=400); st.plotly_chart(_fig, width="stretch")
                         elif _graf_scelta == "Domeniche lavorate (cumulativo)":
                             _fig = px.bar(_df_hist, x="Medico", y="Domeniche", title="Domeniche lavorate per medico (cumulativo)", color="Domeniche", color_continuous_scale="Blues")
-                            _fig.update_layout(xaxis_tickangle=-45, height=400); st.plotly_chart(_fig, use_container_width=True)
+                            _fig.update_layout(xaxis_tickangle=-45, height=400); st.plotly_chart(_fig, width="stretch")
                         elif _graf_scelta == "Reperibilità (cumulativo)":
                             _fig = px.bar(_df_hist, x="Medico", y="Reperibilità (C)", title="Reperibilità per medico (cumulativo)", color="Reperibilità (C)", color_continuous_scale="Greens")
-                            _fig.update_layout(xaxis_tickangle=-45, height=400); st.plotly_chart(_fig, use_container_width=True)
+                            _fig.update_layout(xaxis_tickangle=-45, height=400); st.plotly_chart(_fig, width="stretch")
                         elif _graf_scelta == "Evoluzione notti mese per mese":
                             if len(_sorted_months) > 1:
                                 _evo = []
@@ -5075,7 +4915,7 @@ else:
                                         _j2 = _ds2.get("J", {})
                                         _evo.append({"Mese": _ml2, "Medico": _doc2, "Notti": _j2.get("total", 0) if isinstance(_j2, dict) else 0})
                                 _fig = px.line(pd.DataFrame(_evo), x="Mese", y="Notti", color="Medico", title="Evoluzione notti per medico", markers=True)
-                                _fig.update_layout(height=400); st.plotly_chart(_fig, use_container_width=True)
+                                _fig.update_layout(height=400); st.plotly_chart(_fig, width="stretch")
                             else:
                                 st.info("Servono almeno 2 mesi per il grafico di evoluzione.")
 
@@ -5116,7 +4956,7 @@ else:
                         night_double = bool((dcfg or {}).get("night_counts_double", False))
                         target = round(working * uni_ratio)
                         rows_u.append({"Medico": doc_raw, "Notte vale doppio": "✓ (2 turni)" if night_double else "✗ (1 turno)", "Target turni pesati": target, "Max consentito": target+1, "Note": "Indisponibilità NON riducono il target"})
-                    st.dataframe(pd.DataFrame(rows_u), use_container_width=True, hide_index=True)
+                    st.dataframe(pd.DataFrame(rows_u), width="stretch", hide_index=True)
                 else:
                     st.info("Nessun medico universitario configurato nel YAML.")
             except Exception as e:
@@ -5141,7 +4981,7 @@ else:
             st.warning("**Azione richiesta (una-tantum).** Il sistema ora salva un file CSV separato per ogni medico, eliminando i conflitti di salvataggio concorrente. Clicca il bottone qui sotto per copiare i dati storici dal vecchio CSV ai file per-medico.", icon="⚠️")
             _mg_col1, _mg_col2 = st.columns([1, 3])
             with _mg_col1:
-                _do_migrate = st.button("Esegui migrazione", key="btn_migrate_unavail", type="primary", use_container_width=True)
+                _do_migrate = st.button("Esegui migrazione", key="btn_migrate_unavail", type="primary", width="stretch")
             with _mg_col2:
                 st.caption(f"Legge `unavailability_store.csv` → scrive file per-medico in `{_unavail_per_doctor_dir()}/`. Il vecchio file resta intatto come backup.")
         if _do_migrate:
@@ -5183,7 +5023,7 @@ else:
             st.warning(f"**Azione richiesta (una-tantum).** Divide `availability_store.csv` in file per-medico nella directory `{_avail_per_doctor_dir()}/`, eliminando i conflitti concorrenti.", icon="⚠️")
             _mg2_col1, _mg2_col2 = st.columns([1, 3])
             with _mg2_col1:
-                _do_migrate_avail = st.button("Esegui migrazione disponibilità", key="btn_migrate_avail", type="primary", use_container_width=True)
+                _do_migrate_avail = st.button("Esegui migrazione disponibilità", key="btn_migrate_avail", type="primary", width="stretch")
             with _mg2_col2:
                 st.caption(f"Legge `availability_store.csv` → scrive file per-medico in `{_avail_per_doctor_dir()}/`. Il vecchio file resta intatto come backup.")
         if _do_migrate_avail:
