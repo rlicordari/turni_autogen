@@ -323,6 +323,23 @@ def email_configured(smtp_cfg: dict) -> bool:
     return bool((smtp_cfg or {}).get("host") and (smtp_cfg or {}).get("from"))
 
 
+def _smtp_session(smtp_cfg: dict) -> smtplib.SMTP:
+    s = smtplib.SMTP(str(smtp_cfg.get("host") or ""), int(smtp_cfg.get("port") or 587), timeout=20)
+    s.ehlo()
+    if bool(smtp_cfg.get("starttls", True)):
+        s.starttls()
+        s.ehlo()
+    if smtp_cfg.get("username") and smtp_cfg.get("password"):
+        s.login(str(smtp_cfg["username"]), str(smtp_cfg["password"]))
+    return s
+
+
+def check_smtp_login(smtp_cfg: dict) -> None:
+    """Connects and logs in without sending anything (raises on refused credentials)."""
+    with _smtp_session(smtp_cfg):
+        pass
+
+
 def send_email(smtp_cfg: dict, to: list, cc: list, subject: str, body: str) -> None:
     if not email_configured(smtp_cfg):
         raise RuntimeError("Invio email non configurato (smtp).")
@@ -333,13 +350,7 @@ def send_email(smtp_cfg: dict, to: list, cc: list, subject: str, body: str) -> N
     if cc:
         msg["Cc"] = ", ".join(cc)
     msg.set_content(body)
-    with smtplib.SMTP(str(smtp_cfg.get("host") or ""), int(smtp_cfg.get("port") or 587), timeout=20) as s:
-        s.ehlo()
-        if bool(smtp_cfg.get("starttls", True)):
-            s.starttls()
-            s.ehlo()
-        if smtp_cfg.get("username") and smtp_cfg.get("password"):
-            s.login(str(smtp_cfg["username"]), str(smtp_cfg["password"]))
+    with _smtp_session(smtp_cfg) as s:
         s.send_message(msg)
 
 

@@ -113,6 +113,8 @@ class DoctorUnavailabilityFlowTests(unittest.TestCase):
             "receipt_cc_emails:\n- admin@example.org\n- utic@polime.it\n",
         )
         FakeSMTP.sent = []
+        FakeSMTP.logins = []
+        FakeSMTP.reject_login = False
         self.calendar = FakeCalendar()
         patches = [
             mock.patch.object(github_utils, "_http", self.gh),
@@ -432,6 +434,53 @@ class DoctorUnavailabilityFlowTests(unittest.TestCase):
 
         self.assertIn("Email non configurata", self.page_text(admin))
         self.assertTrue(admin.button(key="smtp_test_send").disabled)
+
+    def save_email_settings(self, admin: AppTest, username: str, password: str) -> None:
+        admin.text_input(key="smtp_username").input(username)
+        admin.text_input(key="smtp_password").input(password)
+        admin.button(key="smtp_save").click()
+        admin.run()
+        self.assertFalse(admin.exception, admin.exception)
+
+    def test_admin_saves_google_app_password_encrypted_after_checking_it(self):
+        admin = self.admin_session("🔧 Admin — Configurazione")
+
+        self.save_email_settings(admin, "turni.utic@gmail.com", "abcd efgh ijkl mnop")
+
+        stored = self.gh.files["data/email_settings.json"][0]
+        self.assertNotIn("abcdefghijklmnop", stored)
+        self.assertNotIn("abcd efgh", stored)
+        self.assertIn("turni.utic@gmail.com", stored)
+        self.assertEqual(FakeSMTP.logins, [("turni.utic@gmail.com", "abcdefghijklmnop")], "prova di accesso prima di salvare")
+        self.assertIn("Credenziali salvate", self.page_text(admin))
+        self.assertEqual(admin.text_input(key="smtp_password").value, "", "la password non viene mai rimostrata")
+
+        admin.text_input(key="smtp_test_to").input("prova@example.org")
+        admin.button(key="smtp_test_send").click()
+        admin.run()
+        self.assertEqual(FakeSMTP.logins[-1], ("turni.utic@gmail.com", "abcdefghijklmnop"))
+        self.assertEqual(FakeSMTP.sent[-1]["From"], "turni.utic@gmail.com")
+
+    def test_app_password_refused_by_google_is_not_saved(self):
+        admin = self.admin_session("🔧 Admin — Configurazione")
+        FakeSMTP.reject_login = True
+
+        self.save_email_settings(admin, "turni.utic@gmail.com", "sbagliata")
+
+        self.assertNotIn("data/email_settings.json", self.gh.files)
+        self.assertIn("rifiutato", self.page_text(admin))
+
+    def test_receipts_use_the_password_saved_in_the_panel(self):
+        admin = self.admin_session("🔧 Admin — Configurazione")
+        self.save_email_settings(admin, "turni.utic@gmail.com", "abcd efgh ijkl mnop")
+        FakeSMTP.logins = []
+
+        doc = self.login(self.new_session())
+        self.tap(doc, {"type": "set_day", "kind": "unav", "day": 15, "shifts": ["Notte"]})
+        self.save(doc)
+
+        self.assertEqual(len(FakeSMTP.sent), 1)
+        self.assertEqual(FakeSMTP.logins, [("turni.utic@gmail.com", "abcdefghijklmnop")])
 
 
 class DoctorUnavailabilityFlowUnderChaosTests(DoctorUnavailabilityFlowTests):

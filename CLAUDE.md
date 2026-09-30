@@ -82,7 +82,7 @@ Su macOS lanciarla con `caffeinate -i` davanti: se il Mac va in stop durante la 
 - Mese già uguale all'editor → nessuna scrittura (il doppio tap è un no-op).
 - **Bozze**: le modifiche non inviate vengono scritte in `data/unavailability_drafts/draft_<slug>.json` (al cambio, max ogni 15 s, più un fragment `run_every=20`). Al login la bozza viene ripresa (se costruita sui dati attuali) o proposta (se il server è cambiato). Il solver usa SOLO i CSV ufficiali; il pannello "Genera turni" mostra le bozze non inviate.
 - Dopo un salvataggio riuscito, baseline/audit/pulizia bozza/mail passano da un'outbox in `session_state` (`_process_unav_outbox`): un doppio tap che interrompe l'esecuzione non fa perdere audit o mail.
-- **Email**: un'unica configurazione `[smtp]` nei Secrets per codici PIN (OTP) e resoconti; il pannello admin "📧 Email" ne mostra lo stato e manda una mail di prova. La password resta nei Secrets: il repo dati è pubblico.
+- **Email**: un'unica configurazione per codici PIN (OTP) e resoconti = Secrets `[smtp]` sovrascritti dal pannello admin "📧 Email" (`email_settings.py`, file `data/email_settings.json`). Il repo dati è pubblico: la password (password per le app di Google) sta lì **solo cifrata** (Fernet, chiave ricavata dal token GitHub dei Secrets), viene provata col server prima di salvarla e non viene mai rimostrata. Se cambia il token GitHub la password salvata non è più leggibile: l'app torna ai Secrets e il pannello chiede di reinserirla. Nella sandbox locale l'SMTP è finto (stampa in console).
 - **Mail di resoconto** al medico (email da `doctor_contacts.yml`) + copie da impostazioni (`receipt_cc_emails`, modificabile nel pannello admin, default `utic@polime.it`) e da secrets `[notifications] receipt_cc`. Best-effort: se fallisce il salvataggio resta valido.
 - Nessuna riga precompilata negli editor: una riga "1 del mese, Mattina" lasciata lì veniva salvata come indisponibilità vera.
 - **Calendario**: niente pulsante "Applica", ogni tocco su una fascia si registra subito in bozza. Il componente rinvia ogni modifica (`edits` con `seq`, più `cid` dell'istanza) finché la pagina non la conferma nel payload (`ack`, in `unav_calendar_ack::<medico>`): Streamlit può unire due tocchi rapidi in un solo rerun e nessuno dei due deve perdersi (`ucal.apply_value`). Anche "Ferie lunghe" passa dalle stesse regole (evento `range` via `_apply_calendar_edit()`), così "Ferie" e "Tutto il giorno" restano esclusive nel giorno. Nel componente l'altezza dell'iframe va misurata sul contenuto (`#root`), mai su `document.documentElement.scrollHeight`: include l'iframe stesso e cresce all'infinito. Nei test AppTest il componente è sostituito da `FakeCalendar` (patch di `declare_component`, stesso protocollo).
@@ -120,6 +120,7 @@ per_doctor_dir = "data/unavailability"             # default, opzionale se non r
 availability_path = "data/availability_store.csv"  # fallback legacy preferenze
 per_doctor_avail_dir = "data/availability"         # default, opzionale se non rinominata
 drafts_dir = "data/unavailability_drafts"          # default, bozze non inviate
+email_settings_path = "data/email_settings.json"   # default, credenziali mail dal pannello admin (password cifrata)
 
 [notifications]
 receipt_cc = ["..."]                               # opzionale: copie extra della mail di resoconto

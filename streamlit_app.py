@@ -31,6 +31,7 @@ import unavailability_calendar as ucal
 import unavailability_drafts as udrafts
 import unavailability_service as usvc
 import unavailability_receipts as receipts
+import email_settings as esettings
 import unavailability_store as ustore
 import xlsx_utils
 import shift_history as sh
@@ -251,6 +252,40 @@ def _get_doctor_pins() -> dict[str, str]:
 # PIN hashes are stored on GitHub under doctor_auth_dir (default: data/doctor_auth/)
 
 def _smtp_cfg() -> dict:
+    """SMTP used everywhere (PIN codes, receipts): Secrets [smtp] + admin panel settings."""
+    return _smtp_cfg_with_warnings()[0]
+
+
+def _smtp_cfg_with_warnings() -> tuple[dict, list[str]]:
+    base = _smtp_secrets_cfg()
+    try:
+        stored, _sha = load_email_settings_from_github()
+    except Exception as e:
+        return base, [f"Impostazioni email del pannello non leggibili da GitHub ({type(e).__name__}): si usano i Secrets."]
+    return esettings.effective_smtp(base, stored, str(_github_cfg().get("token") or ""))
+
+
+def _email_settings_path() -> str:
+    return str(_github_cfg().get("email_settings_path") or "data/email_settings.json")
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_email_settings_from_github() -> tuple[dict | None, str | None]:
+    """Admin panel email settings (password only encrypted). Cleared on save; errors are not cached."""
+    g = _github_cfg()
+    if not g.get("token") or not g.get("owner") or not g.get("repo"):
+        return None, None
+    gf = github_utils.get_file(
+        owner=g["owner"], repo=g["repo"], path=_email_settings_path(), token=g["token"],
+        branch=g.get("branch", "main"), max_wait=5,
+    )
+    if gf is None:
+        return None, None
+    data = json.loads(gf.text or "{}")
+    return (data if isinstance(data, dict) else None), gf.sha
+
+
+def _smtp_secrets_cfg() -> dict:
     cfg = _get_secret(("smtp",), None)
     out: dict = {}
     if isinstance(cfg, Mapping):
@@ -278,29 +313,120 @@ def _email_is_configured() -> bool:
     c = _smtp_cfg()
     return bool(c.get("host") and c.get("from"))
 
+def _save_email_settings_cb() -> None:
+    """Admin panel: checks the credentials with the mail server, then stores them (password encrypted)."""
+    token = str(_github_cfg().get("token") or "")
+    try:
+        stored, sha = load_email_settings_from_github()
+    except Exception as e:
+        st.session_state["_smtp_flash"] = ("error", f"Impostazioni email non leggibili da GitHub: {e}")
+        return
+    new = esettings.updated_settings(
+        stored,
+        username=st.session_state.get("smtp_username", ""),
+        from_addr=st.session_state.get("smtp_from", ""),
+        host=st.session_state.get("smtp_host", ""),
+        port=int(st.session_state.get("smtp_port") or 0),
+        starttls=True,
+        new_password=st.session_state.get("smtp_password", ""),
+        secret=token,
+        now=_utc_now_iso(),
+    )
+    candidate, _ = esettings.effective_smtp(_smtp_secrets_cfg(), new, token)
+    if not new["username"] or not candidate.get("password"):
+        st.session_state["_smtp_flash"] = ("error", "Servono l'account e la password per le app.")
+        return
+    try:
+        usvc.check_smtp_login(candidate)
+    except smtplib.SMTPAuthenticationError:
+        st.session_state["_smtp_flash"] = (
+            "error",
+            "Il server ha rifiutato account o password: niente è stato salvato. Con Gmail serve una "
+            "*password per le app* (non la password normale dell'account).",
+        )
+        return
+    except Exception as e:
+        st.session_state["_smtp_flash"] = ("error", f"Server di posta non raggiungibile ({type(e).__name__}: {e}): niente è stato salvato.")
+        return
+    g = _github_cfg()
+    try:
+        github_utils.put_file(
+            owner=g["owner"], repo=g["repo"], path=_email_settings_path(), token=g["token"],
+            branch=g.get("branch", "main"), sha=sha,
+            message=f"Update email settings ({new['updated_at']})",
+            text=json.dumps(new, indent=2, ensure_ascii=False) + "\n",
+        )
+    except Exception as e:
+        st.session_state["_smtp_flash"] = ("error", f"Credenziali corrette ma non salvate su GitHub: {e}")
+        return
+    load_email_settings_from_github.clear()
+    try:
+        _save_queue().cfg = _service_config()   # anche i salvataggi in coda usano le nuove credenziali
+    except Exception:
+        pass
+    st.session_state["smtp_password"] = ""
+    st.session_state["_smtp_flash"] = ("success", "Credenziali salvate e verificate con il server di posta ✅")
+
+
 def _render_email_admin_panel() -> None:
-    """One SMTP setup (Secrets [smtp]) for PIN codes and receipts: status and test mail."""
-    c = _smtp_cfg()
+    """One SMTP setup for PIN codes and receipts: status, credentials (password encrypted), test mail."""
+    c, warnings = _smtp_cfg_with_warnings()
+    try:
+        stored, _sha = load_email_settings_from_github()
+    except Exception:
+        stored = None
+    view = esettings.public_view(stored)
     st.caption(
         "Una sola configurazione, usata per i codici PIN (primo accesso e recupero) "
         "e per le mail di resoconto dopo ogni invio delle indisponibilità."
     )
+    flash = st.session_state.pop("_smtp_flash", None)
+    if flash:
+        (st.success if flash[0] == "success" else st.error)(flash[1])
     if _email_is_configured():
+        source = "pannello" if view["password_set"] and not warnings else "Secrets"
         st.success(
             f"Email configurata: {c.get('host')}:{c.get('port')} · mittente {c.get('from')}"
             + (f" · account {_mask_email(str(c.get('username')))}" if c.get("username") else "")
-            + (" · password impostata" if c.get("password") else " · senza password")
-            + (" · STARTTLS" if c.get("starttls", True) else "")
+            + (f" · password dal {source}" if c.get("password") else " · senza password")
         )
     else:
         st.warning(
             "Email non configurata: niente codici PIN via mail e niente mail di resoconto "
             "(i salvataggi funzionano comunque)."
         )
+    for w in warnings:
+        st.warning(w)
+
+    st.markdown("**Account per l'invio**")
     st.caption(
-        "Le credenziali stanno nei Secrets di Streamlit Cloud (Settings → Secrets, sezione [smtp]) "
-        "e non in questa pagina: il repository dei dati è pubblico e una password salvata lì sarebbe leggibile da chiunque."
+        "Con Gmail serve una *password per le app*: Account Google → Sicurezza → Verifica in due passaggi → "
+        "Password per le app. Prima di salvarla viene provata col server; nel repository dei dati "
+        "(pubblico) resta solo cifrata, con una chiave ricavata dal token GitHub dei Secrets: "
+        "se un giorno cambi quel token, reinseriscila qui."
     )
+    _e1, _e2 = st.columns(2)
+    with _e1:
+        st.text_input("Account (es. Gmail)", value=str(view.get("username") or c.get("username") or ""), key="smtp_username")
+    with _e2:
+        st.text_input("Mittente (vuoto = l'account)", value=str(view.get("from") or ""), key="smtp_from")
+    _e3, _e4, _e5 = st.columns([2, 2, 1])
+    with _e3:
+        st.text_input(
+            "Password per le app",
+            type="password",
+            key="smtp_password",
+            placeholder="già impostata: lascia vuoto per non cambiarla" if view["password_set"] else "16 lettere",
+        )
+    with _e4:
+        st.text_input("Server SMTP", value=str(view.get("host") or c.get("host") or esettings.GMAIL["host"]), key="smtp_host")
+    with _e5:
+        st.number_input("Porta", min_value=1, max_value=65535, value=int(view.get("port") or c.get("port") or esettings.GMAIL["port"]), key="smtp_port")
+    st.button("💾 Verifica e salva", key="smtp_save", type="primary", on_click=_save_email_settings_cb)
+    if view.get("password_set_at"):
+        st.caption(f"Password impostata dal pannello il {view['password_set_at'][:10]}.")
+
+    st.markdown("**Prova**")
     _to = st.text_input("Invia una mail di prova a", key="smtp_test_to", placeholder="nome@esempio.it")
     if st.button("✉️ Invia mail di prova", key="smtp_test_send", disabled=not _email_is_configured()):
         valid = receipts.recipients(_to, [])[0]

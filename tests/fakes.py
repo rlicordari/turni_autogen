@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import random
+import smtplib
 import threading
 from urllib.parse import unquote
 
@@ -139,6 +140,8 @@ class FakeGithubHTTP:
 
 class FakeSMTP:
     sent: list = []
+    logins: list = []          # (username, password) of every login
+    reject_login = False       # True: the server refuses the credentials
     lock = threading.Lock()
 
     def __init__(self, host, port, timeout=20):
@@ -157,7 +160,10 @@ class FakeSMTP:
         pass
 
     def login(self, user, password):
-        pass
+        with FakeSMTP.lock:
+            FakeSMTP.logins.append((user, password))
+        if FakeSMTP.reject_login:
+            raise smtplib.SMTPAuthenticationError(535, b"5.7.8 Username and Password not accepted")
 
     def send_message(self, msg):
         with FakeSMTP.lock:
