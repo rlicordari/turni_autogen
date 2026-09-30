@@ -202,6 +202,64 @@ class GenerationMemoryTests(unittest.TestCase):
         self.assertEqual(usage["counts"], {})
         self.assertEqual(usage["night_dates_by_doc"]["2026-10"]["Zito"], ["2026-09-30"])
 
+    def test_prior_usage_counts_festive_day_duties_only_on_festive_dates(self):
+        memory = gm.empty_memory()
+        memory = gm.append_version(
+            memory,
+            version_id="v1",
+            label="Ottobre prima settimana",
+            start_date=dt.date(2026, 10, 1),
+            end_date=dt.date(2026, 10, 7),
+            assignments={
+                # Domenica: slot DE e HI unificati scritti su due colonne.
+                "2026-10-04": {"D": ["B"], "E": ["B"], "H": ["C"], "I": ["C"]},
+                # Feriali: H/D/E normali, non festivi.
+                "2026-10-05": {"H": ["A"], "D": ["B"], "E": ["C"]},
+                "2026-10-06": {"H": ["A"]},
+                "2026-10-07": {"H": ["A"]},
+            },
+            active=True,
+        )
+
+        usage = gm.build_solver_prior_usage(
+            memory,
+            dt.date(2026, 10, 8),
+            dt.date(2026, 10, 31),
+        )
+
+        october = usage["counts"]["2026-10"]
+        self.assertEqual(october["A"].get("FESTIVI", 0), 0)
+        self.assertEqual(october["B"]["FESTIVI"], 1)
+        self.assertEqual(october["C"]["FESTIVI"], 1)
+
+    def test_prior_usage_festive_dates_extra_marks_local_holiday(self):
+        memory = gm.empty_memory()
+        memory = gm.append_version(
+            memory,
+            version_id="v1",
+            label="Giugno prima settimana",
+            start_date=dt.date(2026, 6, 1),
+            end_date=dt.date(2026, 6, 5),
+            assignments={"2026-06-03": {"D": ["A"], "E": ["A"]}},
+            active=True,
+        )
+
+        usage = gm.build_solver_prior_usage(
+            memory,
+            dt.date(2026, 6, 8),
+            dt.date(2026, 6, 30),
+            festive_dates={"2026-06-03"},
+        )
+
+        self.assertEqual(usage["counts"]["2026-06"]["A"]["FESTIVI"], 1)
+
+    def test_resolve_selected_version_ids_keeps_explicit_empty_selection(self):
+        self.assertEqual(gm.resolve_selected_version_ids([], ["v1", "v2"]), set())
+        self.assertEqual(gm.resolve_selected_version_ids(["v2"], ["v1", "v2"]), {"v2"})
+
+    def test_resolve_selected_version_ids_defaults_when_never_selected(self):
+        self.assertEqual(gm.resolve_selected_version_ids(None, ["v1", "v2"]), {"v1", "v2"})
+
     def test_prior_usage_ignores_generated_memory_for_finalized_months(self):
         memory = gm.empty_memory()
         memory = gm.append_version(

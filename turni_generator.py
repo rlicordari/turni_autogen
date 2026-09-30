@@ -2398,9 +2398,9 @@ def solve_with_ortools(
                          or {})
         try:
             if col_n == "FESTIVI":
-                direct = int(by_col.get("Festivi", by_col.get("FESTIVI", 0)) or 0)
-                if direct <= 0:
-                    direct = sum(int(by_col.get(c, 0) or 0) for c in ("D", "E", "H", "I"))
+                # Only explicit festive counts: summing D/E/H/I would treat weekday
+                # duties as festive and double-count the unified DE/HI slots.
+                direct = int(by_col.get("FESTIVI", by_col.get("Festivi", 0)) or 0)
                 return direct + int(period_by_col.get("Festivi", period_by_col.get("FESTIVI", 0)) or 0)
             return int(by_col.get(col_n, 0) or 0) + int(period_by_col.get(col_n, 0) or 0)
         except Exception:
@@ -2412,12 +2412,32 @@ def solve_with_ortools(
         doc_n = norm_name(doc)
         by_col = prior_counts_month.get(doc_n) or prior_counts_month.get(str(doc).strip()) or {}
         total = 0
-        for v in by_col.values():
+        for k, v in by_col.items():
+            if str(k).strip().upper() in {"FESTIVI", "J_FESTIVI"}:
+                continue  # derived counters, already included in the column counts
             try:
                 total += int(v or 0)
             except Exception:
                 continue
         return total
+
+    def _prior_month_night_dates(doc: str) -> List[dt.date]:
+        """Prior J dates inside the solved month.
+
+        night_dates_by_doc also carries previous-month nights for spacing and
+        post-night carryover; they must not count as usage of this month.
+        """
+        doc_n = norm_name(doc)
+        by_doc = ((prior_usage.get("night_dates_by_doc") or {}).get(month_key_for_solver) or {})
+        out: List[dt.date] = []
+        for ds in (by_doc.get(doc_n) or by_doc.get(str(doc).strip()) or []):
+            try:
+                d = dt.date.fromisoformat(str(ds)[:10])
+            except Exception:
+                continue
+            if f"{d.year:04d}-{d.month:02d}" == month_key_for_solver:
+                out.append(d)
+        return out
 
     def _prior_j_weekend_count(doc: Optional[str]) -> int:
         if not doc:
@@ -2426,49 +2446,18 @@ def solve_with_ortools(
         period_by_col = ((prior_usage.get("period_counts") or {}).get(doc_n)
                          or (prior_usage.get("period_counts") or {}).get(str(doc).strip())
                          or {})
-        by_doc = ((prior_usage.get("night_dates_by_doc") or {}).get(month_key_for_solver) or {})
-        dates = by_doc.get(doc_n) or by_doc.get(str(doc).strip()) or []
         total = int(period_by_col.get("J_FESTIVI", 0) or 0)
-        for ds in dates:
-            try:
-                d = dt.date.fromisoformat(str(ds)[:10])
-            except Exception:
-                continue
-            if _date_is_j_festive(d):
-                total += 1
-        return total
+        return total + sum(1 for d in _prior_month_night_dates(doc) if _date_is_j_festive(d))
 
     def _prior_j_weekday_count(doc: Optional[str]) -> int:
         if not doc:
             return 0
-        doc_n = norm_name(doc)
-        by_doc = ((prior_usage.get("night_dates_by_doc") or {}).get(month_key_for_solver) or {})
-        dates = by_doc.get(doc_n) or by_doc.get(str(doc).strip()) or []
-        total = 0
-        for ds in dates:
-            try:
-                d = dt.date.fromisoformat(str(ds)[:10])
-            except Exception:
-                continue
-            if not _date_is_j_festive(d):
-                total += 1
-        return total
+        return sum(1 for d in _prior_month_night_dates(doc) if not _date_is_j_festive(d))
 
     def _prior_j_sunday_count(doc: Optional[str]) -> int:
         if not doc:
             return 0
-        doc_n = norm_name(doc)
-        by_doc = ((prior_usage.get("night_dates_by_doc") or {}).get(month_key_for_solver) or {})
-        dates = by_doc.get(doc_n) or by_doc.get(str(doc).strip()) or []
-        total = 0
-        for ds in dates:
-            try:
-                d = dt.date.fromisoformat(str(ds)[:10])
-            except Exception:
-                continue
-            if d.weekday() == 6:
-                total += 1
-        return total
+        return sum(1 for d in _prior_month_night_dates(doc) if d.weekday() == 6)
 
     def _prior_rule_balance_count(doc: Optional[str], rule_key: Optional[str]) -> int:
         if not doc or not rule_key:
@@ -4454,6 +4443,30 @@ def solve_with_ortools(
                     model.Add(cnt + short >= target_rec)
                     extra_obj.append(target_pen * short)
 
+    # Tetto anti-dominanza per colonna: ceil(slot / medici assegnabili) + 1.
+    # Il pool conta solo chi ha almeno uno slot nel periodo (chi e' in ferie non
+    # fa capacita') ed e' soft: sforare costa molto ma meno di uno slot vuoto.
+    DOMINANCE_CAP_PENALTY = 100_000_000
+
+    def _add_soft_dominance_cap(col: str, pool_raw: List[str]) -> None:
+        col_slots = [s for s in slots if s.columns == [col]]
+        vars_by_doc = {}
+        for d in dict.fromkeys(norm_name(p) for p in pool_raw):
+            if d not in doctors:
+                continue
+            vars_ = [x[(s.slot_id, d)] for s in col_slots if (s.slot_id, d) in x]
+            if vars_:
+                vars_by_doc[d] = vars_
+        if not vars_by_doc:
+            return
+        cap = math.ceil(len(col_slots) / len(vars_by_doc)) + 1
+        for d, vars_ in vars_by_doc.items():
+            if len(vars_) <= cap:
+                continue
+            over = model.NewIntVar(0, len(vars_), f"dom_over_{col}_{hash(d)%10**6}")
+            model.Add(over >= sum(vars_) - cap)
+            extra_obj.append(DOMINANCE_CAP_PENALTY * over)
+
     if "rules" in cfg and "Q" in cfg["rules"]:
         rQ = cfg["rules"]["Q"] or {}
         if "Recupero" in doctors:
@@ -4465,30 +4478,13 @@ def solve_with_ortools(
                         vars_.append(x[(s.slot_id, "Recupero")])
                 if vars_:
                     model.Add(sum(vars_) <= max_rec)
-        # Q: hard cap per ogni medico del pool per evitare dominanza
-        # Ideale: round(n_Q_slots / pool_size) + 1
-        q_pool_raw = [norm_name(d) for d in (rQ.get("pool") or []) if norm_name(d) in doctors]
-        q_slots = [s for s in slots if s.columns == ["Q"]]
-        if q_pool_raw and q_slots:
-            import math as _math
-            q_cap = _math.ceil(len(q_slots) / len(q_pool_raw)) + 1
-            for doc in q_pool_raw:
-                vars_ = [x[(s.slot_id, doc)] for s in q_slots if (s.slot_id, doc) in x]
-                if vars_:
-                    model.Add(sum(vars_) <= q_cap)
+        # Q: tetto anti-dominanza per ogni medico del pool
+        _add_soft_dominance_cap("Q", rQ.get("pool") or [])
 
-    # T: hard cap per ogni medico del pool per evitare dominanza (Cimino/D'Angelo/Recupero a 5)
+    # T: tetto anti-dominanza per ogni medico del pool (Cimino/D'Angelo/Recupero a 5)
     if "rules" in cfg and "T" in cfg["rules"]:
         rT2 = cfg["rules"]["T"] or {}
-        t_pool_raw = [norm_name(d) for d in (rT2.get("pool") or []) if norm_name(d) in doctors]
-        t_slots = [s for s in slots if s.columns == ["T"]]
-        if t_pool_raw and t_slots:
-            import math as _math
-            t_cap = _math.ceil(len(t_slots) / len(t_pool_raw)) + 1
-            for doc in t_pool_raw:
-                vars_ = [x[(s.slot_id, doc)] for s in t_slots if (s.slot_id, doc) in x]
-                if vars_:
-                    model.Add(sum(vars_) <= t_cap)
+        _add_soft_dominance_cap("T", rT2.get("pool") or [])
 
     # W: cap Recupero per evitare che domini il turno
     if "rules" in cfg and "W" in cfg["rules"] and "Recupero" in doctors:
@@ -4970,7 +4966,7 @@ def solve_with_ortools(
             for _fa2 in (fixed_assignments or []):
                 try:
                     _fc2 = str(_fa2.get("column","")).strip().upper()
-                    _fd2 = date.fromisoformat(str(_fa2.get("date","")).strip())
+                    _fd2 = dt.date.fromisoformat(str(_fa2.get("date","")).strip())
                     _fdc2 = norm_name(str(_fa2.get("doctor","")).strip())
                     if _fc2 == "J":
                         continue
@@ -5032,6 +5028,7 @@ def solve_with_ortools(
                                 _model2.Add(_v1_2 + _v2_2 <= 1)
 
                 _solver_t1 = cp_model.CpSolver()
+                _solver_t1.parameters.num_search_workers = 1
                 _solver_t1.parameters.max_time_in_seconds = 8.0
                 _st_t1 = _solver_t1.Solve(_model2)
                 if _st_t1 == cp_model.INFEASIBLE:
@@ -5065,6 +5062,7 @@ def solve_with_ortools(
                     _uni_added = True
                 if _uni_added:
                     _slv3 = cp_model.CpSolver()
+                    _slv3.parameters.num_search_workers = 1
                     _slv3.parameters.max_time_in_seconds = 8.0
                     _st3 = _slv3.Solve(_model2)
                     if _st3 == cp_model.INFEASIBLE:
@@ -5091,6 +5089,7 @@ def solve_with_ortools(
                             _model2.Add(_ec3 == sum(_ev3))
                             _model2.Add(_ec3 <= _emax3)
                     _slv4 = cp_model.CpSolver()
+                    _slv4.parameters.num_search_workers = 1
                     _slv4.parameters.max_time_in_seconds = 8.0
                     _st4 = _slv4.Solve(_model2)
                     if _st4 == cp_model.INFEASIBLE:
@@ -5114,6 +5113,7 @@ def solve_with_ortools(
                                 if _v2_4 is not None:
                                     _model2.Add(_v1_4 + _v2_4 <= 1)
                     _slv5 = cp_model.CpSolver()
+                    _slv5.parameters.num_search_workers = 1
                     _slv5.parameters.max_time_in_seconds = 10.0
                     _st5 = _slv5.Solve(_model2)
                     if _st5 == cp_model.INFEASIBLE:
@@ -5137,6 +5137,7 @@ def solve_with_ortools(
                             if _vv1 and _vv2:
                                 _model2.Add(sum(_vv1) + sum(_vv2) <= 1)
                 _slv6 = cp_model.CpSolver()
+                _slv6.parameters.num_search_workers = 1
                 _slv6.parameters.max_time_in_seconds = 10.0
                 _st6 = _slv6.Solve(_model2)
                 if _st6 == cp_model.INFEASIBLE:

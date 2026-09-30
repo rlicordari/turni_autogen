@@ -1,8 +1,10 @@
 import datetime as dt
+import multiprocessing
 import tempfile
 import unittest
 from pathlib import Path
 
+import generation_memory as gm
 from pool_config_store import audit_pool_config, normalize_pool_config
 from turni_generator import (
     DayRow,
@@ -1447,6 +1449,156 @@ class SolverRegressionTests(unittest.TestCase):
 
         self.assertNotEqual(stats["status"], "PARTIAL")
         self.assertEqual(0, sum(1 for d in days if assignment.get(f"{d.date}-J") == "A"))
+
+    def test_partial_period_weekday_afternoons_are_not_prior_festive_days(self):
+        # A ha fatto 3 pomeriggi H feriali nella prima settimana salvata:
+        # non sono festivi e non devono togliergli le domeniche del resto del mese.
+        memory = gm.append_version(
+            gm.empty_memory(),
+            version_id="w1",
+            label="Ottobre prima settimana",
+            start_date=dt.date(2026, 10, 1),
+            end_date=dt.date(2026, 10, 7),
+            assignments={
+                "2026-10-05": {"H": ["A"]},
+                "2026-10-06": {"H": ["A"]},
+                "2026-10-07": {"H": ["A"]},
+            },
+        )
+        prior_usage = gm.build_solver_prior_usage(memory, dt.date(2026, 10, 8), dt.date(2026, 10, 31))
+        cfg = {"rules": {"Festivi": {"pool": ["A", "B"]}}, "global_constraints": {}}
+        days = [DayRow(dt.date(2026, 10, 11), "Sun", 2), DayRow(dt.date(2026, 10, 18), "Sun", 3)]
+        slots = [
+            Slot(d, f"{d.date}-DE", ["D", "E"], ["A", "B"], required=True, shift="Mattina", rule_tag="Festivo_DE")
+            for d in days
+        ]
+
+        assignment, stats = solve_with_ortools(cfg, days, slots, prior_usage=prior_usage)
+
+        self.assertNotEqual(stats["status"], "PARTIAL")
+        self.assertEqual(sorted(assignment.values()), ["A", "B"])
+
+    def test_previous_month_carryover_nights_do_not_count_as_current_month_weekend_usage(self):
+        # Le notti di settembre servono solo per spacing/smonto a inizio ottobre:
+        # non devono pesare sul bilanciamento weekend/feriali di ottobre.
+        cfg = {
+            "rules": {"J": {"pool_other": ["A", "B"]}},
+            "global_constraints": {
+                "night_spacing_days_min": 5,
+                "night_off": {"same_day": True, "next_day": True},
+            },
+        }
+        days = [DayRow(dt.date(2026, 10, 10), "Sat", 2), DayRow(dt.date(2026, 10, 19), "Mon", 3)]
+        slots = [
+            Slot(d, f"{d.date}-J", ["J"], ["A", "B"], required=True, shift="Notte", rule_tag="J")
+            for d in days
+        ]
+        prior_usage = {"counts": {}, "night_dates_by_doc": {"2026-10": {"A": ["2026-09-26"]}}}
+        # Unico criterio rimasto a parità di bilanciamento: A preferisce il sabato.
+        prefs = [{"doctor": "A", "date": "2026-10-10", "shift": "Notte", "priority": "bassa"}]
+
+        assignment, stats = solve_with_ortools(
+            cfg, days, slots, availability_preferences=prefs, prior_usage=prior_usage
+        )
+
+        self.assertNotEqual(stats["status"], "PARTIAL")
+        self.assertEqual(assignment["2026-10-10-J"], "A")
+
+    def _twelve_working_days(self, start: dt.date):
+        days = []
+        d = start
+        while len(days) < 12:
+            if d.weekday() < 6:
+                days.append(DayRow(d, ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][d.weekday()], len(days) + 2))
+            d += dt.timedelta(days=1)
+        return days
+
+    def test_q_cap_does_not_leave_coverable_slots_blank_when_pool_is_on_leave(self):
+        # Pool Q di 6 medici ma 4 in ferie: A e B devono coprire tutto,
+        # il tetto anti-dominanza non puo' produrre buchi evitabili.
+        cfg = {"rules": {"Q": {"pool": ["A", "B", "C", "D", "E", "F"]}}, "global_constraints": {}}
+        days = self._twelve_working_days(dt.date(2026, 10, 5))
+        slots = [
+            Slot(d, f"{d.date}-Q", ["Q"], ["A", "B"], required=True, shift="Mattina", rule_tag="Q")
+            for d in days
+        ]
+
+        assignment, stats = solve_with_ortools(cfg, days, slots)
+
+        self.assertNotEqual(stats["status"], "PARTIAL")
+        self.assertTrue(all(assignment[s.slot_id] for s in slots))
+
+    def test_t_cap_does_not_leave_coverable_slots_blank_when_pool_is_on_leave(self):
+        cfg = {"rules": {"T": {"pool": ["A", "B", "C", "D", "E", "F"]}}, "global_constraints": {}}
+        days = self._twelve_working_days(dt.date(2026, 10, 5))
+        slots = [
+            Slot(d, f"{d.date}-T", ["T"], ["A", "B"], required=True, shift="Mattina", rule_tag="T")
+            for d in days
+        ]
+
+        assignment, stats = solve_with_ortools(cfg, days, slots)
+
+        self.assertNotEqual(stats["status"], "PARTIAL")
+        self.assertTrue(all(assignment[s.slot_id] for s in slots))
+
+    def test_infeasible_fixed_assignments_are_reported_by_diagnostic_retry(self):
+        cfg = {
+            "rules": {"K": {"pool": ["A", "B"]}, "Q": {"pool": ["A", "B"]}},
+            "global_constraints": {},
+        }
+        day = DayRow(dt.date(2026, 10, 5), "Mon", 2)
+        slots = [
+            Slot(day, "2026-10-05-K", ["K"], ["A", "B"], required=True, shift="Mattina", rule_tag="K"),
+            Slot(day, "2026-10-05-Q", ["Q"], ["A", "B"], required=True, shift="Mattina", rule_tag="Q"),
+        ]
+        fixed = [
+            {"doctor": "A", "date": "2026-10-05", "column": "K"},
+            {"doctor": "A", "date": "2026-10-05", "column": "Q"},
+        ]
+
+        with self.assertRaises(RuntimeError) as ctx:
+            solve_with_ortools(cfg, [day], slots, fixed_assignments=fixed)
+
+        self.assertIn("fixed_assignments impossibili", str(ctx.exception))
+
+    def test_diagnostic_retry_terminates_when_only_night_constraints_conflict(self):
+        # J fisse incompatibili con lo spacing: il modello principale e' infeasible,
+        # il retry diagnostico deve testare i gruppi e terminare (niente blocco
+        # multi-thread di OR-Tools, vedi CLAUDE.md su num_search_workers).
+        ctx = multiprocessing.get_context("spawn")
+        queue = ctx.Queue()
+        proc = ctx.Process(target=_run_conflicting_fixed_nights, args=(queue,))
+        proc.start()
+        proc.join(timeout=120)
+        if proc.is_alive():
+            proc.terminate()
+            proc.join()
+            self.fail("solve_with_ortools non termina nel retry diagnostico")
+        self.assertIn("Slot critici", queue.get(timeout=5))
+
+
+def _run_conflicting_fixed_nights(queue):
+    cfg = {
+        "rules": {"J": {"pool_other": ["A", "B"]}},
+        "global_constraints": {
+            "night_spacing_days_min": 5,
+            "night_off": {"same_day": True, "next_day": False},
+        },
+    }
+    days = [DayRow(dt.date(2026, 10, 5), "Mon", 2), DayRow(dt.date(2026, 10, 6), "Tue", 3)]
+    slots = [
+        Slot(d, f"{d.date}-J", ["J"], ["A", "B"], required=True, shift="Notte", rule_tag="J")
+        for d in days
+    ]
+    fixed = [
+        {"doctor": "A", "date": "2026-10-05", "column": "J"},
+        {"doctor": "A", "date": "2026-10-06", "column": "J"},
+    ]
+    try:
+        solve_with_ortools(cfg, days, slots, fixed_assignments=fixed)
+        queue.put("NO_ERROR")
+    except RuntimeError as e:
+        queue.put(str(e))
 
 
 if __name__ == "__main__":

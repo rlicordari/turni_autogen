@@ -10,7 +10,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 import openpyxl
 
@@ -154,6 +154,21 @@ def _effective_active_assignments(
     return out
 
 
+def resolve_selected_version_ids(saved_ids: Any, default_ids: Iterable[str]) -> set[str]:
+    """Versions to use for a generation.
+
+    An explicit selection (even empty) wins; defaults apply only when the admin
+    never made a selection.
+    """
+    if isinstance(saved_ids, (list, tuple, set)):
+        return {str(v) for v in saved_ids}
+    return {str(v) for v in default_ids}
+
+
+def _is_festive_date(day: dt.date, extra: set[dt.date]) -> bool:
+    return day in extra or shift_history._is_holiday(dt.datetime(day.year, day.month, day.day))
+
+
 def build_solver_prior_usage(
     memory: dict | None,
     start_date: dt.date,
@@ -161,15 +176,21 @@ def build_solver_prior_usage(
     *,
     finalized_months: Optional[set[str]] = None,
     selected_version_ids: Optional[set[str]] = None,
+    festive_dates: Optional[Iterable[dt.date | str]] = None,
 ) -> dict:
     """Build compact prior usage for the solver.
 
     Only active versions are considered. For each target month, only assignments
     with date < first generated date in that month are counted. This prevents a
     saved version of the same period from counting against its own regeneration.
+
+    counts[month][doctor]["FESTIVI"] counts festive day duties like the solver's
+    Festivo_DE/Festivo_HI slots: on a festive date, +1 for D/E and +1 for H/I.
+    `festive_dates` adds local holidays (e.g. turni_festivi.yml festivi_extra).
     """
     cutoffs = _target_month_cutoffs(start_date, end_date)
     finalized = set(finalized_months or set())
+    extra_festive = {d for d in (_parse_date(x) for x in (festive_dates or [])) if d is not None}
     counts: dict[str, dict[str, dict[str, int]]] = {}
     night_dates: dict[str, dict[str, list[str]]] = {}
     versions_used: list[str] = []
@@ -200,6 +221,17 @@ def build_solver_prior_usage(
             continue
         if day >= cutoff:
             continue
+        if _is_festive_date(day, extra_festive):
+            for group in (("D", "E"), ("H", "I")):
+                group_docs = set()
+                for col, docs in by_col.items():
+                    if str(col).strip().upper() in group and isinstance(docs, list):
+                        group_docs |= {str(d).strip() for d in docs}
+                for doc_s in group_docs:
+                    if not doc_s or doc_s in OPERATIONAL_EXCLUDED_DOCTORS:
+                        continue
+                    by_doc = counts.setdefault(mk, {}).setdefault(doc_s, {})
+                    by_doc["FESTIVI"] = by_doc.get("FESTIVI", 0) + 1
         for col, docs in by_col.items():
             col_s = str(col).strip().upper()
             if not col_s or not isinstance(docs, list):
