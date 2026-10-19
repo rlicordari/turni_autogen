@@ -94,6 +94,12 @@ def unavail_path(cfg: ServiceConfig, doctor: str) -> str:
     return f"{base}/unavail_{doctor_slug(doctor)}.csv"
 
 
+def avail_path(cfg: ServiceConfig, doctor: str) -> str:
+    """Preferences ("availability") of one doctor."""
+    base = str(_gh(cfg).get("per_doctor_avail_dir") or "data/availability").rstrip("/")
+    return f"{base}/avail_{doctor_slug(doctor)}.csv"
+
+
 def audit_path(cfg: ServiceConfig, month_key: str) -> str:
     base = str(_gh(cfg).get("audit_dir") or "data/unavailability_audit").rstrip("/")
     return f"{base}/unavailability_audit_{month_key}.csv"
@@ -120,19 +126,29 @@ def is_conflict_error(err: Exception) -> bool:
 
 # ── GitHub I/O ───────────────────────────────────────────────────────────────
 
-def load_doctor_rows(cfg: ServiceConfig, doctor: str, *, max_wait: Optional[float] = None):
+def _load_rows(cfg: ServiceConfig, path: str, *, max_wait: Optional[float] = None):
     g = _gh(cfg)
-    gf = github_utils.get_file(g["owner"], g["repo"], unavail_path(cfg, doctor), g["token"], g["branch"], max_wait=max_wait)
+    gf = github_utils.get_file(g["owner"], g["repo"], path, g["token"], g["branch"], max_wait=max_wait)
     if gf is None:
         return [], None
     return ustore.load_store(gf.text), gf.sha
 
 
-def _put_rows_fn(cfg: ServiceConfig, doctor: str, message: str, *, max_wait: Optional[float] = None):
+def load_doctor_rows(cfg: ServiceConfig, doctor: str, *, max_wait: Optional[float] = None):
+    return _load_rows(cfg, unavail_path(cfg, doctor), max_wait=max_wait)
+
+
+def load_doctor_pref_rows(cfg: ServiceConfig, doctor: str, *, max_wait: Optional[float] = None):
+    return _load_rows(cfg, avail_path(cfg, doctor), max_wait=max_wait)
+
+
+def _put_rows_fn(cfg: ServiceConfig, doctor: str, message: str, *, max_wait: Optional[float] = None, path: Optional[str] = None):
+    path = path or unavail_path(cfg, doctor)
+
     def _save(rows, sha):
         g = _gh(cfg)
         resp = github_utils.put_file(
-            g["owner"], g["repo"], unavail_path(cfg, doctor), g["token"], message, ustore.to_csv(rows),
+            g["owner"], g["repo"], path, g["token"], message, ustore.to_csv(rows),
             branch=g["branch"], sha=sha, max_wait=max_wait,
         )
         resp = resp if isinstance(resp, dict) else {}
@@ -206,6 +222,13 @@ class SaveJob:
     next_attempt_at: float = 0.0
     last_error: str = ""
     origins: dict = field(default_factory=dict)   # {(yy, mm): editor/session id}
+    # Preferences: same rules, entries (date, shift, note, priority), signatures with priority.
+    pref_entries_by_month: dict = field(default_factory=dict)
+    pref_base_signatures: dict = field(default_factory=dict)
+    pref_origins: dict = field(default_factory=dict)
+    # Diffs already written by an earlier attempt of this job ({"unav"|"pref": {month: diff}}):
+    # if GitHub fails between the two files, the final receipt still lists both.
+    landed: dict = field(default_factory=dict)
 
 
 def make_job(
@@ -217,9 +240,12 @@ def make_job(
     by_admin: bool = False,
     created_at: Optional[float] = None,
     origin: str = "",
+    pref_entries_by_month: Optional[dict] = None,
+    pref_base_signatures: Optional[dict] = None,
 ) -> SaveJob:
     """`origin` identifies the editor session: a month waiting in the queue (or
     just landed from it) can be continued only by the same session."""
+    pref_entries_by_month = pref_entries_by_month or {}
     return SaveJob(
         job_id=str(uuid.uuid4()),
         doctor=doctor,
@@ -229,6 +255,11 @@ def make_job(
         by_admin=by_admin,
         created_at=time.time() if created_at is None else created_at,
         origins={tuple(k): str(origin) for k in entries_by_month},
+        pref_entries_by_month={tuple(k): list(v) for k, v in pref_entries_by_month.items()},
+        pref_base_signatures={
+            tuple(k): ustore.normalize_signature(v) for k, v in (pref_base_signatures or {}).items()
+        },
+        pref_origins={tuple(k): str(origin) for k in pref_entries_by_month},
     )
 
 
@@ -237,23 +268,87 @@ class SaveResult:
     job: SaveJob
     outcome: ustore.SaveOutcome
     saved_at: str
+    pref_outcome: Optional[ustore.SaveOutcome] = None
+    pref_error: str = ""     # preferences blocked after the unavailability had already landed
+
+    @property
+    def changed(self) -> bool:
+        return bool(self.outcome.changed or (self.pref_outcome is not None and self.pref_outcome.changed))
+
+
+def _check_pref_bases(cfg: ServiceConfig, job: SaveJob, *, max_wait: Optional[float]) -> None:
+    """Preference conflicts are detected BEFORE anything is written (no half saves)."""
+    rows, _sha = load_doctor_pref_rows(cfg, job.doctor, max_wait=max_wait)
+    for (yy, mm), entries in sorted(job.pref_entries_by_month.items()):
+        current = ustore.month_signature(rows, job.doctor, int(yy), int(mm), with_priority=True)
+        if current == ustore.entries_signature(entries, with_priority=True):
+            continue
+        base = job.pref_base_signatures.get((yy, mm))
+        if base is not None and current != ustore.normalize_signature(base):
+            raise ustore.MonthConflictError(f"{int(yy):04d}-{int(mm):02d}", "preferenze")
+
+
+def _with_landed(outcome: ustore.SaveOutcome, landed: dict) -> ustore.SaveOutcome:
+    diffs = {**(landed or {}), **(outcome.diffs or {})}
+    return ustore.SaveOutcome(
+        changed=bool(diffs), diffs=diffs, verified_rows=outcome.verified_rows,
+        sha=outcome.sha, commit_sha=outcome.commit_sha,
+    )
 
 
 def save_now(cfg: ServiceConfig, job: SaveJob, *, max_wait: Optional[float] = None) -> SaveResult:
-    """Save the job's months now. Raises GithubUnavailable or MonthConflictError."""
+    """Save the job's months (unavailability, then preferences) now.
+
+    Raises GithubUnavailable or MonthConflictError. Conflicts of either file are
+    checked before the first write; what an earlier attempt already wrote is
+    kept in job.landed so the final receipt/audit list it.
+    """
     saved_at = utc_now_iso()
     prefix = "Admin update" if job.by_admin else "Update"
-    outcome = ustore.save_doctor_months(
-        load_fn=lambda: load_doctor_rows(cfg, job.doctor, max_wait=max_wait),
-        save_fn=_put_rows_fn(cfg, job.doctor, f"{prefix} unavailability: {job.doctor} ({saved_at})", max_wait=max_wait),
+    common = dict(
         doctor=job.doctor,
-        entries_by_month=job.entries_by_month,
-        base_signatures=job.base_signatures,
         updated_at=saved_at,
         is_conflict=is_conflict_error,
         sleep_fn=lambda s: github_utils._sleep(s),
     )
-    return SaveResult(job=job, outcome=outcome, saved_at=saved_at)
+    if job.pref_entries_by_month:
+        _check_pref_bases(cfg, job, max_wait=max_wait)
+
+    if job.entries_by_month:
+        outcome = ustore.save_doctor_months(
+            load_fn=lambda: load_doctor_rows(cfg, job.doctor, max_wait=max_wait),
+            save_fn=_put_rows_fn(cfg, job.doctor, f"{prefix} unavailability: {job.doctor} ({saved_at})", max_wait=max_wait),
+            entries_by_month=job.entries_by_month,
+            base_signatures=job.base_signatures,
+            on_attempt=lambda diffs: job.landed.setdefault("unav", {}).update(diffs),
+            **common,
+        )
+    else:
+        outcome = ustore.SaveOutcome(changed=False)
+    outcome = _with_landed(outcome, job.landed.get("unav"))
+
+    pref_outcome, pref_error = None, ""
+    if job.pref_entries_by_month:
+        try:
+            pref_outcome = ustore.save_doctor_months(
+                load_fn=lambda: load_doctor_pref_rows(cfg, job.doctor, max_wait=max_wait),
+                save_fn=_put_rows_fn(
+                    cfg, job.doctor, f"{prefix} availability: {job.doctor} ({saved_at})",
+                    max_wait=max_wait, path=avail_path(cfg, job.doctor),
+                ),
+                entries_by_month=job.pref_entries_by_month,
+                base_signatures=job.pref_base_signatures,
+                with_priority=True,
+                what="preferenze",
+                on_attempt=lambda diffs: job.landed.setdefault("pref", {}).update(diffs),
+                **common,
+            )
+            pref_outcome = _with_landed(pref_outcome, job.landed.get("pref"))
+        except ustore.MonthConflictError as e:
+            if not outcome.changed:
+                raise
+            pref_error = str(e)   # rare race after the check: the unavailability is saved anyway
+    return SaveResult(job=job, outcome=outcome, saved_at=saved_at, pref_outcome=pref_outcome, pref_error=pref_error)
 
 
 # ── Audit (idempotent) ───────────────────────────────────────────────────────
@@ -293,27 +388,31 @@ def append_audit_row(cfg: ServiceConfig, month_key: str, row: dict, *, max_wait:
 
 
 def write_audit(cfg: ServiceConfig, result: SaveResult, *, action: Optional[str] = None, max_wait: Optional[float] = None) -> list:
-    """One audit row per changed month. Returns warnings (never raises)."""
+    """One audit row per changed month (and per changed preference month). Returns warnings (never raises)."""
     warnings = []
     action = action or ("admin_save" if result.job.by_admin else "save")
-    for mk, diff in sorted((result.outcome.diffs or {}).items()):
-        row = {
-            "ts_utc": result.saved_at,
-            "doctor": result.job.doctor,
-            "month": mk,
-            "action": action,
-            "before_count": diff.get("before_count", 0),
-            "after_count": diff.get("after_count", 0),
-            "added_count": diff.get("added_count", 0),
-            "removed_count": diff.get("removed_count", 0),
-            "note_changed_count": diff.get("note_changed_count", 0),
-            "details_json": json.dumps(diff.get("details", {}), ensure_ascii=False),
-            "app_build": cfg.app_build,
-        }
-        try:
-            append_audit_row(cfg, mk, row, max_wait=max_wait)
-        except Exception as e:
-            warnings.append(f"Audit log non aggiornato per {mk}: {e}")
+    parts = [(action, result.outcome.diffs or {})]
+    if result.pref_outcome is not None:
+        parts.append((f"{action}_pref", result.pref_outcome.diffs or {}))
+    for act, diffs in parts:
+        for mk, diff in sorted(diffs.items()):
+            row = {
+                "ts_utc": result.saved_at,
+                "doctor": result.job.doctor,
+                "month": mk,
+                "action": act,
+                "before_count": diff.get("before_count", 0),
+                "after_count": diff.get("after_count", 0),
+                "added_count": diff.get("added_count", 0),
+                "removed_count": diff.get("removed_count", 0),
+                "note_changed_count": diff.get("note_changed_count", 0),
+                "details_json": json.dumps(diff.get("details", {}), ensure_ascii=False),
+                "app_build": cfg.app_build,
+            }
+            try:
+                append_audit_row(cfg, mk, row, max_wait=max_wait)
+            except Exception as e:
+                warnings.append(f"Audit log non aggiornato per {mk}: {e}")
     return warnings
 
 
@@ -362,7 +461,7 @@ def _mask(addr: str) -> str:
 def send_receipt(cfg: ServiceConfig, result: SaveResult) -> str:
     """Email what the server now holds for the changed months. Never raises."""
     try:
-        if not result.outcome.changed:
+        if not result.changed:
             return ""
         if not email_configured(cfg.smtp):
             return "⚠️ Mail di resoconto non inviata: SMTP non configurato."
@@ -374,9 +473,19 @@ def send_receipt(cfg: ServiceConfig, result: SaveResult) -> str:
             mk: ustore.filter_doctor_month(result.outcome.verified_rows, doctor, int(mk[:4]), int(mk[5:7]))
             for mk in result.outcome.diffs
         }
+        pref = result.pref_outcome
+        pref_diffs = (pref.diffs or {}) if pref is not None else {}
+        pref_rows_by_month = {
+            mk: ustore.filter_doctor_month(pref.verified_rows, doctor, int(mk[:4]), int(mk[5:7]))
+            for mk in pref_diffs
+        }
         subject, body = receipts.build_receipt(
             doctor, rows_by_month, result.outcome.diffs,
-            saved_at_utc=result.saved_at, commit_sha=result.outcome.commit_sha, by_admin=result.job.by_admin,
+            saved_at_utc=result.saved_at,
+            commit_sha=result.outcome.commit_sha or (pref.commit_sha if pref is not None else None),
+            by_admin=result.job.by_admin,
+            pref_rows_by_month=pref_rows_by_month,
+            pref_diffs_by_month=pref_diffs,
         )
         send_email(cfg.smtp, to, cc, subject, body)
         missing = "" if result.job.doctor_email else " (email del medico mancante in anagrafica)"
@@ -394,7 +503,7 @@ def notify_not_saved(cfg: ServiceConfig, job: SaveJob, reason: str) -> str:
         if not to:
             return "nessun destinatario"
         lines = [
-            f"ATTENZIONE: le indisponibilità di {job.doctor} inviate il "
+            f"ATTENZIONE: le indisponibilità/preferenze di {job.doctor} inviate il "
             f"{dt.datetime.fromtimestamp(job.created_at, receipts.LOCAL_TZ):%d/%m/%Y %H:%M} NON sono state registrate.",
             "",
             f"Motivo: {reason}",
@@ -409,6 +518,12 @@ def notify_not_saved(cfg: ServiceConfig, job: SaveJob, reason: str) -> str:
                 lines.append(f"    {d:%d/%m}  {sh}")
             if not entries:
                 lines.append("    (nessuna: il mese doveva restare vuoto)")
+        for (yy, mm), entries in sorted(job.pref_entries_by_month.items()):
+            lines.append(f"  Preferenze {receipts.month_label(f'{yy:04d}-{mm:02d}')}:")
+            for item in sorted(entries):
+                lines.append(f"    {item[0]:%d/%m}  {item[1]} (priorità {item[3] if len(item) > 3 else 'media'})")
+            if not entries:
+                lines.append("    (nessuna: il mese doveva restare vuoto)")
         send_email(cfg.smtp, to, cc, f"⚠️ Indisponibilità NON salvate – {job.doctor}", "\n".join(lines))
         return "notificato"
     except Exception as e:
@@ -421,7 +536,7 @@ def _job_to_json(job: SaveJob) -> dict:
     def months(d):
         return {
             f"{int(yy):04d}-{int(mm):02d}": [
-                [x[0].isoformat() if isinstance(x[0], dt.date) else str(x[0]), str(x[1]), str(x[2])]
+                [x[0].isoformat() if isinstance(x[0], dt.date) else str(x[0])] + [str(v) for v in x[1:]]
                 for x in items
             ]
             for (yy, mm), items in d.items()
@@ -438,6 +553,10 @@ def _job_to_json(job: SaveJob) -> dict:
         "next_attempt_at": job.next_attempt_at,
         "last_error": job.last_error,
         "origins": {f"{int(yy):04d}-{int(mm):02d}": o for (yy, mm), o in job.origins.items()},
+        "pref_entries_by_month": months(job.pref_entries_by_month),
+        "pref_base_signatures": months(job.pref_base_signatures),
+        "pref_origins": {f"{int(yy):04d}-{int(mm):02d}": o for (yy, mm), o in job.pref_origins.items()},
+        "landed": job.landed,
     }
 
 
@@ -461,6 +580,15 @@ def _job_from_json(data: dict) -> SaveJob:
         next_attempt_at=float(data.get("next_attempt_at") or 0),
         last_error=str(data.get("last_error") or ""),
         origins={key(mk): str(o) for mk, o in (data.get("origins") or {}).items()},
+        pref_entries_by_month={
+            key(mk): [(dt.date.fromisoformat(x[0]), x[1], x[2], x[3] if len(x) > 3 else "media") for x in items]
+            for mk, items in (data.get("pref_entries_by_month") or {}).items()
+        },
+        pref_base_signatures={
+            key(mk): [tuple(x) for x in items] for mk, items in (data.get("pref_base_signatures") or {}).items()
+        },
+        pref_origins={key(mk): str(o) for mk, o in (data.get("pref_origins") or {}).items()},
+        landed=dict(data.get("landed") or {}),
     )
 
 
@@ -490,6 +618,7 @@ class SaveQueue:
         self._jobs: dict = {}
         self._results: dict = {}
         self._landed: dict = {}   # doctor -> {(yy, mm): (origin, base_before, signature_after)}
+        self._landed_pref: dict = {}   # same, for preferences
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._load()
@@ -538,6 +667,12 @@ class SaveQueue:
             merged.entries_by_month[month] = list(entries)
             merged.base_signatures.setdefault(month, job.base_signatures.get(month, []))
             merged.origins[month] = job.origins.get(month, "")
+        for month, entries in job.pref_entries_by_month.items():
+            if month in merged.pref_entries_by_month and merged.pref_origins.get(month) != job.pref_origins.get(month):
+                raise ustore.MonthConflictError(f"{int(month[0]):04d}-{int(month[1]):02d}", "preferenze")
+            merged.pref_entries_by_month[month] = list(entries)
+            merged.pref_base_signatures.setdefault(month, job.pref_base_signatures.get(month, []))
+            merged.pref_origins[month] = job.pref_origins.get(month, "")
         merged.doctor_email = job.doctor_email or merged.doctor_email
         merged.by_admin = merged.by_admin or job.by_admin
         merged.next_attempt_at = 0.0
@@ -552,6 +687,11 @@ class SaveQueue:
             rec = landed.get(month)
             if rec and rec[0] == out.origins.get(month) and ustore.normalize_signature(out.base_signatures.get(month, [])) == rec[1]:
                 out.base_signatures[month] = rec[2]
+        landed_pref = self._landed_pref.get(job.doctor) or {}
+        for month in out.pref_entries_by_month:
+            rec = landed_pref.get(month)
+            if rec and rec[0] == out.pref_origins.get(month) and ustore.normalize_signature(out.pref_base_signatures.get(month, [])) == rec[1]:
+                out.pref_base_signatures[month] = rec[2]
         return out
 
     def _remember_landed(self, job: SaveJob, result: SaveResult) -> None:
@@ -562,6 +702,14 @@ class SaveQueue:
                 ustore.normalize_signature(job.base_signatures.get((yy, mm), [])),
                 ustore.month_signature(result.outcome.verified_rows, job.doctor, int(yy), int(mm)),
             )
+        if result.pref_outcome is not None:
+            landed_pref = self._landed_pref.setdefault(job.doctor, {})
+            for (yy, mm) in job.pref_entries_by_month:
+                landed_pref[(yy, mm)] = (
+                    job.pref_origins.get((yy, mm), ""),
+                    ustore.normalize_signature(job.pref_base_signatures.get((yy, mm), [])),
+                    ustore.month_signature(result.pref_outcome.verified_rows, job.doctor, int(yy), int(mm), with_priority=True),
+                )
 
     def enqueue(self, job: SaveJob) -> None:
         with self._lock:

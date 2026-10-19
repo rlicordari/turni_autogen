@@ -32,6 +32,7 @@ import unavailability_drafts as udrafts
 import unavailability_service as usvc
 import unavailability_receipts as receipts
 import email_settings as esettings
+import doctor_contacts as dcontacts
 import unavailability_store as ustore
 import xlsx_utils
 import shift_history as sh
@@ -703,30 +704,6 @@ def load_doctor_avail_from_github(doctor: str) -> tuple[list[dict], str | None]:
     return ustore.load_store(gf.text), gf.sha
 
 
-def save_doctor_avail_to_github(
-    doctor: str,
-    rows: list[dict],
-    sha: str | None,
-    message: str,
-) -> str | None:
-    """Write ONLY the given doctor's rows to their personal availability CSV file."""
-    g = _github_cfg()
-    text = ustore.to_csv(rows)
-    resp = github_utils.put_file(
-        owner=g["owner"], repo=g["repo"],
-        path=_doctor_avail_path(doctor),
-        token=g["token"], branch=g.get("branch", "main"),
-        sha=sha, message=message, text=text,
-    )
-    try:
-        content = resp.get("content") if isinstance(resp, dict) else None
-        if isinstance(content, dict) and content.get("sha"):
-            return str(content["sha"])
-    except Exception:
-        pass
-    return None
-
-
 def load_avail_store_from_github() -> tuple[list[dict], str | None]:
     """Load all availability rows.
 
@@ -765,73 +742,6 @@ def load_avail_store_from_github() -> tuple[list[dict], str | None]:
     if gf is None:
         return [], None
     return ustore.load_store(gf.text), gf.sha
-
-
-def save_avail_store_to_github(rows: list[dict], sha: str | None, message: str) -> str | None:
-    """Legacy writer — kept for backward compatibility. Prefer save_doctor_avail_to_github."""
-    g = _github_cfg()
-    path = g.get("availability_path", "data/availability_store.csv")
-    text = ustore.to_csv(rows)
-    resp = github_utils.put_file(
-        owner=g["owner"], repo=g["repo"], path=path,
-        token=g["token"], branch=g.get("branch", "main"),
-        sha=sha, message=message, text=text,
-    )
-    try:
-        content = resp.get("content") if isinstance(resp, dict) else None
-        if isinstance(content, dict) and content.get("sha"):
-            return str(content.get("sha"))
-    except Exception:
-        pass
-    return None
-
-
-def save_doctor_availability_with_retry(
-    *,
-    doctor: str,
-    entries_by_month: dict,
-    updated_at: str,
-    message: str,
-    initial_rows: list[dict] | None = None,
-    initial_sha: str | None = None,
-    max_retries: int = 6,
-) -> str | None:
-    """Concurrency-safe save using per-doctor availability CSV files.
-
-    Each doctor writes only their own file — no cross-doctor SHA conflicts.
-    Returns: final_sha (or None)
-    """
-    last_err: Exception | None = None
-    months = sorted(entries_by_month.items())
-
-    for attempt in range(max_retries):
-        if attempt == 0 and initial_rows is not None:
-            doctor_rows = [r for r in initial_rows if r.get("doctor", "") == doctor]
-            doctor_sha = initial_sha
-        else:
-            doctor_rows, doctor_sha = load_doctor_avail_from_github(doctor)
-
-        new_rows = list(doctor_rows)
-        for (yy, mm), entries in months:
-            new_rows = ustore.replace_doctor_month(
-                new_rows, doctor, int(yy), int(mm), entries, updated_at=updated_at
-            )
-
-        try:
-            _new_sha = save_doctor_avail_to_github(doctor, new_rows, doctor_sha, message)
-            verified_rows, latest_sha = load_doctor_avail_from_github(doctor)
-            return latest_sha or _new_sha
-        except Exception as e:
-            last_err = e
-            if _is_sha_conflict_error(e):
-                sleep_s = min(3.0, 0.35 * (2 ** attempt) + random.random() * 0.25)
-                time.sleep(sleep_s)
-                continue
-            raise
-
-    if last_err:
-        raise last_err
-    raise RuntimeError("Errore salvataggio preferenze: tentativi esauriti.")
 
 
 def _is_sha_conflict_error(err: Exception) -> bool:
@@ -1343,10 +1253,11 @@ def _save_queue() -> usvc.SaveQueue:
     rows_cache = _official_rows_cache()
 
     def _on_saved(result: usvc.SaveResult) -> None:  # worker thread: no st.* here
-        for (yy, mm) in result.job.entries_by_month:
-            store.remove_month(result.job.doctor, f"{int(yy):04d}-{int(mm):02d}")
+        for mk in _job_month_keys(result.job):
+            store.remove_month(result.job.doctor, mk)
         store.flush(result.job.doctor, force=True)
-        rows_cache[result.job.doctor] = (result.outcome.verified_rows, result.outcome.sha)
+        if result.job.entries_by_month:
+            rows_cache[result.job.doctor] = (result.outcome.verified_rows, result.outcome.sha)
 
     q = usvc.SaveQueue(
         _service_config(),
@@ -1399,21 +1310,34 @@ def _session_draft(doctor: str) -> dict:
     return _draft_store().get(doctor)
 
 
-def _draft_mark_written(doctor: str, mk: str, entries) -> None:
+def _job_month_keys(job: usvc.SaveJob) -> list[str]:
+    """Months of a save job (unavailability and/or preferences)."""
+    return sorted({f"{int(yy):04d}-{int(mm):02d}" for (yy, mm) in list(job.entries_by_month) + list(job.pref_entries_by_month)})
+
+
+def _draft_sig(entries, pref_entries) -> list:
+    return [ustore.entries_signature(entries), ustore.entries_signature(pref_entries or [], with_priority=True)]
+
+
+def _draft_mark_written(doctor: str, mk: str, entries, pref_entries=None) -> None:
     state = _draft_state(doctor)
-    state["written"][mk] = ustore.entries_signature(entries)
+    state["written"][mk] = _draft_sig(entries, pref_entries)
     state["pending"].pop(mk, None)
 
 
-def _draft_note_change(doctor: str, mk: str, entries, base_signature, session_id: str) -> None:
+def _draft_note_change(
+    doctor: str, mk: str, entries, base_signature, session_id: str, *, pref_entries=None, pref_base_signature=None,
+) -> None:
     state = _draft_state(doctor)
-    sig = ustore.entries_signature(entries)
+    sig = _draft_sig(entries, pref_entries)
     if sig == state["written"].get(mk):
         state["pending"].pop(mk, None)
         return
     state["pending"][mk] = {
         "entries": [(d, sh, note) for d, sh, note in entries],
         "base_signature": list(base_signature or []),
+        "pref_entries": [tuple(e) for e in (pref_entries or [])],
+        "pref_base_signature": list(pref_base_signature or []),
         "session_id": session_id,
     }
 
@@ -1433,8 +1357,10 @@ def _draft_flush(doctor: str, *, force: bool = False) -> None:
                 base_signature=item["base_signature"],
                 updated_at=now_iso,
                 session_id=item["session_id"],
+                pref_entries=item.get("pref_entries", []),
+                pref_base_signature=item.get("pref_base_signature", []),
             )
-            state["written"][mk] = ustore.entries_signature(item["entries"])
+            state["written"][mk] = _draft_sig(item["entries"], item.get("pref_entries", []))
             if state["pending"].get(mk) is item:
                 state["pending"].pop(mk, None)
         state["last_write_at"] = now_iso
@@ -1471,8 +1397,8 @@ def _draft_status_and_flush(doctor: str, session_id: str, mk: str) -> None:
             parts.append(f"{unsent['pref']} preferenze")
         in_draft = mk not in (state.get("pending") or {}) and bool(state.get("last_write_at"))
         where = (
-            f"Le indisponibilità sono al sicuro in bozza (salvata alle {_local_hhmm(state['last_write_at'])}), ma "
-            if in_draft and (unsent.get("added") or unsent.get("removed"))
+            f"Le modifiche sono al sicuro in bozza (salvata alle {_local_hhmm(state['last_write_at'])}), ma "
+            if in_draft
             else ""
         )
         st.warning(
@@ -1535,41 +1461,63 @@ def load_pending_drafts_summary(month_keys: tuple[str, ...]) -> list[dict]:
         if not any(mk in (draft.get("months") or {}) for mk in month_keys):
             continue
         official, _ = load_doctor_unavail_from_github(doctor)
-        out += udrafts.pending_summary(draft, official, month_keys)
+        try:
+            official_pref, _ = load_doctor_avail_from_github(doctor)
+        except Exception:
+            official_pref = None
+        out += udrafts.pending_summary(draft, official, month_keys, official_pref_rows=official_pref)
     return out
 
 
 def _apply_saved_result_to_session(doctor: str, result: usvc.SaveResult, selected) -> None:
-    """Server data just verified by read-back → baseline + editor bases (no reload)."""
-    _official_rows_cache()[doctor] = (result.outcome.verified_rows, result.outcome.sha)
-    sel = tuple(tuple(x) for x in (selected or []))
+    """Server data just verified by read-back → baselines + editor bases (no reload)."""
     cur = st.session_state.get(_BASELINE_SS_KEY)
-    if isinstance(cur, dict) and cur.get("doctor") == doctor:
-        sel = tuple(cur.get("selected") or sel)
-    _set_doctor_baseline_rows(doctor, sel, result.outcome.verified_rows, result.outcome.sha)
+    if result.job.entries_by_month:
+        _official_rows_cache()[doctor] = (result.outcome.verified_rows, result.outcome.sha)
+        sel = tuple(tuple(x) for x in (selected or []))
+        if isinstance(cur, dict) and cur.get("doctor") == doctor:
+            sel = tuple(cur.get("selected") or sel)
+        cur = _set_doctor_baseline_rows(doctor, sel, result.outcome.verified_rows, result.outcome.sha)
+    pref = result.pref_outcome
+    if pref is not None:
+        st.session_state[f"avail_store_baseline_{doctor}"] = {"rows": pref.verified_rows, "sha": pref.sha}
+    unav_rows = (cur or {}).get("rows") or [] if isinstance(cur, dict) else []
+    pref_rows = (st.session_state.get(f"avail_store_baseline_{doctor}") or {}).get("rows") or []
     state = _draft_state(doctor)
-    for (yy, mm), entries in result.job.entries_by_month.items():
-        mk = f"{int(yy):04d}-{int(mm):02d}"
-        st.session_state[f"unav_rows_{doctor}_{yy}_{mm}__base_sig"] = ustore.month_signature(
-            result.outcome.verified_rows, doctor, int(yy), int(mm)
-        )
-        _draft_mark_written(doctor, mk, entries)
+    for mk in _job_month_keys(result.job):
+        yy, mm = int(mk[:4]), int(mk[5:7])
+        unav_sig = ustore.month_signature(unav_rows, doctor, yy, mm)
+        pref_sig = ustore.month_signature(pref_rows, doctor, yy, mm, with_priority=True)
+        if (yy, mm) in result.job.entries_by_month:
+            st.session_state[f"unav_rows_{doctor}_{yy}_{mm}__base_sig"] = unav_sig
+        if pref is not None and (yy, mm) in result.job.pref_entries_by_month:
+            st.session_state[f"avail_rows_{doctor}_{yy}_{mm}__base_sig"] = pref_sig
+        state["written"][mk] = [unav_sig, pref_sig]   # editor == server: niente da mettere in bozza
+        state["pending"].pop(mk, None)
         state["unsent"].pop(mk, None)
 
 
 def _saved_message(result: usvc.SaveResult, mail_status: str, warnings: list[str]) -> str:
-    outcome = result.outcome
-    if outcome.changed:
-        parts = [
-            f"{receipts.month_label(mk)}: +{d.get('added_count', 0)} / -{d.get('removed_count', 0)}, "
-            f"ora registrate {d.get('after_count', 0)}"
-            for mk, d in sorted(outcome.diffs.items())
+    parts = [
+        f"{receipts.month_label(mk)}: +{d.get('added_count', 0)} / -{d.get('removed_count', 0)}, "
+        f"ora registrate {d.get('after_count', 0)}"
+        for mk, d in sorted((result.outcome.diffs or {}).items())
+    ]
+    if result.pref_outcome is not None:
+        parts += [
+            f"preferenze {receipts.month_label(mk)}: +{d.get('added_count', 0)} / -{d.get('removed_count', 0)}"
+            + (f" / {d['note_changed_count']} modificate" if d.get("note_changed_count") else "")
+            + f", ora registrate {d.get('after_count', 0)}"
+            for mk, d in sorted((result.pref_outcome.diffs or {}).items())
         ]
+    if result.changed:
         msg = "✅ Salvataggio completato e verificato sul server — " + "; ".join(parts) + "."
         if mail_status:
             msg += f" {mail_status}"
     else:
-        msg = "✅ Nessuna modifica da inviare: il server ha già esattamente queste indisponibilità."
+        msg = "✅ Nessuna modifica da inviare: il server ha già esattamente questi dati."
+    if result.pref_error:
+        msg += f" ⚠️ Preferenze NON salvate: {result.pref_error} Ricarica i dati e reinseriscile."
     if warnings:
         msg += " " + " ".join(f"⚠️ {w}" for w in warnings)
     return msg
@@ -1580,29 +1528,15 @@ def _registered_details(doctor: str, result: usvc.SaveResult) -> str:
         f"{int(yy):04d}-{int(mm):02d}": ustore.filter_doctor_month(result.outcome.verified_rows, doctor, int(yy), int(mm))
         for (yy, mm) in result.job.entries_by_month
     }
-    return receipts.build_receipt(doctor, rows_by_month, {}, saved_at_utc=result.saved_at, commit_sha=result.outcome.commit_sha)[1]
-
-
-def _save_preferences(doctor: str, pref_entries_by_month: dict, store_rows: list[dict], store_sha: str | None) -> str:
-    """Save changed preference months (same Invia as unavailability). Returns a message."""
-    if not pref_entries_by_month:
-        return ""
-    updated_at = _utc_now_iso()
-    try:
-        save_doctor_availability_with_retry(
-            doctor=doctor,
-            entries_by_month=pref_entries_by_month,
-            updated_at=updated_at,
-            message=f"Update availability: {doctor} ({updated_at})",
-            initial_rows=store_rows,
-            initial_sha=store_sha,
-        )
-        fresh_rows, fresh_sha = load_doctor_avail_from_github(doctor)
-        st.session_state[f"avail_store_baseline_{doctor}"] = {"rows": fresh_rows, "sha": fresh_sha}
-        n = sum(len(v) for v in pref_entries_by_month.values())
-        return f"Preferenze registrate ({n})."
-    except Exception as e:
-        return f"⚠️ Preferenze NON salvate ({type(e).__name__}: {e}): riprova con 📤 Invia."
+    pref = result.pref_outcome
+    pref_rows_by_month = {
+        f"{int(yy):04d}-{int(mm):02d}": ustore.filter_doctor_month(pref.verified_rows, doctor, int(yy), int(mm))
+        for (yy, mm) in result.job.pref_entries_by_month
+    } if pref is not None else {}
+    return receipts.build_receipt(
+        doctor, rows_by_month, {}, saved_at_utc=result.saved_at, commit_sha=result.outcome.commit_sha,
+        pref_rows_by_month=pref_rows_by_month,
+    )[1]
 
 
 def _process_unav_outbox(doctor: str, selected) -> None:
@@ -1625,20 +1559,21 @@ def _process_unav_outbox(doctor: str, selected) -> None:
         done.add("baseline")
     if "draft" not in done:
         store = _draft_store()
-        for (yy, mm) in result.job.entries_by_month:
-            store.remove_month(doctor, f"{int(yy):04d}-{int(mm):02d}")
+        for mk in _job_month_keys(result.job):
+            store.remove_month(doctor, mk)
         store.flush(doctor, force=True)
         done.add("draft")
     warnings = box.setdefault("warnings", [])
-    if result.outcome.changed and "audit" not in done:
+    if result.changed and "audit" not in done:
         warnings += usvc.write_audit(cfg, result)
         done.add("audit")
-    if result.outcome.changed and "mail" not in done:
+    if result.changed and "mail" not in done:
         box["mail_status"] = usvc.send_receipt(cfg, result)
         done.add("mail")
 
     set_unav_flash(
-        doctor, "success", _saved_message(result, box.get("mail_status", ""), warnings),
+        doctor, "warning" if result.pref_error else "success",
+        _saved_message(result, box.get("mail_status", ""), warnings),
         details=_registered_details(doctor, result),
     )
     st.session_state.pop(key, None)
@@ -1655,7 +1590,7 @@ def _show_save_queue_status(doctor: str, selected) -> None:
         else:
             set_unav_flash(doctor, "error", res["message"])
     for job in q.pending(doctor):
-        months = ", ".join(receipts.month_label(f"{int(yy):04d}-{int(mm):02d}") for (yy, mm) in sorted(job.entries_by_month))
+        months = ", ".join(receipts.month_label(mk) for mk in _job_month_keys(job))
         when = datetime.fromtimestamp(job.created_at, receipts.LOCAL_TZ).strftime("%d/%m %H:%M")
         st.warning(
             f"⏳ **Salvataggio IN CODA** ({months}, inviato alle {when}): GitHub è momentaneamente saturo. "
@@ -1804,62 +1739,31 @@ def load_pool_config_from_github_st() -> tuple[dict, str | None]:
     )
 
 
-def sync_pool_contacts_to_github(pool_cfg: dict) -> tuple[bool, str]:
-    """Aggiorna doctor_contacts.yml su GitHub con le email definite nel pool_config.
+def save_doctor_email(doctor: str, email: str, max_retries: int = 4) -> None:
+    """Set (or remove, if empty) one doctor's email in doctor_contacts.yml on GitHub.
 
-    Per ogni medico attivo con email valorizzata nel pool_config, aggiunge/aggiorna
-    la voce corrispondente in doctor_contacts.yml. Non cancella voci esistenti.
-    Ritorna (ok, messaggio).
+    That address receives the PIN codes and the receipt mail. Raises ValueError
+    for an invalid address; other doctors and the phone numbers are kept.
     """
     g = _github_cfg()
     if not (g.get("token") and g.get("owner") and g.get("repo")):
-        return False, "GitHub non configurato — impossibile sincronizzare i contatti."
-
-    contacts_path = g.get("contacts_path") or "data/doctor_contacts.yml"
-
-    gf = github_utils.get_file(
-        owner=g["owner"], repo=g["repo"], path=contacts_path,
-        token=g["token"], branch=g.get("branch", "main"),
-    )
-    existing: dict = {}
-    sha_contacts: str | None = None
-    if gf:
+        raise RuntimeError("GitHub non configurato.")
+    path = g.get("contacts_path") or "data/doctor_contacts.yml"
+    for attempt in range(max_retries):
+        gf = github_utils.get_file(owner=g["owner"], repo=g["repo"], path=path, token=g["token"], branch=g.get("branch", "main"))
+        text = dcontacts.set_email(gf.text if gf else "", doctor, email)
         try:
-            existing = yaml.safe_load(gf.text) or {}
-        except Exception:
-            existing = {}
-        sha_contacts = gf.sha
-
-    changed = False
-    for doc, dcfg in (pool_cfg.get("doctors") or {}).items():
-        if not dcfg.get("active", True):
-            continue
-        email = str(dcfg.get("email") or "").strip()
-        if not email:
-            continue
-        if not isinstance(existing.get(doc), dict):
-            existing[doc] = {}
-        if existing[doc].get("email") != email:
-            existing[doc]["email"] = email
-            changed = True
-
-    if not changed:
-        return True, "Nessuna email nuova — doctor_contacts.yml già aggiornato."
-
-    content = yaml.dump(
-        {k: existing[k] for k in sorted(existing)},
-        allow_unicode=True, default_flow_style=False,
-    )
-    github_utils.put_file(
-        owner=g["owner"], repo=g["repo"], path=contacts_path,
-        token=g["token"],
-        message="Aggiornamento contatti medici da pool_config GUI",
-        text=content,
-        branch=g.get("branch", "main"),
-        sha=sha_contacts,
-    )
-    load_doctor_contacts_from_github.clear()  # invalida cache
-    return True, "Email medici sincronizzate con doctor_contacts.yml ✓"
+            github_utils.put_file(
+                owner=g["owner"], repo=g["repo"], path=path, token=g["token"],
+                message=f"Email medico aggiornata: {doctor}", text=text,
+                branch=g.get("branch", "main"), sha=gf.sha if gf else None,
+            )
+            break
+        except Exception as e:
+            if _is_sha_conflict_error(e) and attempt < max_retries - 1:
+                continue
+            raise
+    load_doctor_contacts_from_github.clear()
 
 
 def save_pool_config_with_retry(cfg: dict, sha: str | None, max_retries: int = 3) -> tuple[bool, str]:
@@ -2229,10 +2133,10 @@ def render_admin_doctor_data_editor(doctors: list[str], default_year: int, defau
         st.error(f"Errore lettura indisponibilità: {e}")
         unav_rows, unav_sha = [], None
     try:
-        avail_rows, avail_sha = load_doctor_avail_from_github(doctor)
+        avail_rows, _avail_sha = load_doctor_avail_from_github(doctor)
     except Exception as e:
         st.error(f"Errore lettura preferenze: {e}")
-        avail_rows, avail_sha = [], None
+        avail_rows = []
 
     tab_unav, tab_avail = st.tabs(["Indisponibilità", "Preferenze"])
     flash_key = f"admin_store__{doctor}__{int(yy)}__{int(mm)}"
@@ -2335,6 +2239,10 @@ def render_admin_doctor_data_editor(doctors: list[str], default_year: int, defau
         ]
         st.caption("Preferenze persistite su GitHub: " + _entries_summary(existing_entries))
         rows_key = f"admin_avail_rows_{doctor}_{int(yy)}_{int(mm)}"
+        base_sig_key = f"{rows_key}__base_sig"
+        existing_sig = ustore.rows_signature(existing, with_priority=True)
+        if rows_key not in st.session_state:
+            st.session_state[base_sig_key] = existing_sig
         editor_rows = _render_admin_month_rows(
             rows_key=rows_key,
             rows=_store_rows_to_editor_rows(existing, int(yy), int(mm), availability=True),
@@ -2345,26 +2253,54 @@ def render_admin_doctor_data_editor(doctors: list[str], default_year: int, defau
         )
         entries = _dedup_avail_editor_rows(editor_rows)
         st.caption(f"Totale righe salvabili: {len(entries)}")
-        if _entries_signature_from_tuples([(d, sh, note) for d, sh, note, _pri in entries]) != _month_entries_signature(existing):
+        if ustore.entries_signature(entries, with_priority=True) != existing_sig:
             st.warning("Ci sono preferenze nella lista non ancora salvate su GitHub.", icon="⚠️")
         if st.button("💾 Salva preferenze medico", key=f"{rows_key}_save", type="primary"):
-            updated_at = _utc_now_iso()
+            admin_cfg = _service_config()
+            admin_job = usvc.make_job(
+                doctor=doctor,
+                doctor_email=str(get_doctor_contact(doctor).get("email") or ""),
+                entries_by_month={},
+                base_signatures={},
+                by_admin=True,
+                origin=f"admin:{rows_key}",
+                pref_entries_by_month={(int(yy), int(mm)): entries},
+                pref_base_signatures={(int(yy), int(mm)): st.session_state.get(base_sig_key, existing_sig)},
+            )
             try:
-                save_doctor_availability_with_retry(
-                    doctor=doctor,
-                    entries_by_month={(int(yy), int(mm)): entries},
-                    updated_at=updated_at,
-                    message=f"Admin update availability: {doctor} ({updated_at})",
-                    initial_rows=avail_rows,
-                    initial_sha=avail_sha,
-                )
+                queue = _save_queue()
+                queue.cfg = admin_cfg
+                status, result = queue.save_or_enqueue(admin_job, max_wait=25)
+                if status == "queued":
+                    set_unav_flash(
+                        flash_key,
+                        "warning",
+                        f"⏳ GitHub saturo: preferenze di {doctor} IN CODA, verranno registrate automaticamente "
+                        "(il medico riceverà la mail a registrazione avvenuta).",
+                    )
+                else:
+                    warnings = usvc.write_audit(admin_cfg, result) if result.changed else []
+                    mail_status = usvc.send_receipt(admin_cfg, result) if result.changed else ""
+                    set_unav_flash(
+                        flash_key,
+                        "success",
+                        (
+                            f"Preferenze salvate e verificate su GitHub per {doctor}. {mail_status}"
+                            if result.changed
+                            else f"Nessuna modifica da salvare per {doctor}."
+                        )
+                        + "".join(f" ⚠️ {w}" for w in warnings),
+                        details=_entries_summary(entries),
+                    )
+                st.session_state.pop(rows_key, None)
+                st.session_state.pop(base_sig_key, None)
+                _rerun_fragment_or_app()
+            except ustore.MonthConflictError as e:
                 set_unav_flash(
                     flash_key,
-                    "success",
-                    f"Preferenze salvate e verificate su GitHub per {doctor}.",
-                    details=_entries_summary(entries),
+                    "error",
+                    f"Salvataggio bloccato per {doctor}: {e} Premi 'Ricarica dati medico' e ripeti la modifica.",
                 )
-                st.session_state.pop(rows_key, None)
                 _rerun_fragment_or_app()
             except Exception as e:
                 set_unav_flash(
@@ -3958,6 +3894,25 @@ if mode == "📋 Le mie indisponibilità":
                 st.dataframe(conversions, width="stretch", hide_index=True)
 
 
+            # Preferenze del mese (stesse regole delle indisponibilità: base, bozza, conflitti)
+            avail_key = f"avail_rows_{doctor}_{yy}_{mm}"
+            pref_base_sig_key = f"{avail_key}__base_sig"
+            existing_avail = ustore.filter_doctor_month(avail_store_rows, doctor, yy, mm)
+            official_pref_sig = ustore.rows_signature(existing_avail, with_priority=True)
+
+            def _pref_editor_rows(items) -> list[dict]:
+                return [
+                    {"id": str(uuid.uuid4()), "Data": d, "Fascia": ustore.norm_shift(sh),
+                     "Priorita": ustore.norm_priority(pri), "Note": note}
+                    for d, sh, note, pri in items
+                ]
+
+            _official_pref_entries = [
+                (ustore.parse_iso_date(r["date"]), r.get("shift", ""), r.get("note", ""), r.get("priority", "media"))
+                for r in existing_avail
+                if r.get("date")
+            ]
+
             # --- Editor righe (UI robusta: niente st.data_editor) ---
             rows_key = f"unav_rows_{doctor}_{yy}_{mm}"
             mk_cur = f"{yy:04d}-{mm:02d}"
@@ -3981,11 +3936,14 @@ if mode == "📋 Le mie indisponibilità":
             if rows_key not in st.session_state:
                 start = {"action": "official"}
                 try:
-                    start = udrafts.editor_start(_session_draft(doctor), mk_cur, official_sig)
+                    start = udrafts.editor_start(_session_draft(doctor), mk_cur, official_sig, official_pref_sig)
                 except Exception as _draft_err:
                     st.caption(f"Bozza non leggibile ({_draft_err}): mostro i dati registrati.")
+                _pref_init = _official_pref_entries
                 if start["action"] == "resume":
                     init = [{"Data": d, "Fascia": sh, "Note": note} for d, sh, note in start["entries"]]
+                    if start.get("pref_entries") is not None:
+                        _pref_init = start["pref_entries"]
                     set_unav_flash(
                         doctor,
                         "info",
@@ -3996,27 +3954,35 @@ if mode == "📋 Le mie indisponibilità":
                     st.session_state[draft_offer_key] = start
                 st.session_state[rows_key] = _editor_rows(init)
                 st.session_state[base_sig_key] = official_sig
+                st.session_state[avail_key] = _pref_editor_rows(_pref_init)
+                st.session_state[pref_base_sig_key] = official_pref_sig
                 _draft_mark_written(
                     doctor,
                     mk_cur,
                     [(r["Data"], r["Fascia"], r.get("Note", "")) for r in init if isinstance(r.get("Data"), date)],
+                    _pref_init,
                 )
 
             _offer = st.session_state.get(draft_offer_key)
             if _offer and unav_open:
-                _offer_list = ", ".join(f"{d:%d/%m} {sh}" for d, sh, _n in _offer.get("entries") or []) or "nessuna riga"
+                _offer_list = ", ".join(f"{d:%d/%m} {sh}" for d, sh, _n in _offer.get("entries") or []) or "nessuna indisponibilità"
+                if _offer.get("pref_entries"):
+                    _offer_list += "; preferenze: " + ", ".join(f"{e[0]:%d/%m} {e[1]}" for e in _offer["pref_entries"])
                 st.warning(
                     f"Hai una **bozza NON inviata** del {_local_hhmm(_offer.get('updated_at'))} "
-                    f"({_offer_list}), ma nel frattempo le indisponibilità registrate sono cambiate "
-                    "(ad es. da un altro dispositivo). Qui sotto vedi quelle registrate: vuoi recuperare la bozza?"
+                    f"({_offer_list}), ma nel frattempo i dati registrati sono cambiati "
+                    "(ad es. da un altro dispositivo). Qui sotto vedi quelli registrati: vuoi recuperare la bozza?"
                 )
                 _oc1, _oc2 = st.columns(2)
                 with _oc1:
                     if st.button("↩️ Recupera bozza", key=f"{rows_key}__draft_recover", width="stretch"):
                         _draft_rows = [{"Data": d, "Fascia": sh, "Note": n} for d, sh, n in _offer["entries"]]
                         st.session_state[rows_key] = _editor_rows(_draft_rows)
+                        _offer_pref = _offer.get("pref_entries")
+                        if _offer_pref is not None:
+                            st.session_state[avail_key] = _pref_editor_rows(_offer_pref)
                         st.session_state.pop(draft_offer_key, None)
-                        _draft_mark_written(doctor, mk_cur, _offer["entries"])
+                        _draft_mark_written(doctor, mk_cur, _offer["entries"], _offer_pref if _offer_pref is not None else _official_pref_entries)
                         st.rerun()
                 with _oc2:
                     if st.button("🗑️ Scarta bozza", key=f"{rows_key}__draft_discard", width="stretch"):
@@ -4030,20 +3996,9 @@ if mode == "📋 Le mie indisponibilità":
             else:
                 last_day = date(yy, mm + 1, 1) - timedelta(days=1)
 
-            avail_key = f"avail_rows_{doctor}_{yy}_{mm}"
-            existing_avail = ustore.filter_doctor_month(avail_store_rows, doctor, yy, mm)
             if avail_key not in st.session_state:
-                st.session_state[avail_key] = [
-                    {
-                        "id": str(uuid.uuid4()),
-                        "Data": ustore.parse_iso_date(r["date"]),
-                        "Fascia": ustore.norm_shift(r.get("shift", "")),
-                        "Priorita": ustore.norm_priority(r.get("priority", "media")),
-                        "Note": r.get("note", ""),
-                    }
-                    for r in existing_avail
-                    if r.get("date")
-                ]
+                st.session_state[avail_key] = _pref_editor_rows(_official_pref_entries)
+                st.session_state[pref_base_sig_key] = official_pref_sig
             max_avail = int(app_settings.get("max_availability_per_shift", 6))
 
             if unav_open:
@@ -4188,13 +4143,8 @@ if mode == "📋 Le mie indisponibilità":
                     + ", ".join(f"{sh}: {n}/{max_avail}" for sh, n in pref_over.items())
                     + ". Togli qualche preferenza prima di inviare."
                 )
-            _pref_now = {(d.isoformat(), sh, note, pri) for d, sh, note, pri in pref_entries}
-            _pref_sent = {
-                (str(r.get("date", ""))[:10], ustore.norm_shift(r.get("shift", "")), str(r.get("note") or ""),
-                 ustore.norm_priority(r.get("priority", "media")))
-                for r in existing_avail
-            }
-            pref_changes = len(_pref_now ^ _pref_sent)
+            _pdiff = ustore.compute_month_diff(existing_avail, pref_entries, with_priority=True)
+            pref_changes = _pdiff["added_count"] + _pdiff["removed_count"] + _pdiff["note_changed_count"]
             if pref_changes:
                 pref_entries_by_month[(yy, mm)] = pref_entries
 
@@ -4212,7 +4162,9 @@ if mode == "📋 Le mie indisponibilità":
                 _dstate["unsent"].pop(mk_cur, None)
             if unav_open and not st.session_state.get(draft_offer_key):
                 _draft_note_change(
-                    doctor, mk_cur, entries_norm, st.session_state.get(base_sig_key, official_sig), _doctor_session_id
+                    doctor, mk_cur, entries_norm, st.session_state.get(base_sig_key, official_sig), _doctor_session_id,
+                    pref_entries=pref_entries,
+                    pref_base_signature=st.session_state.get(pref_base_sig_key, official_pref_sig),
                 )
                 _draft_flush(doctor)
             if unav_open:
@@ -4289,6 +4241,14 @@ if mode == "📋 Le mie indisponibilità":
             for (yy, mm) in (normalized_entries_by_month or {})
         }
 
+        pref_base_signatures = {
+            (yy, mm): st.session_state.get(
+                f"avail_rows_{doctor}_{yy}_{mm}__base_sig",
+                ustore.month_signature(avail_store_rows, doctor, yy, mm, with_priority=True),
+            )
+            for (yy, mm) in (pref_entries_by_month or {})
+        }
+
         save_cfg = _service_config()
         save_job = usvc.make_job(
             doctor=doctor,
@@ -4296,6 +4256,8 @@ if mode == "📋 Le mie indisponibilità":
             entries_by_month=dict(normalized_entries_by_month or {}),
             base_signatures=base_signatures,
             origin=_sid,
+            pref_entries_by_month=dict(pref_entries_by_month or {}),
+            pref_base_signatures=pref_base_signatures,
         )
         save_status = None
         try:
@@ -4317,8 +4279,8 @@ if mode == "📋 Le mie indisponibilità":
                 doctor,
                 "error",
                 f"❌ Salvataggio BLOCCATO: {e} Per non cancellare quei dati non ho sovrascritto nulla. "
-                "Le tue modifiche sono al sicuro nella bozza: premi 🔄 Ricarica dati, controlla le "
-                "indisponibilità aggiornate e scegli se recuperare la bozza.",
+                "Le tue modifiche sono al sicuro nella bozza: premi 🔄 Ricarica dati, controlla i "
+                "dati aggiornati e scegli se recuperare la bozza.",
             )
             st.rerun()
         except Exception as e:
@@ -4336,7 +4298,6 @@ if mode == "📋 Le mie indisponibilità":
                 ),
             )
             st.rerun()
-        pref_msg = _save_preferences(doctor, pref_entries_by_month, avail_store_rows, avail_store_sha)
         if save_status == "queued":
             _draft_flush(doctor, force=True)
             set_unav_flash(
@@ -4345,16 +4306,10 @@ if mode == "📋 Le mie indisponibilità":
                 "⏳ GitHub è momentaneamente saturo: il salvataggio è **IN CODA** e verrà registrato "
                 "automaticamente appena possibile (di solito entro pochi minuti), anche se chiudi la pagina. "
                 "Riceverai la mail di conferma solo a registrazione avvenuta: senza mail non è registrato. "
-                "Non serve premere di nuovo Invia." + (f" {pref_msg}" if pref_msg else ""),
+                "Non serve premere di nuovo Invia.",
             )
             st.rerun()
         _process_unav_outbox(doctor, selected)
-        if pref_msg:
-            _flash = st.session_state.get(_unav_flash_key(doctor))
-            if isinstance(_flash, dict):
-                _flash["msg"] = f"{_flash.get('msg', '')} {pref_msg}".strip()
-                if pref_msg.startswith("⚠️"):
-                    _flash["kind"] = "warning"
         st.rerun()
 
 
@@ -4594,6 +4549,10 @@ else:
                 with _tab_med:
                     st.markdown("**Stato e flag per ogni medico** — aggiungi righe con ＋, elimina con ✕")
                     import pandas as _pd_pool
+                    try:
+                        _contacts_now = load_doctor_contacts_from_github()
+                    except Exception:
+                        _contacts_now = {}
                     _med_rows = []
                     for _dname in _all_docs_list:
                         _dc = _draft_doctors[_dname]
@@ -4605,7 +4564,7 @@ else:
                             "Festivi diurni": bool(_dc.get("festivi_diurni", True)),
                             "Festivi notti": bool(_dc.get("festivi_notti", True)),
                             "Universitario": bool(_dc.get("university_doctor")),
-                            "Email": str(_dc.get("email") or ""),
+                            "Email": str((_contacts_now.get(_dname) or {}).get("email") or ""),
                         })
                     _med_df = _pd_pool.DataFrame(_med_rows)
                     _edited_med = st.data_editor(
@@ -4618,7 +4577,10 @@ else:
                             "Festivi diurni": st.column_config.CheckboxColumn("Festivi diurni"),
                             "Festivi notti": st.column_config.CheckboxColumn("Festivi notti"),
                             "Universitario": st.column_config.CheckboxColumn("Universitario"),
-                            "Email": st.column_config.TextColumn("Email", help="Email per OTP/PIN (salvata in doctor_contacts.yml)"),
+                            "Email": st.column_config.TextColumn(
+                                "Email", disabled=True,
+                                help="Riceve codici PIN e mail di resoconto. Si modifica nel riquadro qui sotto.",
+                            ),
                         },
                         hide_index=True,
                         width="stretch",
@@ -4650,11 +4612,46 @@ else:
                             _draft_doctors[_dn]["university_doctor"] = {"ratio": 0.6}
                         else:
                             _draft_doctors[_dn]["university_doctor"] = None
-                        _email_val = str(_row.get("Email") or "").strip()
-                        _draft_doctors[_dn]["email"] = _email_val if _email_val else None
                     for _dn_old in list(_draft_doctors.keys()):
                         if _dn_old not in _edited_names:
                             del _draft_doctors[_dn_old]
+
+                    st.markdown("**✉️ Email del medico** — riceve i codici PIN e la mail di resoconto dopo ogni invio")
+                    _no_email = [
+                        _d for _d in _all_docs_list
+                        if _draft_doctors[_d].get("active", True) and not (_contacts_now.get(_d) or {}).get("email")
+                    ]
+                    if _no_email:
+                        st.warning(
+                            "Senza email (niente mail di resoconto né codici PIN via mail): " + ", ".join(_no_email),
+                            icon="⚠️",
+                        )
+                    _ce1, _ce2, _ce3 = st.columns([2, 3, 1], vertical_alignment="bottom")
+                    with _ce1:
+                        _c_doc = st.selectbox("Medico", _all_docs_list, key="contact_doctor")
+                    with _ce2:
+                        _c_email = st.text_input(
+                            "Email",
+                            value=str((_contacts_now.get(_c_doc) or {}).get("email") or ""),
+                            key=f"contact_email::{_c_doc}",
+                            placeholder="nome@esempio.it (vuoto = nessuna email)",
+                        )
+                    with _ce3:
+                        _c_save = st.button("💾 Salva email", key="contact_save", width="stretch")
+                    if _c_save and _c_doc:
+                        try:
+                            save_doctor_email(_c_doc, _c_email)
+                            st.session_state["_cfg_flash"] = (
+                                "success",
+                                f"Email di {_c_doc} aggiornata: {_mask_email(_c_email.strip())}"
+                                if _c_email.strip() else f"Email di {_c_doc} rimossa.",
+                            )
+                            st.session_state.pop(f"contact_email::{_c_doc}", None)
+                            st.rerun()
+                        except ValueError as _ce:
+                            st.error(f"{_ce}: niente è stato salvato.")
+                        except Exception as _ce:
+                            st.error(f"Email non salvata ({type(_ce).__name__}: {_ce}).")
 
                     st.divider()
                     with st.expander("📌 Vincoli strutturali fissi (sola lettura — modificabili solo da YAML)", expanded=False):
@@ -4881,10 +4878,6 @@ else:
                         else:
                             _ok_save, _msg_save = save_pool_config_with_retry(_to_save, _pool_cfg_sha)
                             if _ok_save:
-                                # Sincronizza email medici con doctor_contacts.yml
-                                _sync_ok, _sync_msg = sync_pool_contacts_to_github(_to_save)
-                                if not _sync_ok:
-                                    st.warning(f"Pool salvato, ma sync contatti fallita: {_sync_msg}")
                                 del st.session_state["pool_cfg_draft"]
                                 st.session_state["_cfg_flash"] = ("success", _msg_save)
                                 st.rerun()

@@ -218,3 +218,64 @@ class MonthSignatureTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def prow(doctor, day, shift, priority="media", note=""):
+    return {"doctor": doctor, "date": day, "shift": shift, "note": note, "updated_at": "t0", "priority": priority}
+
+
+def save_prefs(store, entries_by_month, base_rows):
+    base_signatures = {
+        mk: ustore.month_signature(base_rows, "Migliorato", mk[0], mk[1], with_priority=True) for mk in entries_by_month
+    }
+    return ustore.save_doctor_months(
+        load_fn=store.load,
+        save_fn=store.save,
+        doctor="Migliorato",
+        entries_by_month=entries_by_month,
+        base_signatures=base_signatures,
+        updated_at="t1",
+        sleep_fn=lambda s: None,
+        with_priority=True,
+        what="preferenze",
+    )
+
+
+class SavePreferencesTests(unittest.TestCase):
+    """Preferences use the same safe save, with the priority in the signature."""
+
+    def test_priority_change_is_written(self):
+        base = [prow("Migliorato", "2026-11-14", "Notte", "media")]
+        store = FakeStore(base)
+
+        out = save_prefs(store, {(2026, 11): [(dt.date(2026, 11, 14), "Notte", "", "alta")]}, base)
+
+        self.assertTrue(out.changed)
+        self.assertEqual(store.rows[0]["priority"], "alta")
+        self.assertEqual(out.diffs["2026-11"]["note_changed_count"], 1)
+
+    def test_stale_editor_cannot_erase_preferences_saved_elsewhere(self):
+        base = []
+        store = FakeStore([prow("Migliorato", "2026-11-03", "Mattina", "alta")])   # salvata da un altro dispositivo
+
+        with self.assertRaises(ustore.MonthConflictError) as ctx:
+            save_prefs(store, {(2026, 11): [(dt.date(2026, 11, 14), "Notte", "", "media")]}, base)
+
+        self.assertIn("preferenze", str(ctx.exception))
+        self.assertEqual(store.puts, 0)
+
+    def test_priority_change_elsewhere_is_a_conflict(self):
+        base = [prow("Migliorato", "2026-11-14", "Notte", "media")]
+        store = FakeStore([prow("Migliorato", "2026-11-14", "Notte", "alta")])
+
+        with self.assertRaises(ustore.MonthConflictError):
+            save_prefs(store, {(2026, 11): [(dt.date(2026, 11, 14), "Notte", "", "bassa")]}, base)
+
+    def test_unchanged_preferences_are_not_rewritten(self):
+        base = [prow("Migliorato", "2026-11-14", "Notte", "alta")]
+        store = FakeStore(base)
+
+        out = save_prefs(store, {(2026, 11): [(dt.date(2026, 11, 14), "Notte", "", "alta")]}, base)
+
+        self.assertFalse(out.changed)
+        self.assertEqual(store.puts, 0)

@@ -330,6 +330,114 @@ class DraftIOTests(ServiceTestCase):
         self.assertEqual(draft["doctor"], "Migliorato")
 
 
+def prefs_of(gh, doctor):
+    text = gh.text(f"data/availability/avail_{svc.doctor_slug(doctor)}.csv")
+    return list(csv.DictReader(io.StringIO(text))) if text.strip() else []
+
+
+def pjob(doctor, prefs, base=(), unav_days=None, unav_base=(), origin="sessione-1"):
+    """prefs: [(day, shift, priority)]; unav_days None = only preferences in the job."""
+    return svc.make_job(
+        doctor=doctor,
+        doctor_email=f"{svc.doctor_slug(doctor)}@example.org",
+        entries_by_month={} if unav_days is None else {MONTH: [(dt.date(2026, 10, d), "Ferie", "") for d in unav_days]},
+        base_signatures={} if unav_days is None else {MONTH: list(unav_base)},
+        pref_entries_by_month={MONTH: [(dt.date(2026, 10, d), sh, "", pri) for d, sh, pri in prefs]},
+        pref_base_signatures={MONTH: list(base)},
+        origin=origin,
+    )
+
+
+class PreferenceSaveTests(ServiceTestCase):
+    """Preferences go through exactly the same safe save as unavailability."""
+
+    def make_queue(self, **kw):
+        return svc.SaveQueue(cfg(), clock=self.clock.now, **kw)
+
+    def test_preferences_are_saved_verified_audited_and_in_the_receipt(self):
+        result = svc.save_now(cfg(), pjob("Migliorato", [(14, "Notte", "alta")], unav_days=[3]), max_wait=25)
+
+        self.assertEqual([(r["date"], r["shift"], r["priority"]) for r in prefs_of(self.gh, "Migliorato")],
+                         [("2026-10-14", "Notte", "alta")])
+        self.assertEqual([r["date"] for r in rows_of(self.gh, "Migliorato")], ["2026-10-03"])
+        self.assertTrue(result.changed)
+        svc.write_audit(cfg(), result)
+        self.assertEqual(sorted(r["action"] for r in audit_rows(self.gh)), ["save", "save_pref"])
+        svc.send_receipt(cfg(), result)
+        body = FakeSMTP.sent[-1].get_content()
+        self.assertIn("sab 03/10  Ferie", body)
+        self.assertIn("PREFERENZE", body)
+        self.assertIn("mer 14/10  Notte (priorità alta)", body)
+
+    def test_preference_only_save(self):
+        result = svc.save_now(cfg(), pjob("Migliorato", [(14, "Notte", "media")]), max_wait=25)
+
+        self.assertTrue(result.changed)
+        self.assertEqual(len(prefs_of(self.gh, "Migliorato")), 1)
+        self.assertEqual(rows_of(self.gh, "Migliorato"), [])
+
+    def test_stale_editor_cannot_overwrite_preferences_and_writes_nothing(self):
+        svc.save_now(cfg(), pjob("Migliorato", [(3, "Mattina", "alta")]), max_wait=25)   # altro dispositivo
+
+        with self.assertRaises(ustore.MonthConflictError) as ctx:
+            svc.save_now(cfg(), pjob("Migliorato", [(14, "Notte", "media")], base=[], unav_days=[5]), max_wait=25)
+
+        self.assertIn("preferenze", str(ctx.exception))
+        self.assertEqual([r["date"] for r in prefs_of(self.gh, "Migliorato")], ["2026-10-03"])
+        self.assertEqual(rows_of(self.gh, "Migliorato"), [], "nemmeno le indisponibilità: niente salvataggi a metà")
+
+    def test_preferences_are_queued_while_github_is_down(self):
+        with tempfile.TemporaryDirectory() as td:
+            q = self.make_queue(persist_path=Path(td) / "q.json")
+            self.gh.down = True
+            status, _ = q.save_or_enqueue(pjob("Migliorato", [(14, "Notte", "alta")], unav_days=[3]), max_wait=25)
+            self.assertEqual(status, "queued")
+            q = self.make_queue(persist_path=Path(td) / "q.json")   # riavvio del processo
+
+            self.gh.down = False
+            self.clock.sleep(3600)
+            q.process_due()
+
+        self.assertEqual([r["priority"] for r in prefs_of(self.gh, "Migliorato")], ["alta"])
+        self.assertEqual(len(FakeSMTP.sent), 1)
+        self.assertIn("Notte (priorità alta)", FakeSMTP.sent[0].get_content())
+
+    def test_unavailability_landed_then_github_down_gives_one_complete_receipt(self):
+        q = self.make_queue()
+        put = self.gh._put
+
+        def put_then_fail(path, payload, url):
+            r = put(path, payload, url)
+            if path.startswith("data/unavailability/"):
+                self.gh.down = True            # GitHub saturo subito dopo le indisponibilità
+            return r
+        self.gh._put = put_then_fail
+
+        status, _ = q.save_or_enqueue(pjob("Migliorato", [(14, "Notte", "alta")], unav_days=[3]), max_wait=25)
+        self.assertEqual(status, "queued")
+        self.assertEqual(len(rows_of(self.gh, "Migliorato")), 1)
+        self.assertEqual(FakeSMTP.sent, [])
+
+        self.gh._put = put
+        self.gh.down = False
+        self.clock.sleep(3600)
+        q.process_due()
+
+        self.assertEqual(len(prefs_of(self.gh, "Migliorato")), 1)
+        self.assertEqual(len(FakeSMTP.sent), 1)
+        body = FakeSMTP.sent[0].get_content()
+        self.assertIn("sab 03/10  Ferie", body)
+        self.assertIn("Notte (priorità alta)", body)
+        self.assertEqual(sorted(r["action"] for r in audit_rows(self.gh)), ["save", "save_pref"])
+
+    def test_other_device_cannot_overwrite_preferences_waiting_in_queue(self):
+        q = self.make_queue()
+        q.enqueue(pjob("Migliorato", [(14, "Notte", "alta")], origin="telefono"))
+
+        with self.assertRaises(ustore.MonthConflictError):
+            q.save_or_enqueue(pjob("Migliorato", [(20, "Mattina", "media")], origin="pc"), max_wait=25)
+
+
 class WorkerThreadTests(unittest.TestCase):
     """Real background thread, real (short) time."""
 

@@ -37,10 +37,16 @@ MK = f"{YY:04d}-{MM:02d}"
 ROWS_KEY = f"unav_rows_{DOCTOR}_{YY}_{MM}"
 OFFICIAL = "data/unavailability/unavail_migliorato.csv"
 DRAFT = "data/unavailability_drafts/draft_migliorato.json"
+AVAIL = "data/availability/avail_migliorato.csv"
 
 
 def day(n: int) -> dt.date:
     return dt.date(YY, MM, n)
+
+
+def pref_rows(gh):
+    text = gh.files.get(AVAIL, ("", ""))[0]
+    return list(csv.DictReader(io.StringIO(text))) if text.strip() else []
 
 
 def official_rows(gh):
@@ -82,6 +88,21 @@ class FakeCalendar:
         return self.last["days"][n - 1]
 
 
+class CalendarRouter:
+    """One FakeCalendar per AppTest session (the session that is running)."""
+
+    def __init__(self):
+        self.by_session = {}
+        self.current = None
+
+    def calendar(self, at=None) -> FakeCalendar:
+        key = id(at) if at is not None else self.current
+        return self.by_session.setdefault(key, FakeCalendar())
+
+    def __call__(self, payload=None, key=None, default=None):
+        return self.calendar()(payload=payload, key=key, default=default)
+
+
 class DoctorUnavailabilityFlowTests(unittest.TestCase):
     chaos = 0.0
 
@@ -115,13 +136,21 @@ class DoctorUnavailabilityFlowTests(unittest.TestCase):
         FakeSMTP.sent = []
         FakeSMTP.logins = []
         FakeSMTP.reject_login = False
-        self.calendar = FakeCalendar()
+        self.router = CalendarRouter()
+        _orig_run = AppTest.run
+        router = self.router
+
+        def _run(at, *a, **k):
+            router.current = id(at)
+            return _orig_run(at, *a, **k)
+
         patches = [
+            mock.patch.object(AppTest, "run", _run),
             mock.patch.object(github_utils, "_http", self.gh),
             mock.patch.object(github_utils, "_now", self.clock.now),
             mock.patch.object(github_utils, "_sleep", self.clock.sleep),
             mock.patch.object(smtplib, "SMTP", FakeSMTP),
-            mock.patch("streamlit.components.v1.declare_component", lambda *a, **k: self.calendar),
+            mock.patch("streamlit.components.v1.declare_component", lambda *a, **k: self.router),
             mock.patch.dict(os.environ, {
                 "TURNI_QUEUE_WORKER_INTERVAL": "0.05",
                 "TURNI_QUEUE_PERSIST_PATH": os.path.join(self.tmp.name, "queue.json"),
@@ -161,7 +190,12 @@ class DoctorUnavailabilityFlowTests(unittest.TestCase):
         at.run()
         self.assertFalse(at.exception, at.exception)
 
+    @property
+    def calendar(self) -> FakeCalendar:
+        return self.router.calendar()
+
     def tap(self, at: AppTest, event: dict) -> None:
+        self.router.current = id(at)
         self.calendar.send(event)
         at.run()
         self.assertFalse(at.exception, at.exception)
@@ -257,6 +291,86 @@ class DoctorUnavailabilityFlowTests(unittest.TestCase):
 
         self.assertEqual(self.calendar.day(8)["unav"], [{"shift": "Ferie", "note": ""}])
         self.assertEqual(len(at.session_state[ROWS_KEY]), 3)
+
+    # ── Preferenze: stesse garanzie delle indisponibilità ─────────────────────
+    def pref(self, at, d, shift="Notte", priority="alta"):
+        self.tap(at, {"type": "set_day", "kind": "pref", "day": d, "shifts": [shift], "priority": priority})
+
+    def test_preferences_are_saved_with_confirmation_and_receipt(self):
+        at = self.login(self.new_session())
+        self.pref(at, 14)
+
+        self.save(at)
+
+        self.assertEqual([(r["date"], r["shift"], r["priority"]) for r in pref_rows(self.gh)],
+                         [(day(14).isoformat(), "Notte", "alta")])
+        self.assertIn("verificato sul server", self.page_text(at))
+        self.assertIn("preferenze", self.page_text(at).lower())
+        self.assertEqual(len(FakeSMTP.sent), 1)
+        self.assertIn("Notte (priorità alta)", FakeSMTP.sent[0].get_content())
+        self.assertFalse(self.calendar.day(14)["pending"])
+
+    def test_preferences_and_unavailability_in_one_send_and_one_mail(self):
+        at = self.login(self.new_session())
+        self.pref(at, 14)
+        self.tap(at, {"type": "set_day", "kind": "unav", "day": 3, "shifts": ["Mattina"]})
+
+        self.save(at)
+
+        self.assertEqual(len(pref_rows(self.gh)), 1)
+        self.assertEqual(len(official_rows(self.gh)), 1)
+        self.assertEqual(len(FakeSMTP.sent), 1)
+        body = FakeSMTP.sent[0].get_content()
+        self.assertIn("Mattina", body)
+        self.assertIn("Notte (priorità alta)", body)
+
+    def test_priority_change_alone_is_saved(self):
+        at = self.login(self.new_session())
+        self.pref(at, 14, priority="media")
+        self.save(at)
+        self.pref(at, 14, priority="alta")
+
+        self.save(at)
+
+        self.assertEqual([r["priority"] for r in pref_rows(self.gh)], ["alta"])
+
+    def test_unsent_preferences_are_restored_at_next_login(self):
+        at = self.login(self.new_session())
+        self.pref(at, 14)
+        # Il telefono ricarica la pagina prima di Invia.
+        other = self.login(self.new_session())
+
+        self.assertEqual(self.router.calendar(other).day(14)["pref"], [{"shift": "Notte", "note": "", "priority": "alta"}])
+        self.assertIn("NON inviate", self.page_text(other))
+        self.assertEqual(pref_rows(self.gh), [])
+
+    def test_stale_tab_cannot_erase_preferences_saved_from_another_device(self):
+        pc = self.login(self.new_session())
+        phone = self.login(self.new_session())
+        self.pref(phone, 14)
+        self.save(phone)
+        next(b for b in phone.button if b.label == "Esci / cambia medico").click()
+        phone.run()
+
+        self.pref(pc, 20, shift="Mattina", priority="media")
+        self.save(pc)
+
+        self.assertEqual([r["date"] for r in pref_rows(self.gh)], [day(14).isoformat()])
+        self.assertIn("BLOCCATO", self.page_text(pc))
+
+    def test_preferences_are_queued_when_github_is_saturated(self):
+        at = self.login(self.new_session())
+        self.pref(at, 14)
+
+        self.gh.down = True
+        self.save(at)
+        self.assertIn("IN CODA", self.page_text(at))
+        self.assertEqual(pref_rows(self.gh), [])
+
+        self.gh.down = False
+        self.clock.sleep(3600)
+        self.assertTrue(self.wait_until(lambda: len(pref_rows(self.gh)) == 1), "il worker non ha completato")
+        self.assertTrue(self.wait_until(lambda: len(FakeSMTP.sent) == 1))
 
     def test_unsent_draft_is_restored_at_next_login(self):
         at = self.login(self.new_session())
@@ -481,6 +595,54 @@ class DoctorUnavailabilityFlowTests(unittest.TestCase):
 
         self.assertEqual(len(FakeSMTP.sent), 1)
         self.assertEqual(FakeSMTP.logins, [("turni.utic@gmail.com", "abcdefghijklmnop")])
+
+    # ── Email dei medici dal pannello pool ─────────────────────────────────────
+    def seed_pool(self):
+        import pool_config_store
+        import turni_generator
+        pool = pool_config_store.migrate_from_yaml(turni_generator.load_rules(Path("Regole_Turni.yml")))
+        self.gh.seed("data/pool_config.json", json.dumps(pool))
+        return pool
+
+    def contacts(self):
+        import yaml
+        return yaml.safe_load(self.gh.files["data/doctor_contacts.yml"][0]) or {}
+
+    def test_admin_changes_one_doctor_email_from_the_pool_panel(self):
+        self.seed_pool()
+        self.gh.seed("data/doctor_contacts.yml", f"{DOCTOR}:\n  email: migliorato@example.org\n  phone: '+39333'\nRossi:\n  email: rossi@example.org\n")
+        admin = self.admin_session("🔧 Admin — Configurazione")
+
+        admin.selectbox(key="contact_doctor").set_value(DOCTOR)
+        admin.run()
+        self.assertEqual(admin.text_input(key=f"contact_email::{DOCTOR}").value, "migliorato@example.org")
+        admin.text_input(key=f"contact_email::{DOCTOR}").input("nuova.migliorato@example.org")
+        admin.button(key="contact_save").click()
+        admin.run()
+
+        self.assertFalse(admin.exception, admin.exception)
+        self.assertEqual(self.contacts()[DOCTOR], {"email": "nuova.migliorato@example.org", "phone": "+39333"})
+        self.assertEqual(self.contacts()["Rossi"], {"email": "rossi@example.org"})
+        self.assertIn("Email di Migliorato aggiornata", self.page_text(admin))
+
+        # La mail di resoconto successiva va al nuovo indirizzo.
+        doc = self.login(self.new_session())
+        self.tap(doc, {"type": "set_day", "kind": "unav", "day": 15, "shifts": ["Notte"]})
+        self.save(doc)
+        self.assertEqual(FakeSMTP.sent[-1]["To"], "nuova.migliorato@example.org")
+
+    def test_invalid_doctor_email_is_not_saved(self):
+        self.seed_pool()
+        admin = self.admin_session("🔧 Admin — Configurazione")
+        admin.selectbox(key="contact_doctor").set_value(DOCTOR)
+        admin.run()
+
+        admin.text_input(key=f"contact_email::{DOCTOR}").input("non-valida")
+        admin.button(key="contact_save").click()
+        admin.run()
+
+        self.assertEqual(self.contacts()[DOCTOR], {"email": "migliorato@example.org"})
+        self.assertIn("non valido", self.page_text(admin))
 
 
 class DoctorUnavailabilityFlowUnderChaosTests(DoctorUnavailabilityFlowTests):

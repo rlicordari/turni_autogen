@@ -179,7 +179,8 @@ def replace_doctor_month(
 Signature = List[Tuple[str, str, str]]
 
 
-def entries_signature(entries: Iterable[Tuple]) -> Signature:
+def entries_signature(entries: Iterable[Tuple], with_priority: bool = False) -> Signature:
+    """(date_iso, shift, note) per entry; preferences add the priority."""
     sig = set()
     for entry in entries or []:
         d, sh, note = entry[0], entry[1], entry[2] if len(entry) > 2 else ""
@@ -187,12 +188,15 @@ def entries_signature(entries: Iterable[Tuple]) -> Signature:
             continue
         sh2 = norm_shift(sh)
         if sh2:
-            sig.add((d.isoformat(), sh2, str(note or "")))
+            item = (d.isoformat(), sh2, str(note or ""))
+            if with_priority:
+                item += (norm_priority(entry[3] if len(entry) > 3 else "media"),)
+            sig.add(item)
     return sorted(sig)
 
 
-def month_signature(rows: List[Dict[str, str]], doctor: str, year: int, month: int) -> Signature:
-    return rows_signature(filter_doctor_month(rows, doctor, year, month))
+def month_signature(rows: List[Dict[str, str]], doctor: str, year: int, month: int, with_priority: bool = False) -> Signature:
+    return rows_signature(filter_doctor_month(rows, doctor, year, month), with_priority=with_priority)
 
 
 def normalize_signature(sig: Iterable) -> Signature:
@@ -200,10 +204,13 @@ def normalize_signature(sig: Iterable) -> Signature:
     return sorted(tuple(str(x) for x in item) for item in (sig or []))
 
 
-def compute_month_diff(existing_rows: List[Dict[str, str]], new_entries: Iterable[Tuple]) -> dict:
-    """Diff (date, shift) between stored rows and edited entries; notes are not logged."""
-    before = {(d, sh): note for d, sh, note in rows_signature(existing_rows)}
-    after = {(d, sh): note for d, sh, note in entries_signature(new_entries)}
+def compute_month_diff(existing_rows: List[Dict[str, str]], new_entries: Iterable[Tuple], with_priority: bool = False) -> dict:
+    """Diff (date, shift) between stored rows and edited entries; notes are not logged.
+
+    note_changed counts days whose note (or, for preferences, priority) changed.
+    """
+    before = {(it[0], it[1]): it[2:] for it in rows_signature(existing_rows, with_priority=with_priority)}
+    after = {(it[0], it[1]): it[2:] for it in entries_signature(new_entries, with_priority=with_priority)}
     added = sorted(set(after) - set(before))
     removed = sorted(set(before) - set(after))
     note_changed = sorted(k for k in set(before) & set(after) if before[k] != after[k])
@@ -221,7 +228,7 @@ def compute_month_diff(existing_rows: List[Dict[str, str]], new_entries: Iterabl
     }
 
 
-def rows_signature(rows: List[Dict[str, str]]) -> Signature:
+def rows_signature(rows: List[Dict[str, str]], with_priority: bool = False) -> Signature:
     """Signature of already-filtered rows (one doctor-month)."""
     sig = set()
     for r in rows or []:
@@ -231,7 +238,10 @@ def rows_signature(rows: List[Dict[str, str]]) -> Signature:
             continue
         sh = norm_shift(r.get("shift", ""))
         if sh:
-            sig.add((d_iso, sh, str(r.get("note", "") or "")))
+            item = (d_iso, sh, str(r.get("note", "") or ""))
+            if with_priority:
+                item += (norm_priority(r.get("priority", "media")),)
+            sig.add(item)
     return sorted(sig)
 
 
@@ -244,12 +254,13 @@ class ShaConflictError(RuntimeError):
 class MonthConflictError(RuntimeError):
     """The month was changed by another session after the editor was opened."""
 
-    def __init__(self, month_key: str):
+    def __init__(self, month_key: str, what: str = "indisponibilità"):
         super().__init__(
-            f"Le indisponibilità di {month_key} sono state modificate da un'altra sessione "
+            f"Le {what} di {month_key} sono state modificate da un'altra sessione "
             "o da un altro dispositivo dopo che hai aperto questa pagina."
         )
         self.month_key = month_key
+        self.what = what
 
 
 class SaveNotVerifiedError(RuntimeError):
@@ -277,6 +288,9 @@ def save_doctor_months(
     verify_reads: int = 6,
     sleep_fn: Callable[[float], None] = time.sleep,
     is_conflict: Optional[Callable[[Exception], bool]] = None,
+    with_priority: bool = False,
+    what: str = "indisponibilità",
+    on_attempt: Optional[Callable[[Dict[str, dict]], None]] = None,
 ) -> SaveOutcome:
     """Replace whole doctor-months with the edited entries, safely.
 
@@ -289,7 +303,11 @@ def save_doctor_months(
       fresh data; the read-back after the write is retried without rewriting.
 
     load_fn() -> (rows, sha); save_fn(rows, sha) -> {"content_sha", "commit_sha"}.
+    Preferences (entries with a priority) pass with_priority=True and what="preferenze".
+    on_attempt(diffs) is called right before each write: the caller can remember
+    what may have landed even if the response or the read-back is lost.
     """
+    wp = with_priority
     is_conflict = is_conflict or (lambda e: isinstance(e, ShaConflictError))
     months = sorted(entries_by_month.items())
     bases = {k: normalize_signature(v) for k, v in (base_signatures or {}).items()}
@@ -302,13 +320,13 @@ def save_doctor_months(
         diffs: Dict[str, dict] = {}
         for (yy, mm), entries in months:
             mk = f"{int(yy):04d}-{int(mm):02d}"
-            current = month_signature(doctor_rows, doctor, int(yy), int(mm))
-            if current == entries_signature(entries):
+            current = month_signature(doctor_rows, doctor, int(yy), int(mm), with_priority=wp)
+            if current == entries_signature(entries, with_priority=wp):
                 continue
             base = bases.get((yy, mm))
             if base is not None and current != base:
-                raise MonthConflictError(mk)
-            diffs[mk] = compute_month_diff(filter_doctor_month(doctor_rows, doctor, int(yy), int(mm)), entries)
+                raise MonthConflictError(mk, what)
+            diffs[mk] = compute_month_diff(filter_doctor_month(doctor_rows, doctor, int(yy), int(mm)), entries, with_priority=wp)
             new_rows = replace_doctor_month(new_rows, doctor, int(yy), int(mm), entries, updated_at=updated_at)
 
         if not diffs:
@@ -323,6 +341,8 @@ def save_doctor_months(
         if not attempted_diffs:
             attempted_diffs = diffs
 
+        if on_attempt is not None:
+            on_attempt(diffs)
         try:
             result = save_fn(new_rows, sha) or {}
         except Exception as e:
@@ -335,7 +355,7 @@ def save_doctor_months(
             v_rows, v_sha = load_fn()
             v_doctor_rows = [r for r in v_rows if (r.get("doctor") or "") == doctor]
             if all(
-                month_signature(v_doctor_rows, doctor, int(yy), int(mm)) == entries_signature(entries)
+                month_signature(v_doctor_rows, doctor, int(yy), int(mm), with_priority=wp) == entries_signature(entries, with_priority=wp)
                 for (yy, mm), entries in months
             ):
                 return SaveOutcome(

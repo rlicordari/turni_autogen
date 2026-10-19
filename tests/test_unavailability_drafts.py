@@ -103,6 +103,59 @@ class DraftTests(unittest.TestCase):
         self.assertEqual(ud.remove_month(draft, "2026-10")["months"], {})
 
 
+def prow(doctor, day, shift, priority="media"):
+    return {"doctor": doctor, "date": day, "shift": shift, "note": "", "updated_at": "t0", "priority": priority}
+
+
+NOTTE_14 = (dt.date(2026, 10, 14), "Notte", "", "alta")
+
+
+def with_prefs(pref_entries, pref_base=(), entries=(), base=()):
+    return ud.set_month(
+        ud.empty_draft("Migliorato"), "2026-10",
+        entries=list(entries), base_signature=list(base),
+        pref_entries=list(pref_entries), pref_base_signature=list(pref_base),
+        updated_at="2026-10-19T08:00:00Z", session_id="s1",
+    )
+
+
+class DraftPreferenceTests(unittest.TestCase):
+    def test_preferences_round_trip_with_priority(self):
+        restored = ud.from_text(ud.to_text(with_prefs([NOTTE_14])))
+        self.assertEqual(ud.month_pref_entries(restored, "2026-10"), [NOTTE_14])
+
+    def test_unsent_preferences_are_resumed(self):
+        start = ud.editor_start(with_prefs([NOTTE_14]), "2026-10", [], official_pref_signature=[])
+
+        self.assertEqual(start["action"], "resume")
+        self.assertEqual(start["pref_entries"], [NOTTE_14])
+        self.assertEqual(start["entries"], [])
+
+    def test_preferences_changed_on_server_are_offered_not_resumed(self):
+        official_pref = ustore.rows_signature([prow("Migliorato", "2026-10-03", "Mattina")], with_priority=True)
+
+        start = ud.editor_start(with_prefs([NOTTE_14], pref_base=[]), "2026-10", [], official_pref_signature=official_pref)
+
+        self.assertEqual(start["action"], "offer")
+
+    def test_draft_equal_to_server_starts_from_server(self):
+        official_pref = ustore.entries_signature([NOTTE_14], with_priority=True)
+        start = ud.editor_start(with_prefs([NOTTE_14]), "2026-10", [], official_pref_signature=official_pref)
+        self.assertEqual(start["action"], "official")
+
+    def test_pending_summary_counts_unsent_preferences(self):
+        out = ud.pending_summary(with_prefs([NOTTE_14]), [], ["2026-10"], official_pref_rows=[])
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["pref"], 1)
+
+    def test_old_drafts_without_preferences_still_work(self):
+        draft = ud.set_month(ud.empty_draft("Migliorato"), "2026-10", entries=[(dt.date(2026, 10, 7), "Ferie", "")],
+                             base_signature=[], updated_at="t", session_id="s1")
+        start = ud.editor_start(draft, "2026-10", [], official_pref_signature=[])
+        self.assertEqual(start["action"], "resume")
+        self.assertIsNone(start["pref_entries"])
+
+
 class FakeDraftServer:
     """Stand-in for the GitHub draft file: read-modify-write, can be made to fail."""
 

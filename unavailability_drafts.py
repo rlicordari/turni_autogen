@@ -6,7 +6,12 @@ One JSON file per doctor on GitHub (data/unavailability_drafts/draft_<slug>.json
     {"schema_version": 1, "doctor": "...",
      "months": {"2026-10": {"entries": [["2026-10-07", "Ferie", ""], ...],
                              "base_signature": [[date, shift, note], ...],
+                             "pref_entries": [["2026-10-14", "Notte", "", "alta"], ...],
+                             "pref_base_signature": [[date, shift, note, priority], ...],
                              "updated_at": "...Z", "session_id": "..."}}}
+
+Preferences ("Preferirei") follow the same rules as unavailability; drafts
+written before they existed simply have no pref_* keys.
 
 `base_signature` is the server data the editor started from: if the server
 changed after it, the draft must not be resumed silently.
@@ -53,14 +58,20 @@ def set_month(
     base_signature: Iterable,
     updated_at: str,
     session_id: str,
+    pref_entries: Optional[Iterable] = None,
+    pref_base_signature: Optional[Iterable] = None,
 ) -> dict:
     out = copy.deepcopy(draft)
-    out.setdefault("months", {})[month_key] = {
+    month = {
         "entries": [list(item) for item in ustore.entries_signature(entries)],
         "base_signature": [list(item) for item in ustore.normalize_signature(base_signature)],
         "updated_at": updated_at,
         "session_id": session_id,
     }
+    if pref_entries is not None:
+        month["pref_entries"] = [list(item) for item in ustore.entries_signature(pref_entries, with_priority=True)]
+        month["pref_base_signature"] = [list(item) for item in ustore.normalize_signature(pref_base_signature or [])]
+    out.setdefault("months", {})[month_key] = month
     return out
 
 
@@ -81,24 +92,51 @@ def month_entries(draft: dict, month_key: str) -> List[Entry]:
     return out
 
 
-def editor_start(draft: Optional[dict], month_key: str, official_signature: Iterable) -> dict:
-    """How the month editor should start.
+def month_pref_entries(draft: dict, month_key: str) -> Optional[list]:
+    """Preferences of the draft month, None if the draft has none stored."""
+    month = (draft.get("months") or {}).get(month_key) or {}
+    if "pref_entries" not in month:
+        return None
+    out = []
+    for item in month.get("pref_entries") or []:
+        try:
+            out.append((dt.date.fromisoformat(str(item[0])[:10]), str(item[1]), str(item[2]), str(item[3])))
+        except Exception:
+            continue
+    return out
+
+
+def editor_start(
+    draft: Optional[dict],
+    month_key: str,
+    official_signature: Iterable,
+    official_pref_signature: Optional[Iterable] = None,
+) -> dict:
+    """How the month editor should start (unavailability + preferences together).
 
     - "official": no draft for the month, or the draft equals the server data;
     - "resume": unsent draft built on the current server data → reload it;
     - "offer": unsent draft, but the server changed after it → let the doctor choose.
+    pref_entries is None when the draft holds no preferences (keep the server ones).
     """
     official = ustore.normalize_signature(official_signature)
+    official_pref = ustore.normalize_signature(official_pref_signature or [])
     month = ((draft or {}).get("months") or {}).get(month_key)
     if not month:
         return {"action": "official"}
     entries = month_entries(draft, month_key)
-    if ustore.entries_signature(entries) == official:
+    pref_entries = month_pref_entries(draft, month_key)
+    same_unav = ustore.entries_signature(entries) == official
+    same_pref = pref_entries is None or ustore.entries_signature(pref_entries, with_priority=True) == official_pref
+    if same_unav and same_pref:
         return {"action": "official"}
-    base = ustore.normalize_signature(month.get("base_signature") or [])
+    base_ok = ustore.normalize_signature(month.get("base_signature") or []) == official
+    if pref_entries is not None:
+        base_ok = base_ok and ustore.normalize_signature(month.get("pref_base_signature") or []) == official_pref
     return {
-        "action": "resume" if base == official else "offer",
+        "action": "resume" if base_ok else "offer",
         "entries": entries,
+        "pref_entries": pref_entries,
         "updated_at": month.get("updated_at") or "",
     }
 
@@ -154,11 +192,13 @@ class MemoryDraftStore:
         with self._lock:
             return {d: copy.deepcopy(v) for d, v in self._drafts.items()}
 
-    def set_month(self, doctor, month_key, *, entries, base_signature, updated_at, session_id) -> None:
+    def set_month(self, doctor, month_key, *, entries, base_signature, updated_at, session_id,
+                  pref_entries=None, pref_base_signature=None) -> None:
         with self._lock:
             draft = self._drafts.get(doctor) or empty_draft(doctor)
             draft = set_month(draft, month_key, entries=entries, base_signature=base_signature,
-                              updated_at=updated_at, session_id=session_id)
+                              updated_at=updated_at, session_id=session_id,
+                              pref_entries=pref_entries, pref_base_signature=pref_base_signature)
             self._drafts[doctor] = draft
             self._dirty.setdefault(doctor, {})[month_key] = copy.deepcopy(draft["months"][month_key])
 
@@ -201,7 +241,12 @@ class MemoryDraftStore:
             return not dirty
 
 
-def pending_summary(draft: Optional[dict], official_rows: List[dict], month_keys: Iterable[str]) -> List[dict]:
+def pending_summary(
+    draft: Optional[dict],
+    official_rows: List[dict],
+    month_keys: Iterable[str],
+    official_pref_rows: Optional[List[dict]] = None,
+) -> List[dict]:
     """Months where the draft still differs from the official server data."""
     doctor = (draft or {}).get("doctor") or ""
     out = []
@@ -212,14 +257,22 @@ def pending_summary(draft: Optional[dict], official_rows: List[dict], month_keys
         yy, mm = int(mk[:4]), int(mk[5:7])
         entries = month_entries(draft, mk)
         official = ustore.filter_doctor_month(official_rows, doctor, yy, mm)
-        if ustore.entries_signature(entries) == ustore.rows_signature(official):
-            continue
         diff = ustore.compute_month_diff(official, entries)
+        unav_changed = ustore.entries_signature(entries) != ustore.rows_signature(official)
+        pref_changes = 0
+        pref_entries = month_pref_entries(draft, mk)
+        if pref_entries is not None and official_pref_rows is not None:
+            official_pref = ustore.filter_doctor_month(official_pref_rows, doctor, yy, mm)
+            pdiff = ustore.compute_month_diff(official_pref, pref_entries, with_priority=True)
+            pref_changes = pdiff["added_count"] + pdiff["removed_count"] + pdiff["note_changed_count"]
+        if not unav_changed and not pref_changes:
+            continue
         out.append({
             "doctor": doctor,
             "month": mk,
-            "added": diff["added_count"],
-            "removed": diff["removed_count"],
+            "added": diff["added_count"] if unav_changed else 0,
+            "removed": diff["removed_count"] if unav_changed else 0,
+            "pref": pref_changes,
             "updated_at": month.get("updated_at") or "",
         })
     return out
