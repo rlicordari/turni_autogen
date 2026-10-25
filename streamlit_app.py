@@ -37,6 +37,7 @@ import unavailability_store as ustore
 import xlsx_utils
 import shift_history as sh
 import generation_memory as gmem
+from fixed_assignment_options import parse_fixed_assignment_rows
 
 # Import generator
 import turni_generator as tg
@@ -2913,37 +2914,40 @@ def render_admin_generate_panel(cfg_admin: dict, doctors: list[str], rules_path:
             reset_j_defaults = st.form_submit_button("Reset J default")
 
     if apply_generation_options or generate:
-        _fixed_records = []
-        if isinstance(fixed_df_draft, pd.DataFrame):
-            for _, _row in fixed_df_draft.iterrows():
-                _doc = str(_row.get("Medico") or "").strip()
-                _day = _row.get("Giorno")
-                _label = str(_row.get("Turno/Colonna") or "").strip()
-                if not _doc or not _label:
-                    continue
-                if isinstance(_day, datetime):
-                    _day = _day.date()
-                if not isinstance(_day, date):
-                    continue
-                _fixed_records.append({"doctor": _doc, "date": str(_day), "column": SHIFT_LABELS_ADMIN.get(_label, "J")})
-        _options_state = {
-            "disabled_labels": list(_disabled_selected_labels_draft or []),
-            "unav_mode": unav_mode_draft,
-            "manual_block": list(manual_block_draft or []),
-            "fixed_assignments": _fixed_records,
-            "v_double": dict(_v_double_draft or {}),
-            "j_blank": dict(_j_blank_draft or {}),
-            "confirm_j_non_default": bool(_confirm_j_non_default_draft),
-            "use_generation_memory": bool(_use_generation_memory_draft),
-            "store_generation_memory": bool(_store_generation_memory_draft),
-            "generation_memory_label": _generation_memory_label_draft,
-            "selected_generation_version_ids": list(_selected_generation_version_ids_draft or []),
-        }
-        st.session_state[_options_key] = _options_state
+        # A previous workbook is no longer valid after submitting new options,
+        # or after a failed attempt to generate with them.
+        st.session_state.pop("last_generated", None)
+        try:
+            _fixed_records = parse_fixed_assignment_rows(
+                fixed_df_draft,
+                start=period_start,
+                end=period_end,
+                doctors=doctors,
+                shift_labels=SHIFT_LABELS_ADMIN,
+            )
+        except ValueError as _fixed_error:
+            st.error(f"Assegnazioni fisse: {_fixed_error}")
+            generate = False
+        else:
+            _options_state = {
+                "disabled_labels": list(_disabled_selected_labels_draft or []),
+                "unav_mode": unav_mode_draft,
+                "manual_block": list(manual_block_draft or []),
+                "fixed_assignments": _fixed_records,
+                "v_double": dict(_v_double_draft or {}),
+                "j_blank": dict(_j_blank_draft or {}),
+                "confirm_j_non_default": bool(_confirm_j_non_default_draft),
+                "use_generation_memory": bool(_use_generation_memory_draft),
+                "store_generation_memory": bool(_store_generation_memory_draft),
+                "generation_memory_label": _generation_memory_label_draft,
+                "selected_generation_version_ids": list(_selected_generation_version_ids_draft or []),
+            }
+            st.session_state[_options_key] = _options_state
         if generate and _j_non_default_draft and not _confirm_j_non_default_draft:
             st.error("Generazione bloccata: conferma le eccezioni J non-default oppure usa Reset J default.")
             generate = False
     elif reset_j_defaults:
+        st.session_state.pop("last_generated", None)
         _options_state = dict(_options_state or {})
         _options_state["j_blank"] = {}
         _options_state["confirm_j_non_default"] = False
@@ -3269,6 +3273,20 @@ def render_admin_generate_panel(cfg_admin: dict, doctors: list[str], rules_path:
                     pool_config=_pool_cfg_for_solver if _pool_cfg_for_solver else None,
                     prior_usage=_prior_usage_for_solver,
                 )
+
+                _failed_fixed = [
+                    check
+                    for month_stats in (stats.get("months") or {}).values()
+                    for check in (month_stats.get("fixed_assignments_checked") or [])
+                    if not check.get("ok")
+                ]
+                if _failed_fixed:
+                    details = "; ".join(
+                        f"{check.get('date')} {check.get('column')}: richiesto {check.get('doctor')}, "
+                        f"ottenuto {', '.join(check.get('actual') or []) or 'vuoto'}"
+                        for check in _failed_fixed
+                    )
+                    raise ValueError(f"Assegnazioni fisse non rispettate: {details}")
 
                 _saved_generation_memory = None
                 if _store_generation_memory:
