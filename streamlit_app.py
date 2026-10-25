@@ -42,7 +42,7 @@ from fixed_assignment_options import parse_fixed_assignment_rows
 # Import generator
 import turni_generator as tg
 
-APP_BUILD = "2026-02-01-ui-v7"
+APP_BUILD = "2026-10-25-fixed-assignments-v2"
 
 # ---- Concurrency & session safety (doctor mode) ----
 # - One active session per doctor: in-memory lease (session_leases), a new login
@@ -2990,7 +2990,21 @@ def render_admin_generate_panel(cfg_admin: dict, doctors: list[str], rules_path:
         if r.get("doctor") and r.get("date") and r.get("column")
     ]
     if fixed_assignments_list:
-        st.caption(f"Assegnazioni fisse richieste: {len(fixed_assignments_list)}")
+        st.markdown(f"**Assegnazioni fisse acquisite: {len(fixed_assignments_list)}**")
+        st.dataframe(
+            pd.DataFrame([
+                {
+                    "Giorno": row["date"],
+                    "Medico": row["doctor"],
+                    "Colonna": row["column"],
+                }
+                for row in fixed_assignments_list
+            ]),
+            hide_index=True,
+            width="stretch",
+        )
+    else:
+        st.caption("Nessuna assegnazione fissa acquisita per questa generazione.")
 
     _v_double_overrides_list = []
     for _iso_key, _val in sorted(((_options_state.get("v_double") or {}) if isinstance(_options_state.get("v_double"), dict) else {}).items()):
@@ -3330,6 +3344,7 @@ def render_admin_generate_panel(cfg_admin: dict, doctors: list[str], rules_path:
                     "mk": mk,
                     "excel_bytes": excel_bytes,
                     "log_bytes": log_bytes,
+                    "fixed_assignments": list(fixed_assignments_list),
                     "stats": stats,
                     "elapsed_s": round(time.time() - t0, 2),
                     "generated_at": datetime.now().isoformat(timespec="seconds"),
@@ -3355,6 +3370,17 @@ def render_admin_generate_panel(cfg_admin: dict, doctors: list[str], rules_path:
             st.error(_summary)
         else:
             st.success(_summary)
+        _generated_fixed = last.get("fixed_assignments") or []
+        st.caption(
+            f"Assegnazioni fisse acquisite per questo Excel: {len(_generated_fixed)}"
+            + (
+                " · " + "; ".join(
+                    f"{row['date']} {row['column']} {row['doctor']}"
+                    for row in _generated_fixed
+                )
+                if _generated_fixed else ""
+            )
+        )
         _gm_last = last.get("generation_memory") if isinstance(last.get("generation_memory"), dict) else {}
         if _gm_last:
             _gm_parts = []

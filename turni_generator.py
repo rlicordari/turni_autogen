@@ -5931,6 +5931,13 @@ def write_solver_log(out_path: Path, stats: Dict) -> Optional[Path]:
         lines.append(f"Output: {out_path}")
         lines.append(f"Generated: {dt.datetime.now().isoformat(timespec='seconds')}")
         lines.append(f"Overall status: {stats.get('status')}")
+        requested_fixed = stats.get("requested_fixed_assignments")
+        if requested_fixed is not None:
+            lines.append(f"Assegnazioni fisse ricevute in input: {len(requested_fixed)}")
+            for item in requested_fixed:
+                lines.append(
+                    f"  - {item.get('date')} {item.get('column')}: {item.get('doctor')}"
+                )
         second_look = stats.get("heavy_festive_second_look") or []
         if second_look:
             lines.append("")
@@ -6455,6 +6462,8 @@ def generate_schedule(
             if str(c).strip()
         })
 
+    requested_fixed_assignments = list(fixed_assignments or [])
+
     # Merge pre-assigned holiday shifts from data/turni_festivi.yml
     tf = load_turni_festivi()
     if tf["festivi_extra"]:
@@ -6480,6 +6489,7 @@ def generate_schedule(
         historical_stats=historical_stats,
         prior_usage=prior_usage,
     )
+    stats["requested_fixed_assignments"] = requested_fixed_assignments
     # REMOVED: terza chiamata ridondante a assign_reperibilita_C (sovrascriveva C già ottimizzata)
     write_output(wb, ws, days, slots, assignment, cfg=cfg, out_path=outp, unav_map=unav_map)
     logp = write_solver_log(outp, stats)
