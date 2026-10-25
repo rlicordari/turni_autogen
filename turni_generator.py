@@ -2365,6 +2365,7 @@ def solve_with_ortools(
     # Collect extra objective terms built during constraint setup
     extra_obj = []
     heavy_priority_terms = []
+    kt_share_vars = []
     # Warnings raccolti durante la costruzione del modello (non bloccanti)
     pre_solve_warnings: List[str] = []
 
@@ -2618,6 +2619,7 @@ def solve_with_ortools(
     }
     blank_required_vars: Dict[str, object] = {}  # slot_id -> b_blank var (for diagnostics)
     coverage_obj_terms: List = []
+    optional_blank_vars: List = []
     for s in slots:
         vars_ = [x[(s.slot_id, d)] for d in s.allowed if (s.slot_id, d) in x]
         if not vars_:
@@ -2638,6 +2640,7 @@ def solve_with_ortools(
                 b = model.NewBoolVar(f"blank_{hash(s.slot_id)%10**8}")
                 model.Add(sum(vars_) + b == 1)
                 extra_obj.append(b * int(getattr(s, "blank_penalty", 0)))
+                optional_blank_vars.append(b)
             else:
                 model.Add(sum(vars_) <= 1)
     # Penalità per medici di emergenza (non nel pool primario della colonna)
@@ -2790,6 +2793,7 @@ def solve_with_ortools(
             if kt_y_by_doc:
                 model.Add(sum(kt_y_by_doc.values()) <= 1)
                 extra_obj.append(sum(kt_y_by_doc.values()) * kt_share_penalty)
+                kt_share_vars.extend(kt_y_by_doc.values())
                 for d, y in kt_y_by_doc.items():
                     slack_vars_by_doc[d].append(y)
 
@@ -4902,6 +4906,9 @@ def solve_with_ortools(
     solver.parameters.num_search_workers = 1
     coverage_status = None
     coverage_cost = None
+    kt_share_status = None
+    kt_share_count = None
+    optional_blank_count = None
     heavy_status = None
     heavy_cost = None
 
@@ -4925,6 +4932,35 @@ def solve_with_ortools(
                 # a non-worsening ceiling. Otherwise the final objective can
                 # drift back to a schedule with more blanks.
                 model.Add(coverage_expr <= coverage_cost)
+
+    # K+T is a fallback. Preserve required coverage first, optional service
+    # coverage second, then minimize K+T shares. This stops ordinary balance
+    # costs from buying an unnecessary share without sacrificing other services.
+    if kt_share_vars and coverage_status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        kt_share_expr = sum(kt_share_vars)
+        optional_blank_expr = sum(optional_blank_vars) if optional_blank_vars else 0
+        kt_scale = len(kt_share_vars) + 1
+        coverage_scale = (len(optional_blank_vars) + 1) * kt_scale
+        kt_priority_expr = (
+            coverage_scale * coverage_expr
+            + kt_scale * optional_blank_expr
+            + kt_share_expr
+        )
+        model.Minimize(kt_priority_expr)
+        original_time_limit = solver.parameters.max_time_in_seconds
+        solver.parameters.max_time_in_seconds = min(original_time_limit, 20.0)
+        try:
+            kt_share_status = solver.Solve(model)
+        finally:
+            solver.parameters.max_time_in_seconds = original_time_limit
+        if kt_share_status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            kt_priority_cost = int(solver.Value(kt_priority_expr))
+            kt_share_count = int(solver.Value(kt_share_expr))
+            optional_blank_count = int(solver.Value(optional_blank_expr)) if optional_blank_vars else 0
+            if kt_share_status == cp_model.OPTIMAL:
+                model.Add(kt_priority_expr == kt_priority_cost)
+            else:
+                model.Add(kt_priority_expr <= kt_priority_cost)
 
     heavy_priority_expr = sum(heavy_priority_terms) if heavy_priority_terms else 0
     if heavy_priority_terms:
@@ -5223,6 +5259,11 @@ def solve_with_ortools(
                 chosen = d
                 break
         assignment[s.slot_id] = chosen
+    if kt_share_status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        # Report the final schedule, which may improve on the intermediate
+        # feasible solution while respecting its priority bound.
+        kt_share_count = sum(int(solver.Value(v)) for v in kt_share_vars)
+        optional_blank_count = sum(int(solver.Value(v)) for v in optional_blank_vars)
     has_forced_blanks = bool(forced_blank_slots)
     stats = {
         "status": "OPTIMAL" if status == cp_model.OPTIMAL else "FEASIBLE",
@@ -5231,6 +5272,9 @@ def solve_with_ortools(
         "lexicographic": {
             "coverage_status": _status_name(coverage_status),
             "coverage_cost": coverage_cost,
+            "kt_share_status": _status_name(kt_share_status),
+            "kt_share_count": kt_share_count,
+            "optional_blank_count": optional_blank_count,
             "heavy_status": _status_name(heavy_status),
             "heavy_cost": heavy_cost,
             "final_status": _status_name(status),
@@ -5961,6 +6005,9 @@ def write_solver_log(out_path: Path, stats: Dict) -> Optional[Path]:
                 lines.append(
                     "lexicographic: "
                     f"coverage={lex.get('coverage_status')} cost={lex.get('coverage_cost')}; "
+                    f"K/T fallback={lex.get('kt_share_status')} "
+                    f"optional blanks={lex.get('optional_blank_count')} "
+                    f"shares={lex.get('kt_share_count')}; "
                     f"heavy={lex.get('heavy_status')} cost={lex.get('heavy_cost')}; "
                     f"final={lex.get('final_status')}"
                 )

@@ -24,6 +24,53 @@ from turni_generator import (
 
 
 class SolverRegressionTests(unittest.TestCase):
+    def test_kt_fallback_keeps_doctors_separate_when_alternative_is_available(self):
+        cfg = {
+            "rules": {"K": {"pool": ["A"]}, "T": {"pool": ["A", "B"]}},
+            "global_constraints": {
+                "relief_valves": {"enable_kt_share": True, "kt_share_penalty": 5000},
+            },
+        }
+        day = DayRow(dt.date(2026, 11, 11), "Wed", 12)
+        slots = [
+            Slot(day, "2026-11-11-K", ["K"], ["A"], required=True,
+                 shift="Mattina", rule_tag="K"),
+            Slot(day, "2026-11-11-T", ["T"], ["A", "B"], required=True,
+                 shift="Mattina", rule_tag="T", emergency_doctors=["B"]),
+        ]
+
+        assignment, stats = solve_with_ortools(cfg, [day], slots)
+
+        self.assertEqual(assignment["2026-11-11-K"], "A")
+        self.assertEqual(assignment["2026-11-11-T"], "B")
+        self.assertEqual(stats["lexicographic"]["kt_share_count"], 0)
+
+    def test_kt_fallback_can_share_to_keep_another_service_covered(self):
+        cfg = {
+            "rules": {
+                "K": {"pool": ["A"]},
+                "T": {"pool": ["A", "B"]},
+                "L": {"pool_other": ["B"]},
+            },
+            "global_constraints": {"relief_valves": {"enable_kt_share": True}},
+        }
+        day = DayRow(dt.date(2026, 11, 11), "Wed", 12)
+        slots = [
+            Slot(day, "2026-11-11-K", ["K"], ["A"], required=True,
+                 shift="Mattina", rule_tag="K"),
+            Slot(day, "2026-11-11-T", ["T"], ["A", "B"], required=True,
+                 shift="Mattina", rule_tag="T"),
+            Slot(day, "2026-11-11-L", ["L"], ["B"], required=False,
+                 shift="Mattina", rule_tag="L", blank_penalty=20_000_000),
+        ]
+
+        assignment, stats = solve_with_ortools(cfg, [day], slots)
+
+        self.assertEqual(assignment["2026-11-11-K"], "A")
+        self.assertEqual(assignment["2026-11-11-T"], "A")
+        self.assertEqual(assignment["2026-11-11-L"], "B")
+        self.assertEqual(stats["lexicographic"]["optional_blank_count"], 0)
+
     def test_fixed_reperibilita_survives_final_assignment(self):
         cfg = {
             "rules": {
