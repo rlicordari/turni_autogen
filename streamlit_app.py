@@ -2986,7 +2986,7 @@ def render_admin_generate_panel(cfg_admin: dict, doctors: list[str], rules_path:
         if r.get("doctor") and r.get("date") and r.get("column")
     ]
     if fixed_assignments_list:
-        st.caption(f"Assegnazioni fisse applicate: {len(fixed_assignments_list)}")
+        st.caption(f"Assegnazioni fisse richieste: {len(fixed_assignments_list)}")
 
     _v_double_overrides_list = []
     for _iso_key, _val in sorted(((_options_state.get("v_double") or {}) if isinstance(_options_state.get("v_double"), dict) else {}).items()):
@@ -3355,6 +3355,20 @@ def render_admin_generate_panel(cfg_admin: dict, doctors: list[str], rules_path:
             _serr = _month_stats.get("solver_error") or _stats.get("solver_error") or "(nessun dettaglio)"
             st.error(f"**Errore solver:** {_serr}")
         _month_stats = (_stats.get("months") or {}).get(mk, {}) or {}
+        _fixed_checks = _month_stats.get("fixed_assignments_checked") or []
+        if _fixed_checks:
+            _failed_fixed = [check for check in _fixed_checks if not check.get("ok")]
+            if _failed_fixed:
+                st.error(
+                    "Assegnazioni fisse non rispettate: "
+                    + "; ".join(
+                        f"{check.get('date')}-{check.get('column')} "
+                        f"{check.get('doctor')} (risultato: {', '.join(check.get('actual') or []) or 'vuoto'})"
+                        for check in _failed_fixed
+                    )
+                )
+            else:
+                st.success(f"Assegnazioni fisse verificate: {len(_fixed_checks)}/{len(_fixed_checks)}")
         _uncovered = _month_stats.get("forced_blank_slots") or []
         if _uncovered:
             st.error(
@@ -3362,7 +3376,7 @@ def render_admin_generate_panel(cfg_admin: dict, doctors: list[str], rules_path:
                 + ", ".join(str(slot) for slot in _uncovered)
             )
         for _warning in _month_stats.get("warnings") or []:
-            if str(_warning).startswith("AB sabato:"):
+            if str(_warning).startswith(("AB sabato:", "Fixed assignment ignorata:")):
                 st.warning(str(_warning))
 
         # If the month fell back to GREEDY, shout it loudly (otherwise users

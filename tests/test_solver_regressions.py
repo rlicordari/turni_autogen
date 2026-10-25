@@ -24,6 +24,63 @@ from turni_generator import (
 
 
 class SolverRegressionTests(unittest.TestCase):
+    def test_fixed_reperibilita_survives_final_assignment(self):
+        cfg = {
+            "rules": {
+                "C_reperibilita": {
+                    "one_per_day": True,
+                    "target_per_doctor": 0,
+                    "min_per_doctor": 0,
+                    "max_per_doctor": 3,
+                    "spacing_min_days": 0,
+                    "constraints": [],
+                },
+                "U": {"pool": ["Allegra", "Cimino"]},
+            },
+            "global_constraints": {},
+        }
+        day = DayRow(dt.date(2026, 11, 3), "Tue", 2)
+        slot = Slot(day, "2026-11-03-C", ["C"], ["Allegra", "Cimino"],
+                    required=True, shift="Any", rule_tag="C_reperibilita")
+
+        assignment, _stats = solve_with_ortools(
+            cfg, [day], [slot],
+            fixed_assignments=[{"doctor": "Cimino", "date": "2026-11-03", "column": "C"}],
+        )
+
+        self.assertEqual(assignment["2026-11-03-C"], "Cimino")
+
+    def test_fixed_assignment_reports_a_day_without_that_service(self):
+        cfg = {"rules": {"J": {"pool_other": ["Allegra"]}}, "global_constraints": {}}
+        day = DayRow(dt.date(2026, 11, 5), "Thu", 2)
+
+        with self.assertRaisesRegex(ValueError, "turno J non presente"):
+            solve_with_ortools(
+                cfg, [day], [],
+                fixed_assignments=[{"doctor": "Allegra", "date": "2026-11-05", "column": "J"}],
+            )
+
+    def test_fixed_v_on_double_day_targets_one_slot(self):
+        cfg = {
+            "rules": {"V": {"pool": ["Crea", "Dattilo", "Allegra"]}},
+            "global_constraints": {},
+        }
+        day = DayRow(dt.date(2026, 11, 6), "Fri", 2)
+        slots = [
+            Slot(day, "2026-11-06-V1", ["V"], ["Crea"], required=True,
+                 shift="Mattina", rule_tag="V"),
+            Slot(day, "2026-11-06-V2", ["V"], ["Dattilo", "Allegra"],
+                 required=True, shift="Mattina", rule_tag="V"),
+        ]
+
+        assignment, _stats = solve_with_ortools(
+            cfg, [day], slots,
+            fixed_assignments=[{"doctor": "Crea", "date": "2026-11-06", "column": "V"}],
+        )
+
+        self.assertEqual(assignment["2026-11-06-V1"], "Crea")
+        self.assertIn(assignment["2026-11-06-V2"], {"Dattilo", "Allegra"})
+
     def test_old_y_recupero_flags_do_not_force_recupero_on_monday_t(self):
         cfg = {
             "rules": {

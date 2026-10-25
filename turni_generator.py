@@ -386,7 +386,8 @@ class Slot:
 # -------------------------
 
 def assign_reperibilita_C(cfg: dict, days: List[DayRow], slots: List[Slot],
-                         assignment: Dict[str, Optional[str]]) -> Tuple[Dict[str, Optional[str]], Dict]:
+                         assignment: Dict[str, Optional[str]],
+                         fixed_assignments: Optional[List[dict]] = None) -> Tuple[Dict[str, Optional[str]], Dict]:
     """Assign/Reassign Reperibilità (column C) as a final layer (STRICT).
 
     HARD rules (no automatic relaxation):
@@ -454,6 +455,23 @@ def assign_reperibilita_C(cfg: dict, days: List[DayRow], slots: List[Slot],
             cslot_by_date[d.date] = cslot
             c_dates.append(d.date)
 
+    fixed_c_by_date: Dict[dt.date, str] = {}
+    for fa in fixed_assignments or []:
+        if str(fa.get("column", "")).strip().upper() != "C":
+            continue
+        try:
+            fixed_date = dt.date.fromisoformat(str(fa.get("date", "")).strip())
+        except ValueError as exc:
+            raise ValueError(f"Assegnazione fissa C: data non valida {fa.get('date')!r}.") from exc
+        fixed_doc = norm_name(str(fa.get("doctor", "")).strip())
+        if not fixed_doc:
+            raise ValueError(f"Assegnazione fissa C del {fixed_date}: medico mancante.")
+        if fixed_date not in cslot_by_date:
+            raise ValueError(f"Assegnazione fissa C del {fixed_date}: turno C non presente nel periodo.")
+        if fixed_date in fixed_c_by_date and fixed_c_by_date[fixed_date] != fixed_doc:
+            raise ValueError(f"Assegnazione fissa C del {fixed_date}: due medici diversi richiesti.")
+        fixed_c_by_date[fixed_date] = fixed_doc
+
     if not c_dates:
         return assignment, {"C_reperibilita_diag": {"status": "SKIPPED", "reason": "No C slots in template"}}
 
@@ -490,6 +508,22 @@ def assign_reperibilita_C(cfg: dict, days: List[DayRow], slots: List[Slot],
     pool = sorted(pool_set, key=lambda s: s.lower())
     if not pool:
         raise ValueError("C_reperibilita: pool vuoto (tutti esclusi o non presenti nei pools YAML).")
+    for fixed_date, fixed_doc in fixed_c_by_date.items():
+        if fixed_doc in excluded or fixed_doc not in allowed_norm_by_date[fixed_date]:
+            raise ValueError(
+                f"Assegnazione fissa C del {fixed_date}: {fixed_doc} non ammesso in reperibilità."
+            )
+        if assignment.get(f"{fixed_date}-{night_col}") == fixed_doc:
+            raise ValueError(
+                f"Assegnazione fissa C del {fixed_date}: {fixed_doc} fa già la notte J."
+            )
+        drow = dayrow_by_date.get(fixed_date)
+        if (drow is not None and is_festivo(drow, cfg)
+                and "not_working_same_day_on_sundays_and_holidays" in constraints
+                and doctor_works_same_day(fixed_date, fixed_doc)):
+            raise ValueError(
+                f"Assegnazione fissa C del {fixed_date}: {fixed_doc} ha già un altro turno festivo."
+            )
 
     # Candidate filter applying hard constraints
     def ok_candidate(date_: dt.date, doc: str) -> bool:
@@ -526,6 +560,8 @@ def assign_reperibilita_C(cfg: dict, days: List[DayRow], slots: List[Slot],
         for d in c_dates:
             cands = []
             for doc in pool:
+                if d in fixed_c_by_date and doc != fixed_c_by_date[d]:
+                    continue
                 if doc not in set(allowed_norm_by_date.get(d, [])):
                     continue
                 # not_night_same_day sempre attivo
@@ -566,7 +602,8 @@ def assign_reperibilita_C(cfg: dict, days: List[DayRow], slots: List[Slot],
         if _night_prox == 0:
             # Ultimo resort: ignora del tutto la disponibilità per i giorni problematici
             for d in _empty_days:
-                fallback = list(allowed_norm_by_date.get(d, [])) or pool[:]
+                fallback = ([fixed_c_by_date[d]] if d in fixed_c_by_date
+                            else (list(allowed_norm_by_date.get(d, [])) or pool[:]))
                 candidates_by_date[d] = fallback
                 _c_relaxation_warnings.append(
                     f"C reperibilità: {d} senza candidati strict → usato pool completo ({len(fallback)} dottori)."
@@ -2491,6 +2528,7 @@ def solve_with_ortools(
 
     # Fixed assignments are admin overrides, but they must be part of the slot
     # domain before variables and slot cardinality constraints are created.
+    resolved_fixed_assignments: List[Tuple[dt.date, str, str, List[Slot]]] = []
     for fa in (fixed_assignments or []):
         try:
             fa_date = dt.date.fromisoformat(str(fa.get("date","")).strip())
@@ -2509,13 +2547,38 @@ def solve_with_ortools(
                 f"Fixed assignment ignorata: {fa_doc} su {fa_date}/{fa_col} ({reason})."
             )
             continue
-        for s in slots:
-            if s.day.date == fa_date and fa_col in [str(c).strip().upper() for c in (s.columns or [])]:
-                if fa_doc not in s.allowed:
-                    s.allowed.append(fa_doc)
-                    existing = s.emergency_doctors or []
-                    if fa_doc not in existing:
-                        s.emergency_doctors = existing + [fa_doc]
+        target_slots = [
+            s for s in slots
+            if s.day.date == fa_date
+            and fa_col in [str(c).strip().upper() for c in (s.columns or [])]
+        ]
+        if not target_slots:
+            raise ValueError(
+                f"Assegnazione fissa {fa_doc} del {fa_date}: turno {fa_col} non presente in quel giorno."
+            )
+        if len(target_slots) > 1 and fa_col == "V":
+            required_v_doc = norm_name(((cfg.get("rules") or {}).get("V") or {}).get("friday_required_doctor") or "Crea")
+            if fa_doc == required_v_doc:
+                v_slot_suffix = "-V1"
+            elif fa_doc in {norm_name("Dattilo"), norm_name("Allegra")}:
+                v_slot_suffix = "-V2"
+            else:
+                raise ValueError(
+                    f"Assegnazione fissa V del {fa_date}: nel turno doppio sono ammessi "
+                    f"{required_v_doc}, Dattilo o Allegra; richiesto {fa_doc}."
+                )
+            target_slots = [s for s in target_slots if s.slot_id.endswith(v_slot_suffix)]
+        if len(target_slots) != 1:
+            raise ValueError(
+                f"Assegnazione fissa {fa_doc} del {fa_date}: turno {fa_col} ambiguo."
+            )
+        resolved_fixed_assignments.append((fa_date, fa_doc, fa_col, target_slots))
+        for s in target_slots:
+            if fa_doc not in s.allowed:
+                s.allowed.append(fa_doc)
+                existing = s.emergency_doctors or []
+                if fa_doc not in existing:
+                    s.emergency_doctors = existing + [fa_doc]
 
     # Decision vars: x[(slot_id, doc)] in {0,1}
     x = {}
@@ -2595,20 +2658,7 @@ def solve_with_ortools(
     # ASSEGNAZIONI FISSE (hard): l'admin ha fissato un medico in una
     # colonna specifica in un giorno specifico.
     # ---------------------------------------------------------------
-    for fa in (fixed_assignments or []):
-        try:
-            fa_date = dt.date.fromisoformat(str(fa.get("date","")).strip())
-            fa_doc = norm_name(str(fa.get("doctor","")).strip())
-            fa_col = str(fa.get("column","")).strip().upper()
-        except Exception:
-            continue
-        if fa_doc not in doc_to_idx:
-            continue
-        # Trova lo slot corrispondente
-        target_slots = [s for s in slots_by_day.get(fa_date, [])
-                        if fa_col in [str(c).strip().upper() for c in (s.columns or [])]]
-        if not target_slots:
-            continue
+    for fa_date, fa_doc, fa_col, target_slots in resolved_fixed_assignments:
         for ts in target_slots:
             tv = x.get((ts.slot_id, fa_doc))
             if tv is None:
@@ -5199,7 +5249,9 @@ def solve_with_ortools(
         )
 
     # Final layer: assign/reassign Reperibilità (C) using definitive rules
-    assignment, cdiag = assign_reperibilita_C(cfg, days, slots, assignment)
+    assignment, cdiag = assign_reperibilita_C(
+        cfg, days, slots, assignment, fixed_assignments=fixed_assignments
+    )
     if isinstance(cdiag, dict):
         stats.update(cdiag)
     return assignment, stats
@@ -5911,6 +5963,16 @@ def write_solver_log(out_path: Path, stats: Dict) -> Optional[Path]:
                 lines.append(f"solver_error: {sm.get('solver_error')}")
             for warning in sm.get("warnings") or []:
                 lines.append(f"warning: {warning}")
+            fixed_checks = sm.get("fixed_assignments_checked") or []
+            if fixed_checks:
+                lines.append("Assegnazioni fisse verificate:")
+                for check in fixed_checks:
+                    actual = ", ".join(check.get("actual") or []) or "vuoto"
+                    result = "OK" if check.get("ok") else "NON APPLICATA"
+                    lines.append(
+                        f"  - {check.get('date')}-{check.get('column')}: "
+                        f"{check.get('doctor')} -> {result} (risultato: {actual})"
+                    )
             j_overrides = sm.get("j_blank_week_overrides") or {}
             if j_overrides:
                 lines.append("Eccezioni J applicate dalla GUI:")
@@ -6135,6 +6197,28 @@ def solve_across_months(
                 "note": "Greedy disabilitato: turni non coperti rimarranno vuoti (celle gialle).",
             }
             assignment_m = {}
+
+        fixed_checks = []
+        for fixed in fixed_m:
+            fixed_date = str(fixed.get("date", "")).strip()
+            fixed_col = str(fixed.get("column", "")).strip().upper()
+            fixed_doc = norm_name(str(fixed.get("doctor", "")).strip())
+            actual_docs = sorted({
+                assigned_doc
+                for slot in slots_m
+                if slot.day.date.isoformat() == fixed_date and fixed_col in slot.columns
+                for assigned_doc in [assignment_m.get(slot.slot_id)]
+                if assigned_doc
+            })
+            fixed_checks.append({
+                "date": fixed_date,
+                "column": fixed_col,
+                "doctor": fixed_doc,
+                "actual": actual_docs,
+                "ok": fixed_doc in actual_docs,
+            })
+        if fixed_checks:
+            stats_m["fixed_assignments_checked"] = fixed_checks
 
 
         # Track where relief valves / blanks were used (useful for logs)
