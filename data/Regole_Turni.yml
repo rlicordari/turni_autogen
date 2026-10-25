@@ -329,12 +329,10 @@ rules:
     balance_weight: 100
   Y:
     day: Mon
-    recupero_two_mondays_per_month: true
     other_pool:
     - Licordari
     - Colarusso
     - D'Angelo
-    recupero_affianca_in_T: true
   Z:
     days:
     - Wed

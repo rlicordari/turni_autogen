@@ -4,6 +4,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import openpyxl
+
 import generation_memory as gm
 from pool_config_store import audit_pool_config, normalize_pool_config
 from turni_generator import (
@@ -17,10 +19,92 @@ from turni_generator import (
     solve_across_months,
     slots_for_month,
     solve_with_ortools,
+    write_output,
 )
 
 
 class SolverRegressionTests(unittest.TestCase):
+    def test_old_y_recupero_flags_do_not_force_recupero_on_monday_t(self):
+        cfg = {
+            "rules": {
+                "Y": {
+                    "other_pool": ["Licordari"],
+                    "recupero_two_mondays_per_month": True,
+                    "recupero_affianca_in_T": True,
+                },
+                "T": {"pool": ["Recupero", "Altro"]},
+            },
+            "global_constraints": {},
+        }
+        day = DayRow(dt.date(2026, 11, 2), "Mon", 2)
+        slots = [
+            Slot(day, "2026-11-02-Y", ["Y"], ["Licordari"], required=True, shift="Mattina", rule_tag="Y_MAIN"),
+            Slot(day, "2026-11-02-T", ["T"], ["Recupero", "Altro"], required=True, shift="Mattina", rule_tag="T"),
+        ]
+
+        _assignment, stats = solve_with_ortools(cfg, [day], slots)
+
+        self.assertNotIn("MonT_recupero", stats)
+        self.assertNotIn("T=Recupero su lunedì", "\n".join(stats.get("warnings", [])))
+
+    def test_old_y_recupero_flags_do_not_add_recupero_to_excel(self):
+        cfg = {
+            "rules": {
+                "Y": {
+                    "other_pool": ["Licordari"],
+                    "recupero_two_mondays_per_month": True,
+                    "recupero_affianca_in_T": True,
+                },
+                "T": {"pool": ["Recupero"]},
+            },
+            "global_constraints": {},
+        }
+        day = DayRow(dt.date(2026, 11, 2), "Mon", 2)
+        slots = [
+            Slot(day, "2026-11-02-Y", ["Y"], ["Licordari"], required=True, shift="Mattina", rule_tag="Y_MAIN"),
+            Slot(day, "2026-11-02-T", ["T"], ["Recupero"], required=True, shift="Mattina", rule_tag="T"),
+        ]
+        workbook = openpyxl.Workbook()
+        worksheet = workbook.active
+        worksheet["A2"] = day.date
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            write_output(
+                workbook, worksheet, [day], slots,
+                {"2026-11-02-Y": "Licordari", "2026-11-02-T": "Recupero"},
+                out_path=Path(temp_dir) / "turni.xlsx", cfg=cfg,
+            )
+
+        self.assertEqual(worksheet["Y2"].value, "Licordari")
+
+    def test_ab_saturday_quota_relaxes_when_doctor_has_only_one_available_saturday(self):
+        cfg = {
+            "rules": {
+                "AB": {
+                    "fallback_pool": ["Crea"],
+                    "saturday_only_doctor": "Crea",
+                    "saturday_per_month": 2,
+                    "saturday_soft": False,
+                },
+            },
+            "global_constraints": {},
+        }
+        days = [
+            DayRow(dt.date(2026, 11, day), dt.date(2026, 11, day).strftime("%a"), day + 1)
+            for day in range(1, 31)
+        ]
+        slots = [
+            Slot(day, f"{day.date}-AB_SAT", ["AB"], ["Crea"] if day.date.day == 14 else [],
+                 required=False, shift="Mattina", rule_tag="AB_SAT")
+            for day in days if day.dow == "Sat"
+        ]
+
+        assignment, stats = solve_with_ortools(cfg, days, slots)
+
+        self.assertEqual(assignment["2026-11-14-AB_SAT"], "Crea")
+        self.assertNotEqual(stats["status"], "INFEASIBLE")
+        self.assertIn("AB", "\n".join(stats.get("warnings", [])))
+
     def test_fixed_assignment_outside_domain_is_output(self):
         cfg = {
             "rules": {"D_F": {"allowed": ["A", "B"]}},

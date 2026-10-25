@@ -1781,9 +1781,7 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                 slots.append(Slot(day, f"{day.date}-W", ["W"], pool, required=required,
                                   blank_penalty=blank_pen, shift="Mattina", rule_tag="W"))
         # ---- Y Amb specialistici (Mon only)
-        # Requirement:
-        #  - Every Monday: 1 doctor among other_pool
-        #  - PLUS: on exactly 2 Mondays: also 'Recupero' (appended in the same cell)
+        # Every Monday: one doctor from other_pool.
         if "Y" in rules and not festivo:
             r = rules["Y"]
             if dayspec_contains(day.dow, r.get("days") or r.get("day")):
@@ -2333,11 +2331,6 @@ def solve_with_ortools(
     # Warnings raccolti durante la costruzione del modello (non bloccanti)
     pre_solve_warnings: List[str] = []
 
-    # Diagnostics for the "Recupero su T in 2 lunedì" rule.
-    # NOTE: this MUST be defined in the OR-Tools path too; otherwise the code may
-    # crash after solving and trigger the greedy fallback.
-    MonT_need_rec = 0
-    MonT_target_dates: List[dt.date] = []
     doctors = collect_doctors(cfg)
     doctors = [d for d in doctors if d != "Recupero"] + (["Recupero"] if "Recupero" in doctors else [])
     doc_to_idx = {d:i for i,d in enumerate(doctors)}
@@ -4300,43 +4293,6 @@ def solve_with_ortools(
     # ------------------------------------------------------------
     # Vincoli richiesti aggiuntivi (Roberto)
     # ------------------------------------------------------------
-    # Y (Ambulatori) – due lunedì/mese: Recupero deve risultare come affiancamento,
-    # ma SENZA creare uno slot extra (per evitare di "consumare" un medico in più).
-    # Implementazione: imponiamo che in esattamente 2 lunedì/mese T=Recupero;
-    # in output, quando T=Recupero di lunedì, aggiungiamo "Recupero" in Y come seconda riga.
-    if "rules" in cfg and "Y" in cfg["rules"] and "T" in cfg["rules"]:
-        rY = cfg["rules"]["Y"] or {}
-        if (
-            rY.get("recupero_two_mondays_per_month", False)
-            and rY.get("recupero_affianca_in_T", False)
-            and "Recupero" in doctors
-        ):
-            # Fixed choice: first 2 Mondays of the month
-            monday_days = [d for d in days if d.dow == "Mon"]
-            monday_days.sort(key=lambda d: d.date)
-            target_mondays = monday_days[:2]
-            other_mondays = monday_days[2:]
-
-            # Save for diagnostics/logging
-            MonT_need_rec = len(target_mondays)
-            MonT_target_dates = [d.date for d in target_mondays]
-
-            # Soft: forte preferenza T=Recupero sui primi 2 lunedì (no hard per evitare infeasibility)
-            _REC_T_MON_PENALTY = 6_000_000
-            for d in target_mondays:
-                sT = next((s for s in slots_by_day[d.date] if s.columns == ["T"]), None)
-                if sT and (sT.slot_id, "Recupero") in x:
-                    _v_rec_t = x[(sT.slot_id, "Recupero")]
-                    _b_rec_t = model.NewBoolVar(f"rec_t_miss_{d.date.isoformat()}")
-                    model.Add(_b_rec_t + _v_rec_t >= 1)  # almeno uno dei due è 1
-                    extra_obj.append(_REC_T_MON_PENALTY * _b_rec_t)
-
-            # Soft: scoraggia T=Recupero sugli altri lunedì
-            for d in other_mondays:
-                sT = next((s for s in slots_by_day[d.date] if s.columns == ["T"]), None)
-                if sT and (sT.slot_id, "Recupero") in x:
-                    extra_obj.append((_REC_T_MON_PENALTY // 2) * x[(sT.slot_id, "Recupero")])
-
     # U (Contr.PM) – Cimino esattamente N volte/mese (default: 2)
     if "rules" in cfg and "U" in cfg["rules"] and "Cimino" in doctors:
         rU = cfg["rules"]["U"] or {}
@@ -4585,7 +4541,7 @@ def solve_with_ortools(
                     model.Add(ab_max_per_doc >= cnt_doc)
             extra_obj.append(50 * ab_max_per_doc)  # minimizza il massimo → bilanciamento
 
-        # Sabati: HARD con Crea (2 sabati/mese)
+        # Sabati: quota hard con il medico dedicato finché ci sono abbastanza date eleggibili.
         sat_doc = norm_name(rAB.get("saturday_only_doctor") or "Crea")
         sat_n = _monthly_target_for_period(int(rAB.get("saturday_per_month", 0) or 0), sat_doc, "AB")
         sat_cap = _monthly_cap_for_period(int(rAB.get("saturday_per_month", 0) or 0), sat_doc, "AB")
@@ -4594,15 +4550,22 @@ def solve_with_ortools(
             for s in slots:
                 if s.rule_tag == "AB_SAT" and (s.slot_id, sat_doc) in x:
                     vars_.append(x[(s.slot_id, sat_doc)])
+            sat_soft = bool(rAB.get("saturday_soft", False))
+            if len(vars_) < sat_n and not sat_soft:
+                pre_solve_warnings.append(
+                    f"AB sabato: quota {sat_n} per {sat_doc} impossibile con le indisponibilità "
+                    f"(giorni disponibili: {len(vars_)}); quota ridotta a {len(vars_)}."
+                )
+                sat_n = len(vars_)
             if vars_:
-                if bool(rAB.get("saturday_soft", False)):
+                if sat_soft:
                     # soft (fallback per evitare infeasible)
                     model.Add(sum(vars_) <= sat_cap)
                     short = model.NewIntVar(0, sat_n, "AB_sat_short")
                     model.Add(sum(vars_) + short == sat_n)
                     extra_obj.append(int(rAB.get("saturday_shortfall_penalty", 10000)) * short)
                 else:
-                    # HARD: i 2 sabati devono essere SOLO con Crea
+                    # HARD: la quota di sabati eleggibili resta riservata al medico dedicato.
                     model.Add(sum(vars_) == sat_n)
 
     # Weekend full off: at least N Sat+Sun "full weekends off" per doctor.
@@ -5235,22 +5198,6 @@ def solve_with_ortools(
             + ", ".join(sorted(forced_blank_slots))
         )
 
-    # Diagnostics for the "2 lunedì" rule (do not affect feasibility).
-    MonT_used_rec = 0
-    if MonT_need_rec and MonT_target_dates:
-        for d in MonT_target_dates:
-            if assignment.get(f"{d}-T") == "Recupero":
-                MonT_used_rec += 1
-        stats["MonT_recupero"] = {
-            "need": int(MonT_need_rec),
-            "used": int(MonT_used_rec),
-            "dates": [dd.isoformat() for dd in MonT_target_dates],
-        }
-        if MonT_used_rec != MonT_need_rec:
-            stats.setdefault("warnings", []).append(
-                f"T=Recupero su lunedì: attesi {MonT_need_rec}, ottenuti {MonT_used_rec}"
-            )
-
     # Final layer: assign/reassign Reperibilità (C) using definitive rules
     assignment, cdiag = assign_reperibilita_C(cfg, days, slots, assignment)
     if isinstance(cdiag, dict):
@@ -5264,7 +5211,7 @@ def solve_greedy(cfg: dict, days: List[DayRow], slots: List[Slot]) -> Tuple[Dict
     Greedy with rule-aware priorities (fallback when OR-Tools is missing or after autorelax still infeasible).
     Goals:
     - always cover required slots when possible
-    - enforce key HARD quotas (e.g., Recupero on L <= 3, Recupero on Y = 2 Mondays) and fixed-day rules
+    - enforce key HARD quotas (e.g., Recupero on L <= 3) and fixed-day rules
     - avoid obviously bad imbalances (especially nights)
     """
     # Rank shifts: Night first helps satisfy spacing/off constraints early
@@ -5301,28 +5248,8 @@ def solve_greedy(cfg: dict, days: List[DayRow], slots: List[Slot]) -> Tuple[Dict
         L_cap_rec = rules["L"].get("quota_recupero_per_month")
         L_cap_rec = int(L_cap_rec) if L_cap_rec is not None else None
     L_rec_used = 0
-    # Y: Monday specialist clinics
-    # - Y_MAIN: always 1 doctor among the main pool (rotation)
-    # - Y_REC: optional second line (Recupero) on exactly 2 Mondays/month
-    Y_need_rec = 0
-    if isinstance(rules.get("Y"), dict) and rules["Y"].get("recupero_two_mondays_per_month", False):
-        Y_need_rec = 2
-    Y_rec_used = 0
-    Y_rec_slots_total = sum(1 for s in slots if getattr(s, "rule_tag", "") == "Y_REC")
-    Y_rec_slots_done = 0
+    # Y: Monday specialist clinics, one doctor from the main pool.
     Y_pool_counts = Counter()
-    # Y affiancamento Recupero su T: i primi 2 lunedì del mese (fallback greedy)
-    MonT_need_rec = 0
-    MonT_target_dates: Set[dt.date] = set()
-    if (
-        isinstance(rules.get("Y"), dict)
-        and rules["Y"].get("recupero_two_mondays_per_month", False)
-        and rules["Y"].get("recupero_affianca_in_T", False)
-    ):
-        MonT_need_rec = 2
-        monday_dates = sorted([d.date for d in days if d.dow == "Mon"])
-        MonT_target_dates = set(monday_dates[:2])
-    MonT_used_rec = 0
 
     # Night equalization target (if divisible)
     night_pool = set()
@@ -5341,9 +5268,6 @@ def solve_greedy(cfg: dict, days: List[DayRow], slots: List[Slot]) -> Tuple[Dict
             return False
         # L cap for Recupero
         if s.columns == ["L"] and doc == "Recupero" and L_cap_rec is not None and L_rec_used >= L_cap_rec:
-            return False
-        # Y_REC quota for Recupero (avoid exceeding)
-        if (getattr(s, "rule_tag", "") == "Y_REC") and doc == "Recupero" and Y_need_rec and Y_rec_used >= Y_need_rec:
             return False
         # Night spacing
         if s.columns == ["J"]:
@@ -5380,8 +5304,6 @@ def solve_greedy(cfg: dict, days: List[DayRow], slots: List[Slot]) -> Tuple[Dict
             # keep closer to target if known
             tgt_pen = abs(night_cnt - (night_target or 0)) if night_target is not None else night_cnt
             return (tgt_pen, night_cnt, load_total[doc], doc.lower())
-        if (s.rule_tag or "") == "Y_REC":
-            return (0, load_total[doc], doc.lower())
         if (s.rule_tag or "") == "Y_MAIN":
             return (Y_pool_counts[doc], load_total[doc], doc.lower())
         # default: balance by tag then total
@@ -5390,37 +5312,10 @@ def solve_greedy(cfg: dict, days: List[DayRow], slots: List[Slot]) -> Tuple[Dict
         candidates = [d for d in s.allowed if can_assign(s, d)]
         if not candidates:
             return None
-        # Forza/nega Recupero su T (lunedi) in base ai 2 lunedi target (fallback greedy)
-        nonlocal MonT_used_rec
-        if s.columns == ["T"] and getattr(s.day, "dow", "") == "Mon" and MonT_need_rec:
-            if s.day.date in MonT_target_dates:
-                if "Recupero" in candidates:
-                    return "Recupero"
-            else:
-                # fuori dai 2 lunedi target: evita Recupero se ci sono alternative
-                if "Recupero" in candidates and len(candidates) > 1:
-                    candidates = [d for d in candidates if d != "Recupero"]
-
-        # Force Recupero on Y_REC when needed and we're running out of Monday slots
-        nonlocal Y_rec_slots_done, Y_rec_used
-        if (getattr(s, "rule_tag", "") == "Y_REC") and Y_need_rec:
-            remaining_after_this = (Y_rec_slots_total - (Y_rec_slots_done + 1))
-            remaining_need = (Y_need_rec - Y_rec_used)
-            if remaining_need <= 0:
-                return None  # leave blank
-            if remaining_need > remaining_after_this:
-                # must use Recupero now (if possible)
-                if "Recupero" in candidates:
-                    return "Recupero"
-                return None
-            # otherwise, leave blank to keep flexibility
-            return None
         candidates.sort(key=lambda d: score_candidate(s, d))
         return candidates[0]
     conflicts = []
     for s in slots_sorted:
-        if (s.rule_tag or "") == "Y_REC":
-            Y_rec_slots_done += 1
         chosen = pick(s)
         if chosen is None:
             if s.required:
@@ -5437,11 +5332,6 @@ def solve_greedy(cfg: dict, days: List[DayRow], slots: List[Slot]) -> Tuple[Dict
                 we_nights_by_doc[chosen] += 1
         if s.columns == ["L"] and chosen == "Recupero":
             L_rec_used += 1
-        if s.columns == ["T"] and getattr(s.day, "dow", "") == "Mon" and chosen == "Recupero":
-            MonT_used_rec += 1
-        if (s.rule_tag or "") == "Y_REC":
-            if chosen == "Recupero":
-                Y_rec_used += 1
         if (s.rule_tag or "") == "Y_MAIN":
             Y_pool_counts[chosen] += 1
     # Final layer: assign/reassign Reperibilità (C) using definitive rules
@@ -5453,8 +5343,6 @@ def solve_greedy(cfg: dict, days: List[DayRow], slots: List[Slot]) -> Tuple[Dict
         "loads": dict(load_total),
         "nights_per_doc": {k: len(v) for k, v in nights_by_doc.items()},
         "L_recupero_used": L_rec_used,
-        "Y_recupero_used": Y_rec_used,
-        "T_recupero_mondays_used": MonT_used_rec,
     }
     if isinstance(cdiag, dict):
         stats.update(cdiag)
@@ -5488,7 +5376,7 @@ def write_output(
     for drow in days:
         for col in managed_cols:
             ws[f"{col}{drow.row_idx}"].value = None
-    # Fill (support multiple assignments on the same cell, e.g. Y_MAIN + Y_REC)
+    # Fill cells, including services that have multiple slots on the same day.
     slot_by_id = {s.slot_id: s for s in slots}
     assigned_by_day: Dict[dt.date, Set[str]] = defaultdict(set)
     cell_values: Dict[Tuple[int, str], List[str]] = defaultdict(list)
@@ -5501,25 +5389,13 @@ def write_output(
             cell_values[(s.day.row_idx, col)].append(doc)
         assigned_by_day[s.day.date].add(doc)
     
-    # Post-process: affiancamento Recupero in Y sui 2 lunedì fissi (i primi 2 del mese) – vedi vincolo su T.
-    if cfg and isinstance(cfg.get("rules", {}), dict) and "Y" not in disabled_cols:
-        rY = (cfg.get("rules") or {}).get("Y") or {}
-        if rY.get("recupero_two_mondays_per_month", False) and rY.get("recupero_affianca_in_T", False):
-            monday_dates = [drow.date for drow in days if getattr(drow, "dow", "") == "Mon"]
-            monday_dates = sorted(monday_dates)[:2]
-            target = set(monday_dates)
-            for drow in days:
-                if drow.date in target and assignment.get(f"{drow.date}-T") == "Recupero":
-                    cell_values[(drow.row_idx, "Y")].append("Recupero")
-
     for (row_idx, col), docs in cell_values.items():
         # de-duplicate while preserving order
         seen = set()
         uniq = [d for d in docs if not (d in seen or seen.add(d))]
-        # Y può legittimamente avere Recupero+medico (affiancamento): usa \n
         # V il venerdì ha legittimamente 2 medici (Crea + Dattilo/Allegra): usa \n
         # Tutte le altre colonne: deve esserci un solo medico; se ce ne sono due è un bug → primo
-        if col in ("Y", "V"):
+        if col == "V":
             ws[f"{col}{row_idx}"].value = "\n".join(uniq)
         else:
             ws[f"{col}{row_idx}"].value = uniq[0] if uniq else None
@@ -6033,6 +5909,8 @@ def write_solver_log(out_path: Path, stats: Dict) -> Optional[Path]:
                 lines.append(f"autorelax: {sm.get('autorelax')}")
             if sm.get("solver_error"):
                 lines.append(f"solver_error: {sm.get('solver_error')}")
+            for warning in sm.get("warnings") or []:
+                lines.append(f"warning: {warning}")
             j_overrides = sm.get("j_blank_week_overrides") or {}
             if j_overrides:
                 lines.append("Eccezioni J applicate dalla GUI:")

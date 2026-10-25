@@ -3332,9 +3332,11 @@ def render_admin_generate_panel(cfg_admin: dict, doctors: list[str], rules_path:
     last = st.session_state.get("last_generated")
     if isinstance(last, dict) and last.get("mk") == mk and last.get("excel_bytes"):
         _stats = last.get("stats") if isinstance(last.get("stats"), dict) else {}
-        st.success(
-            f"Creato ✅ in {last.get('elapsed_s')}s | status={_stats.get('status')} | {last.get('generated_at','')}"
-        )
+        _summary = f"Generazione in {last.get('elapsed_s')}s | status={_stats.get('status')} | {last.get('generated_at','')}"
+        if str(_stats.get("status", "")).upper() in {"PARTIAL", "INFEASIBLE"}:
+            st.error(_summary)
+        else:
+            st.success(_summary)
         _gm_last = last.get("generation_memory") if isinstance(last.get("generation_memory"), dict) else {}
         if _gm_last:
             _gm_parts = []
@@ -3352,6 +3354,16 @@ def render_admin_generate_panel(cfg_admin: dict, doctors: list[str], rules_path:
             _month_stats = (_stats.get("months") or {}).get(mk, {}) or {}
             _serr = _month_stats.get("solver_error") or _stats.get("solver_error") or "(nessun dettaglio)"
             st.error(f"**Errore solver:** {_serr}")
+        _month_stats = (_stats.get("months") or {}).get(mk, {}) or {}
+        _uncovered = _month_stats.get("forced_blank_slots") or []
+        if _uncovered:
+            st.error(
+                f"{len(_uncovered)} turni obbligatori scoperti: "
+                + ", ".join(str(slot) for slot in _uncovered)
+            )
+        for _warning in _month_stats.get("warnings") or []:
+            if str(_warning).startswith("AB sabato:"):
+                st.warning(str(_warning))
 
         # If the month fell back to GREEDY, shout it loudly (otherwise users
         # may think all HARD constraints were respected).
