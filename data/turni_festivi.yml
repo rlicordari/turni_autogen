@@ -199,7 +199,7 @@ entries:
     note: "Immacolata"
 
   - date: "2026-12-24"
-    doctor: "Cusmà"
+    doctor: "Trio"
     shift: "Notte"
     note: "Vigilia di Natale (giovedì normale)"
 
@@ -209,7 +209,7 @@ entries:
     note: "Natale"
 
   - date: "2026-12-25"
-    doctor: "Colarusso"
+    doctor: "Cimino"
     shift: "Pomeriggio"
     note: "Natale"
 
@@ -234,12 +234,12 @@ entries:
     note: "Santo Stefano"
 
   - date: "2026-12-31"
-    doctor: "Cimino"
+    doctor: "Colarusso"
     shift: "Pomeriggio"
     note: "S. Silvestro (festivo)"
 
   - date: "2026-12-31"
-    doctor: "Trio"
+    doctor: "Cusmà"
     shift: "Notte"
     note: "S. Silvestro (festivo)"
 
