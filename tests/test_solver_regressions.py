@@ -345,6 +345,24 @@ class SolverRegressionTests(unittest.TestCase):
 
         self.assertEqual(normalized["doctors"]["A"]["columns"], ["K"])
 
+    def test_pool_config_saved_with_settings_for_hidden_columns_can_be_saved_again(self):
+        # pool_config.json salvato a giugno 2026: column_settings anche per AA/AC/AD-AG
+        # (colonne automatiche/libere, non mostrate in GUI) bloccava OGNI salvataggio.
+        from pathlib import Path
+        import turni_generator as tg
+        from pool_config_store import migrate_from_yaml, validate_pool_config
+        cfg_yaml = tg.load_rules(Path("Regole_Turni.yml"))
+        cfg = migrate_from_yaml(cfg_yaml)
+        default = {"monthly_target": None, "spacing_min_days": 0, "spacing_preferred_days": 0, "counts_as": 1}
+        for col in ("AA", "AC", "AD", "AE", "AF", "AG"):
+            cfg["column_settings"][col] = dict(default)
+        some_doctor = sorted(cfg["doctors"])[0]
+        cfg["doctors"][some_doctor]["active"] = not cfg["doctors"][some_doctor].get("active", True)
+
+        self.assertEqual(validate_pool_config(cfg, cfg_yaml), [])
+        normalized = normalize_pool_config(cfg)
+        self.assertFalse({"AA", "AC", "AD", "AE", "AF", "AG"} & set(normalized["column_settings"]))
+
     def test_pool_config_empty_gui_pool_does_not_fall_back_to_yaml_pool(self):
         cfg_yaml = {
             "columns": {"D": "UTIC mattina", "F": "Supporto 118"},

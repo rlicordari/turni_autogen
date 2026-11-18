@@ -122,7 +122,9 @@ def normalize_pool_config(cfg: dict) -> dict:
         normalized_settings = {}
         for col, spec in col_settings.items():
             c = str(col).strip().upper()
-            if c:
+            # Colonne automatiche/libere: non esposte in GUI, le loro impostazioni
+            # (salvate in passato) bloccherebbero ogni salvataggio.
+            if c and c not in FREE_COLUMNS and c not in AUTO_COLUMNS:
                 normalized_settings[c] = spec
         out["column_settings"] = normalized_settings
     return out
