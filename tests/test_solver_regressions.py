@@ -227,6 +227,73 @@ class SolverRegressionTests(unittest.TestCase):
         self.assertEqual(assignment["2026-04-01-D"], "B")
         self.assertNotEqual(stats["status"], "PARTIAL")
 
+    def test_next_stage_starts_from_previous_solution(self):
+        # Dicembre 2026: la fase 3 trovava l'ottimo, la fase finale ripartiva da zero e
+        # in 60 s restava UNKNOWN → mese segnalato "INFEASIBLE" e lasciato vuoto.
+        from ortools.sat.python import cp_model
+        import turni_generator as tg
+        model = cp_model.CpModel()
+        xs = [model.new_bool_var(f"x{i}") for i in range(40)]
+        model.add(sum(xs) == 17)
+        solver = cp_model.CpSolver()
+        solver.parameters.num_search_workers = 1
+        self.assertEqual(solver.solve(model), cp_model.OPTIMAL)
+        first = [solver.value(x) for x in xs]
+
+        tg._hint_current_solution(model, solver)
+        status = tg._solve_keeping_previous(model, solver, had_solution=True, time_limit=0.0)
+
+        self.assertIn(status, (cp_model.OPTIMAL, cp_model.FEASIBLE))
+        self.assertEqual([solver.value(x) for x in xs], first)
+
+    def test_fixed_night_on_blank_thursday_creates_the_night(self):
+        # Sorteggio festivi: notte della Vigilia 2026 (giovedì, J normalmente vuota)
+        # assegnata a Trio. Prima mandava INFEASIBLE l'intero dicembre.
+        import turni_generator as tg
+        cfg = {
+            "rules": {"J": {"pool_other": ["Trio", "Cusmà"], "thursday_blank": True}},
+            "global_constraints": {},
+        }
+        thu = DayRow(dt.date(2026, 12, 24), "Thu", 25)
+        other_thu = DayRow(dt.date(2026, 12, 17), "Thu", 18)
+        fixed = [{"doctor": "Trio", "date": "2026-12-24", "column": "J"}]
+
+        slots = tg.slots_for_month(cfg, [other_thu, thu], {}, fixed_assignments=fixed)
+        j_days = sorted(str(s.day.date) for s in slots if "J" in s.columns)
+        self.assertEqual(j_days, ["2026-12-24"], "la notte assegnata esiste, gli altri giovedì restano vuoti")
+
+        assignment, stats = solve_with_ortools(cfg, [other_thu, thu], slots, fixed_assignments=fixed)
+        self.assertEqual(assignment["2026-12-24-J"], "Trio")
+        self.assertNotIn(stats.get("status"), ("INFEASIBLE", "PARTIAL"))
+
+    def test_night_draw_of_inactive_doctor_falls_back_to_the_pool(self):
+        # Sorteggio con un medico poi messo non attivo (malattia): la notte non deve
+        # restare senza candidati, la copre il pool normale.
+        import turni_generator as tg
+        cfg = {"rules": {"J": {"pool_other": ["Trio", "Cusmà"]}}, "global_constraints": {}}
+        day = DayRow(dt.date(2026, 12, 25), "Fri", 26)
+
+        slots = tg.slots_for_month(cfg, [day], {}, fixed_assignments=[{"doctor": "Cimino", "date": "2026-12-25", "column": "J"}])
+
+        j = [s for s in slots if "J" in s.columns]
+        self.assertEqual(len(j), 1)
+        self.assertEqual(sorted(j[0].allowed), ["Cusmà", "Trio"])
+
+    def test_draw_of_inactive_doctor_is_reported_as_not_applicable(self):
+        import turni_generator as tg
+        checks = tg.check_fixed_assignments(
+            [{"doctor": "Cimino", "date": "2026-12-25", "column": "H"},
+             {"doctor": "Trio", "date": "2026-12-25", "column": "J"}],
+            slots=[Slot(DayRow(dt.date(2026, 12, 25), "Fri", 26), "x-H", ["H", "I"], ["Trio"], required=True),
+                   Slot(DayRow(dt.date(2026, 12, 25), "Fri", 26), "x-J", ["J"], ["Trio"], required=True)],
+            assignment={"x-H": "Trio", "x-J": "Trio"},
+            active_doctors={"Trio"},
+        )
+        by_doc = {c["doctor"]: c for c in checks}
+        self.assertTrue(by_doc["Trio"]["ok"])
+        self.assertTrue(by_doc["Cimino"]["skipped"])
+        self.assertIn("non attivo", by_doc["Cimino"]["reason"])
+
     def test_fixed_assignment_cannot_put_never_in_j(self):
         cfg = {
             "rules": {

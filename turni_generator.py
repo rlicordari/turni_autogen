@@ -1009,6 +1009,42 @@ def apply_pool_config(cfg_yaml: dict, pool_cfg: Optional[dict]) -> dict:
     return cfg
 
 
+def _hint_current_solution(model, solver) -> None:
+    """Use the solution just found as the starting point of the next solve."""
+    model.clear_hints()
+    for i in range(len(model.proto.variables)):
+        v = model.get_int_var_from_proto_index(i)
+        model.add_hint(v, solver.value(v))
+
+
+def _solve_keeping_previous(model, solver, *, had_solution: bool, time_limit: Optional[float] = None):
+    """Solve one lexicographic stage without ever losing the previous solution.
+
+    Each stage only adds "not worse than before" constraints, so the hinted
+    previous solution is still valid. If the time limit expires before a new
+    solution is found (December 2026: stage 3 OPTIMAL, final stage UNKNOWN →
+    whole month reported INFEASIBLE), the hinted solution is returned instead.
+    """
+    from ortools.sat.python import cp_model
+    params = solver.parameters
+    old_limit = params.max_time_in_seconds
+    if time_limit is not None:
+        params.max_time_in_seconds = time_limit
+    try:
+        status = solver.solve(model)
+    finally:
+        params.max_time_in_seconds = old_limit
+    if status in (cp_model.OPTIMAL, cp_model.FEASIBLE) or not had_solution:
+        return status
+    params.fix_variables_to_their_hinted_value = True
+    params.max_time_in_seconds = max(old_limit, 10.0)
+    try:
+        return solver.solve(model)
+    finally:
+        params.fix_variables_to_their_hinted_value = False
+        params.max_time_in_seconds = old_limit
+
+
 def _strip_festivi_unavailability(
     unav_map: Dict[str, Dict[dt.date, Set[str]]],
     tf_fixed: List[dict],
@@ -1385,6 +1421,38 @@ def _never_in_j_set(cfg: dict) -> Set[str]:
     return {norm_name(d) for d in (rJ.get("never_in_J") or ["De Gregorio", "Manganaro"])}
 
 
+def check_fixed_assignments(fixed, *, slots, assignment, active_doctors, cfg=None) -> List[dict]:
+    """Compare requested fixed assignments with the result.
+
+    An assignment that cannot apply (doctor not active, never in J) is
+    "skipped" with a reason: the admin must change it, but the rest of the
+    schedule is valid. Only applicable assignments not honoured are failures.
+    """
+    out = []
+    for f in fixed or []:
+        f_date = str(f.get("date", "")).strip()
+        f_col = str(f.get("column", "")).strip().upper()
+        f_doc = norm_name(str(f.get("doctor", "")).strip())
+        actual = sorted({
+            assignment.get(s.slot_id)
+            for s in slots
+            if s.day.date.isoformat() == f_date and f_col in s.columns and assignment.get(s.slot_id)
+        })
+        reason = ""
+        if f_doc not in active_doctors:
+            reason = f"{f_doc} non attivo nel pool medici"
+        elif cfg is not None:
+            ok, why = _fixed_assignment_allowed(cfg, f_col, f_doc)
+            reason = "" if ok else why
+        out.append({
+            "date": f_date, "column": f_col, "doctor": f_doc, "actual": actual,
+            "ok": f_doc in actual,
+            "skipped": bool(reason) and f_doc not in actual,
+            "reason": reason,
+        })
+    return out
+
+
 def _fixed_assignment_allowed(cfg: dict, col: str, doctor: str) -> Tuple[bool, str]:
     """Return whether an admin fixed assignment may expand the slot domain."""
     col = str(col or "").strip().upper()
@@ -1453,8 +1521,8 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
             fa_doc = norm_name(str(fa.get("doctor","")).strip())
             if fa_col == "J":
                 ok_fixed, _reason = _fixed_assignment_allowed(cfg, fa_col, fa_doc)
-                if not ok_fixed:
-                    continue
+                if not ok_fixed or fa_doc not in doctors_set:
+                    continue   # medico non attivo: la notte la copre il pool normale
                 forced_j_by_date.setdefault(fa_date, set()).add(fa_doc)
             elif fa_col == "D" and fa_doc in doctors_set:
                 # Il medico sorteggiato potrebbe non essere nel pool Festivi (es. Grimaldi, Calabrò)
@@ -1647,6 +1715,10 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                     if _thu_week_mon == _ov_week_mon:
                         _thu_suppressed_by_override = True
                 _skip_j = (_is_normal_thu_blank and not _thu_suppressed_by_override) or _is_override_blank
+            # Una notte assegnata dall'admin o dal sorteggio festivi (es. Vigilia di
+            # Natale di giovedì) esiste sempre, anche nel giorno di J vuota.
+            if forced_j_by_date.get(day.date):
+                _skip_j = False
             if not _skip_j:
                 # Se esiste un fixed_assignment in J per questo giorno,
                 # lo slot usa SOLO quel medico — l'indisponibilità viene ignorata
@@ -4920,10 +4992,13 @@ def solve_with_ortools(
         except Exception:
             return str(st)
 
+    have_solution = False
     if coverage_obj_terms:
         model.Minimize(coverage_expr)
         coverage_status = solver.Solve(model)
         if coverage_status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            have_solution = True
+            _hint_current_solution(model, solver)
             coverage_cost = int(solver.Value(coverage_expr))
             if coverage_status == cp_model.OPTIMAL:
                 model.Add(coverage_expr == coverage_cost)
@@ -4947,13 +5022,13 @@ def solve_with_ortools(
             + kt_share_expr
         )
         model.Minimize(kt_priority_expr)
-        original_time_limit = solver.parameters.max_time_in_seconds
-        solver.parameters.max_time_in_seconds = min(original_time_limit, 20.0)
-        try:
-            kt_share_status = solver.Solve(model)
-        finally:
-            solver.parameters.max_time_in_seconds = original_time_limit
+        kt_share_status = _solve_keeping_previous(
+            model, solver, had_solution=have_solution,
+            time_limit=min(solver.parameters.max_time_in_seconds, 20.0),
+        )
         if kt_share_status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            have_solution = True
+            _hint_current_solution(model, solver)
             kt_priority_cost = int(solver.Value(kt_priority_expr))
             kt_share_count = int(solver.Value(kt_share_expr))
             optional_blank_count = int(solver.Value(optional_blank_expr)) if optional_blank_vars else 0
@@ -4965,8 +5040,10 @@ def solve_with_ortools(
     heavy_priority_expr = sum(heavy_priority_terms) if heavy_priority_terms else 0
     if heavy_priority_terms:
         model.Minimize(heavy_priority_expr)
-        heavy_status = solver.Solve(model)
+        heavy_status = _solve_keeping_previous(model, solver, had_solution=have_solution)
         if heavy_status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            have_solution = True
+            _hint_current_solution(model, solver)
             heavy_cost = int(solver.Value(heavy_priority_expr))
             if heavy_status == cp_model.OPTIMAL:
                 model.Add(heavy_priority_expr == heavy_cost)
@@ -4974,7 +5051,7 @@ def solve_with_ortools(
                 model.Add(heavy_priority_expr <= heavy_cost)
 
     model.Minimize(sum(full_objective_terms))
-    status = solver.Solve(model)
+    status = _solve_keeping_previous(model, solver, had_solution=have_solution)
     if status not in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
         # ── Diagnostica: retry senza vincoli di quota hard per identificare la causa ──
         _diag_hints: List[str] = []
@@ -6252,25 +6329,10 @@ def solve_across_months(
             }
             assignment_m = {}
 
-        fixed_checks = []
-        for fixed in fixed_m:
-            fixed_date = str(fixed.get("date", "")).strip()
-            fixed_col = str(fixed.get("column", "")).strip().upper()
-            fixed_doc = norm_name(str(fixed.get("doctor", "")).strip())
-            actual_docs = sorted({
-                assigned_doc
-                for slot in slots_m
-                if slot.day.date.isoformat() == fixed_date and fixed_col in slot.columns
-                for assigned_doc in [assignment_m.get(slot.slot_id)]
-                if assigned_doc
-            })
-            fixed_checks.append({
-                "date": fixed_date,
-                "column": fixed_col,
-                "doctor": fixed_doc,
-                "actual": actual_docs,
-                "ok": fixed_doc in actual_docs,
-            })
+        fixed_checks = check_fixed_assignments(
+            fixed_m, slots=slots_m, assignment=assignment_m,
+            active_doctors=set(collect_doctors(cfg)), cfg=cfg,
+        )
         if fixed_checks:
             stats_m["fixed_assignments_checked"] = fixed_checks
 

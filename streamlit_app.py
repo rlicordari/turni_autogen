@@ -3288,11 +3288,19 @@ def render_admin_generate_panel(cfg_admin: dict, doctors: list[str], rules_path:
                     prior_usage=_prior_usage_for_solver,
                 )
 
+                _month_errors = [
+                    f"{_mk}: {_ms.get('solver_error')}"
+                    for _mk, _ms in sorted((stats.get("months") or {}).items())
+                    if str(_ms.get("status", "")).upper() == "INFEASIBLE" and _ms.get("solver_error")
+                ]
+                if _month_errors:
+                    raise ValueError("Il solver non ha trovato una soluzione: " + " · ".join(_month_errors))
+                # Assegnazioni non applicabili (medico non attivo, mai in notte): avviso, non errore.
                 _failed_fixed = [
                     check
                     for month_stats in (stats.get("months") or {}).values()
                     for check in (month_stats.get("fixed_assignments_checked") or [])
-                    if not check.get("ok")
+                    if not check.get("ok") and not check.get("skipped")
                 ]
                 if _failed_fixed:
                     details = "; ".join(
@@ -3401,7 +3409,18 @@ def render_admin_generate_panel(cfg_admin: dict, doctors: list[str], rules_path:
         _month_stats = (_stats.get("months") or {}).get(mk, {}) or {}
         _fixed_checks = _month_stats.get("fixed_assignments_checked") or []
         if _fixed_checks:
-            _failed_fixed = [check for check in _fixed_checks if not check.get("ok")]
+            _skipped_fixed = [check for check in _fixed_checks if check.get("skipped")]
+            if _skipped_fixed:
+                st.warning(
+                    "Assegnazioni fisse/sorteggio NON applicabili (aggiorna il sorteggio nella pagina Festivi): "
+                    + "; ".join(
+                        f"{check.get('date')} {check.get('column')}: {check.get('reason')} "
+                        f"→ assegnato a {', '.join(check.get('actual') or []) or 'nessuno'}"
+                        for check in _skipped_fixed
+                    ),
+                    icon="⚠️",
+                )
+            _failed_fixed = [check for check in _fixed_checks if not check.get("ok") and not check.get("skipped")]
             if _failed_fixed:
                 st.error(
                     "Assegnazioni fisse non rispettate: "
@@ -3411,7 +3430,7 @@ def render_admin_generate_panel(cfg_admin: dict, doctors: list[str], rules_path:
                         for check in _failed_fixed
                     )
                 )
-            else:
+            elif not _skipped_fixed:
                 st.success(f"Assegnazioni fisse verificate: {len(_fixed_checks)}/{len(_fixed_checks)}")
         _uncovered = _month_stats.get("forced_blank_slots") or []
         if _uncovered:
