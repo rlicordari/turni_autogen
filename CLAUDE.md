@@ -61,6 +61,7 @@ Su macOS lanciarla con `caffeinate -i` davanti: se il Mac va in stop durante la 
 | `unavailability_store.py` | Funzioni pure per il datastore CSV: parsing, filtraggio, deduplicazione, serializzazione, firme mese e `save_doctor_months()` (salvataggio con controllo conflitti) |
 | `unavailability_drafts.py` | Bozze delle modifiche non ancora inviate (autosalvataggio), ripresa al login, riepilogo bozze pendenti per l'admin |
 | `unavailability_receipts.py` | Mail di resoconto dopo ogni salvataggio (contenuto dai dati riletti dal server, niente note) |
+| `festivi_store.py` | Turni festivi pre-assegnati (sorteggio + assegnazione manuale) della pagina **Admin → Festivi**: festività/prefestivi del periodo, estrazione bilanciata, controlli, conversione per il solver. File `data/turni_festivi.yml` nel repo **dati** (non si modifica più a mano); quello nel repo codice resta solo come copia iniziale e per la CLI |
 | `doctor_contacts.py` | Email dei medici in `doctor_contacts.yml` (codici PIN + mail di resoconto), modificate dal pannello pool → Medici |
 | `unavailability_calendar.py` + `components/unav_calendar/` | Calendario della pagina medico: logica pura degli eventi (`apply_event`, `calendar_payload`) + componente Streamlit in JS puro |
 | `generation_memory.py` | Memoria delle generazioni salvate: uso pregresso per periodi parziali, carryover notti, storico provvisorio |
@@ -135,6 +136,10 @@ password = "APP_PASSWORD"
 from     = "..."
 starttls = true
 ```
+
+### Solver a fasi: mai perdere una soluzione già trovata
+
+`solve_with_ortools()` risolve in fasi successive (copertura → condivisioni K+T → servizi pesanti → obiettivo finale), ognuna con un vincolo "non peggio di prima". Ogni fase parte dalla soluzione della precedente (`_hint_current_solution`) e, se il tempo scade senza nuova soluzione, la riusa (`_solve_keeping_previous`). Fino a novembre 2026 l'ultima fase ripartiva da zero: dicembre 2026 (molte assenze a Natale) trovava l'ottimo alla fase 3, poi l'ultima fase restava UNKNOWN dopo 60 s e l'intero mese usciva "INFEASIBLE" e vuoto. Un'assegnazione fissa/sorteggio di un medico non attivo è "non applicabile" (avviso, il pool copre il turno); una notte assegnata in un giovedì di J vuota viene creata.
 
 ### IMPORTANTE: `num_search_workers` del CP-SAT solver
 

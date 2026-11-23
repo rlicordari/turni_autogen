@@ -644,6 +644,43 @@ class DoctorUnavailabilityFlowTests(unittest.TestCase):
         self.assertEqual(self.contacts()[DOCTOR], {"email": "migliorato@example.org"})
         self.assertIn("non valido", self.page_text(admin))
 
+    # ── Pagina Festivi ─────────────────────────────────────────────────────────
+    def festivi_page(self):
+        admin = self.admin_session("🎄 Admin — Festivi")
+        admin.date_input(key="fest_start").set_value(dt.date(2026, 12, 1))
+        admin.date_input(key="fest_end").set_value(dt.date(2027, 1, 7))
+        admin.run()
+        self.assertFalse(admin.exception, admin.exception)
+        return admin
+
+    def test_admin_draws_empty_holiday_shifts_and_saves_them(self):
+        import festivi_store as fs
+        self.seed_pool()
+        admin = self.festivi_page()
+
+        admin.button(key="fest_draw").click()
+        admin.run()
+        admin.button(key="fest_save").click()
+        admin.run()
+
+        self.assertFalse(admin.exception, admin.exception)
+        saved = fs.parse(self.gh.files["data/turni_festivi.yml"][0])
+        slots = fs.slots(dt.date(2026, 12, 1), dt.date(2027, 1, 7), saved["festivi_extra"])
+        got = {(e["date"], e["shift"]): e["doctor"] for e in saved["entries"]}
+        self.assertTrue(all((s["date"], s["shift"]) in got for s in slots), "tutti i posti del periodo assegnati")
+        self.assertEqual(got[("2026-12-25", "Mattina")], "Pugliatti", "le assegnazioni esistenti restano")
+        self.assertIn(("2026-04-05", "Mattina"), got, "fuori dal periodo non si tocca nulla")
+        self.assertIn("Festivi salvati", self.page_text(admin))
+
+    def test_holiday_shift_of_inactive_doctor_is_flagged(self):
+        pool = self.seed_pool()
+        pool["doctors"]["Cimino"]["active"] = False
+        self.gh.seed("data/pool_config.json", json.dumps(pool))
+
+        admin = self.festivi_page()
+
+        self.assertIn("Cimino non attivo", self.page_text(admin))
+
 
 class DoctorUnavailabilityFlowUnderChaosTests(DoctorUnavailabilityFlowTests):
     """Same flows with 20% of GitHub requests failing (rate limits, 5xx, timeouts)."""

@@ -33,6 +33,7 @@ import unavailability_service as usvc
 import unavailability_receipts as receipts
 import email_settings as esettings
 import doctor_contacts as dcontacts
+import festivi_store as fstore
 import unavailability_store as ustore
 import xlsx_utils
 import shift_history as sh
@@ -1767,6 +1768,208 @@ def save_doctor_email(doctor: str, email: str, max_retries: int = 4) -> None:
     load_doctor_contacts_from_github.clear()
 
 
+# ---------------- Festivi (sorteggio / assegnazioni) ----------------
+def _festivi_path() -> str:
+    return str(_github_cfg().get("festivi_path") or "data/turni_festivi.yml")
+
+
+def _load_festivi_uncached() -> tuple[dict, str | None, bool]:
+    """(data, sha, on_github). Not on GitHub yet → the file shipped with the app."""
+    g = _github_cfg()
+    gf = None
+    if g.get("token") and g.get("owner") and g.get("repo"):
+        gf = github_utils.get_file(
+            owner=g["owner"], repo=g["repo"], path=_festivi_path(), token=g["token"],
+            branch=g.get("branch", "main"), max_wait=10,
+        )
+    if gf is not None:
+        return fstore.parse(gf.text), gf.sha, True
+    local = Path(__file__).resolve().parent / "data" / "turni_festivi.yml"
+    return (fstore.parse(local.read_text(encoding="utf-8")) if local.exists() else fstore.empty()), None, False
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_festivi() -> dict:
+    """Holiday assignments used by the generation (cached, cleared on save)."""
+    return _load_festivi_uncached()[0]
+
+
+def save_festivi(data: dict, sha: str | None) -> None:
+    g = _github_cfg()
+    github_utils.put_file(
+        owner=g["owner"], repo=g["repo"], path=_festivi_path(), token=g["token"],
+        message=f"Festivi aggiornati dal pannello admin ({_utc_now_iso()})",
+        text=fstore.to_text(data), branch=g.get("branch", "main"), sha=sha,
+    )
+    load_festivi.clear()
+
+
+def render_admin_festivi_page(cfg_admin: dict, active_doctors: list[str]) -> None:
+    """Admin page: holiday shifts assigned by draw or by hand (data/turni_festivi.yml)."""
+    st.markdown("### 🎄 Festivi e sorteggi")
+    st.caption(
+        "Chi fa mattina, pomeriggio e notte nei festivi (e la notte del giorno prima). "
+        "Il generatore turni rispetta queste assegnazioni; i posti lasciati vuoti li sceglie lui."
+    )
+    if "_fest_flash" in st.session_state:
+        _k, _m = st.session_state.pop("_fest_flash")
+        (st.success if _k == "success" else st.error)(_m)
+
+    if "fest_draft" not in st.session_state:
+        try:
+            data, sha, on_github = _load_festivi_uncached()
+        except Exception as e:
+            st.error(f"Festivi non leggibili da GitHub: {e}")
+            return
+        st.session_state["fest_draft"] = data
+        st.session_state["fest_sha"] = sha
+        st.session_state["fest_on_github"] = on_github
+        st.session_state["fest_ver"] = 0
+    draft: dict = st.session_state["fest_draft"]
+    ver = st.session_state["fest_ver"]
+    if not st.session_state.get("fest_on_github"):
+        st.info("I festivi non sono ancora nel repository dei dati: al primo salvataggio verranno copiati lì.")
+
+    today = date.today()
+    _next_easter = fstore._easter(today.year + 1)
+    _c1, _c2 = st.columns(2)
+    with _c1:
+        start = st.date_input("Dal", value=date(today.year, today.month, 1), format="DD/MM/YYYY", key="fest_start")
+    with _c2:
+        end = st.date_input("Al", value=_next_easter + timedelta(days=1), format="DD/MM/YYYY", key="fest_end")
+    if end < start:
+        st.error("La data finale è prima di quella iniziale.")
+        return
+
+    with st.expander("📍 Festivi locali (oltre a quelli nazionali)", expanded=False):
+        _extra_df = pd.DataFrame(
+            [{"Data": date.fromisoformat(x["date"]), "Nome": x.get("name", "")} for x in draft["festivi_extra"]]
+            or [{"Data": None, "Nome": ""}]
+        )
+        _extra_ed = st.data_editor(
+            _extra_df,
+            column_config={
+                "Data": st.column_config.DateColumn("Data", format="DD/MM/YYYY"),
+                "Nome": st.column_config.TextColumn("Nome (es. S. Silvestro)"),
+            },
+            num_rows="dynamic", hide_index=True, width="stretch", key=f"fest_extra_{ver}",
+        )
+        draft["festivi_extra"] = sorted(
+            [
+                {"date": (r["Data"].date() if hasattr(r["Data"], "date") else r["Data"]).isoformat(),
+                 "name": str(r.get("Nome") or "").strip()}
+                for _, r in _extra_ed.iterrows()
+                if r.get("Data") is not None and not pd.isna(r.get("Data"))
+            ],
+            key=lambda x: x["date"],
+        )
+
+    slot_list = fstore.slots(start, end, draft["festivi_extra"])
+    in_period = {(x["date"], x["shift"]) for x in slot_list}
+    s_iso, e_iso = start.isoformat(), end.isoformat()
+    by_key = {(e["date"], e["shift"]): e for e in draft["entries"]}
+    extra_keys = sorted(k for k in by_key if s_iso <= k[0] <= e_iso and k not in in_period)
+    labels = {(x["date"], x["shift"]): x["label"] for x in slot_list}
+    _dow = ["lun", "mar", "mer", "gio", "ven", "sab", "dom"]
+
+    rows = []
+    for key in sorted(in_period | set(extra_keys), key=lambda k: (k[0], fstore.SHIFTS.index(k[1]))):
+        e = by_key.get(key) or {}
+        d = date.fromisoformat(key[0])
+        rows.append({
+            "Data": f"{_dow[d.weekday()]} {d:%d/%m/%Y}",
+            "Festa": labels.get(key, e.get("note", "")),
+            "Turno": key[1],
+            "Medico": e.get("doctor", ""),
+            "Nota": e.get("note", "") if e.get("note", "") != labels.get(key) else "",
+            "_key": f"{key[0]}|{key[1]}",
+        })
+    doc_options = [""] + sorted(set(active_doctors) | {r["Medico"] for r in rows if r["Medico"]})
+
+    st.markdown(f"**Turni festivi dal {start:%d/%m/%Y} al {end:%d/%m/%Y}** — {sum(1 for r in rows if r['Medico'])}/{len(rows)} assegnati")
+    if rows:
+        _ed = st.data_editor(
+            pd.DataFrame(rows),
+            column_config={
+                "Data": st.column_config.TextColumn("Data", disabled=True),
+                "Festa": st.column_config.TextColumn("Festa", disabled=True),
+                "Turno": st.column_config.TextColumn("Turno", disabled=True),
+                "Medico": st.column_config.SelectboxColumn("Medico", options=doc_options, help="Vuoto = lo sceglie il generatore"),
+                "Nota": st.column_config.TextColumn("Nota"),
+                "_key": None,
+            },
+            hide_index=True, width="stretch", key=f"fest_table_{ver}",
+        )
+        outside = [e for e in draft["entries"] if not (s_iso <= e["date"] <= e_iso)]
+        edited = []
+        for _, r in _ed.iterrows():
+            doc = str(r.get("Medico") or "").strip()
+            if not doc:
+                continue
+            d_iso, shift = str(r["_key"]).split("|")
+            note = str(r.get("Nota") or "").strip() or labels.get((d_iso, shift), "")
+            edited.append({"date": d_iso, "doctor": doc, "shift": shift, "note": note})
+        draft["entries"] = fstore.sort_entries(outside + edited)
+    else:
+        st.caption("Nessun festivo nel periodo scelto.")
+
+    for w in fstore.check(draft["entries"], active_doctors=active_doctors):
+        st.warning(w, icon="⚠️")
+
+    with st.expander("🎲 Sorteggio", expanded=False):
+        never_j = {tg.norm_name(d) for d in (((cfg_admin.get("rules") or {}).get("J") or {}).get("never_in_J") or [])}
+        eligible = [d for d in active_doctors if d != "Recupero"]
+        day_docs = st.multiselect("Partecipano a mattina e pomeriggio", eligible, default=eligible, key="fest_day_docs")
+        night_docs = st.multiselect(
+            "Partecipano alle notti", eligible,
+            default=[d for d in eligible if tg.norm_name(d) not in never_j], key="fest_night_docs",
+        )
+        redo = st.checkbox("Risorteggia anche i turni già assegnati del periodo", value=False, key="fest_redo")
+        st.caption(
+            "Estrazione a caso bilanciata: chi ha meno festivi nel periodo ha la precedenza; mai due turni "
+            "nello stesso giorno, mai mattina/pomeriggio dopo la propria notte. Puoi rifarla quante volte vuoi "
+            "e correggere a mano: niente viene salvato finché non premi Salva."
+        )
+        if st.button("🎲 Sorteggia", key="fest_draw"):
+            draft["entries"] = fstore.draw(
+                slot_list, draft["entries"], day_doctors=day_docs, night_doctors=night_docs,
+                only_empty=not redo, seed=random.randrange(1 << 30),
+            )
+            st.session_state["fest_ver"] = ver + 1
+            st.rerun()
+        _counts: dict = {}
+        for e in draft["entries"]:
+            if s_iso <= e["date"] <= e_iso:
+                _counts.setdefault(e["doctor"], {"Giorno": 0, "Notte": 0})["Notte" if e["shift"] == "Notte" else "Giorno"] += 1
+        if _counts:
+            st.dataframe(
+                pd.DataFrame([{"Medico": d, "Mattina/Pomeriggio": c["Giorno"], "Notti": c["Notte"], "Totale": c["Giorno"] + c["Notte"]}
+                              for d, c in sorted(_counts.items())]),
+                hide_index=True, width="stretch",
+            )
+
+    _b1, _b2 = st.columns([3, 1])
+    with _b1:
+        if st.button("💾 Salva festivi", type="primary", key="fest_save"):
+            try:
+                save_festivi(draft, st.session_state.get("fest_sha"))
+                for k in ("fest_draft", "fest_sha", "fest_on_github"):
+                    st.session_state.pop(k, None)
+                st.session_state["_fest_flash"] = ("success", "Festivi salvati ✅: la prossima generazione turni li userà.")
+            except Exception as e:
+                if _is_sha_conflict_error(e):
+                    st.session_state["_fest_flash"] = ("error", "Qualcun altro ha salvato i festivi nel frattempo: niente è stato sovrascritto. Premi «Annulla modifiche» e ripeti.")
+                else:
+                    st.session_state["_fest_flash"] = ("error", f"Festivi non salvati: {e}")
+            st.rerun()
+    with _b2:
+        if st.button("↩️ Annulla modifiche", key="fest_reset"):
+            for k in ("fest_draft", "fest_sha", "fest_on_github"):
+                st.session_state.pop(k, None)
+            st.session_state["fest_ver"] = ver + 1
+            st.rerun()
+
+
 def save_pool_config_with_retry(cfg: dict, sha: str | None, max_retries: int = 3) -> tuple[bool, str]:
     """Salva pool_config su GitHub con retry in caso di conflitto SHA.
 
@@ -3055,7 +3258,7 @@ def render_admin_generate_panel(cfg_admin: dict, doctors: list[str], rules_path:
     # Festivi locali (es. 3 giugno Messina) contano come festivi anche nella memoria.
     try:
         _memory_festive_dates = list(cfg_admin.get("festivi_extra") or []) + list(
-            tg.load_turni_festivi().get("festivi_extra") or []
+            fstore.to_solver(load_festivi()).get("festivi_extra") or []
         )
     except Exception:
         _memory_festive_dates = list(cfg_admin.get("festivi_extra") or [])
@@ -3286,6 +3489,7 @@ def render_admin_generate_panel(cfg_admin: dict, doctors: list[str], rules_path:
                     historical_stats=_hist_agg_for_solver,
                     pool_config=_pool_cfg_for_solver if _pool_cfg_for_solver else None,
                     prior_usage=_prior_usage_for_solver,
+                    turni_festivi=fstore.to_solver(load_festivi()),
                 )
 
                 _month_errors = [
@@ -3526,7 +3730,7 @@ st.markdown("""
 
 mode = st.sidebar.radio(
     "Sezione",
-    ["📋 Le mie indisponibilità", "⚙️ Admin — Genera turni", "🔧 Admin — Configurazione"],
+    ["📋 Le mie indisponibilità", "⚙️ Admin — Genera turni", "🎄 Admin — Festivi", "🔧 Admin — Configurazione"],
     index=0,
 )
 
@@ -4460,6 +4664,21 @@ else:
     except Exception:
         pass
     rules_path = DEFAULT_RULES_PATH
+
+    # ── Ramo Festivi ──────────────────────────────────────────────────────
+    if mode == "🎄 Admin — Festivi":
+        _active_for_fest = list(doctors)
+        try:
+            _pc_f, _ = load_pool_config_from_github_st()
+            if _pc_f:
+                _active_for_fest = sorted(
+                    (d for d, dc in (_pc_f.get("doctors") or {}).items() if dc.get("active", True)),
+                    key=lambda s: (s == "Recupero", s.lower()),
+                )
+        except Exception:
+            pass
+        render_admin_festivi_page(cfg_admin, _active_for_fest)
+        st.stop()
 
     # ── Ramo Configurazione ───────────────────────────────────────────────
     if mode == "🔧 Admin — Configurazione":

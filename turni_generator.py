@@ -1101,39 +1101,11 @@ def load_turni_festivi(base_dir: Optional[Path] = None) -> dict:
     if not path.exists():
         return {"festivi_extra": [], "fixed_assignments": []}
 
+    import festivi_store
     try:
-        with path.open("r", encoding="utf-8") as f:
-            data = yaml.safe_load(f)
+        return festivi_store.to_solver(festivi_store.parse(path.read_text(encoding="utf-8")))
     except Exception:
         return {"festivi_extra": [], "fixed_assignments": []}
-
-    if not isinstance(data, dict):
-        return {"festivi_extra": [], "fixed_assignments": []}
-
-    festivi_extra = [str(x).strip() for x in (data.get("festivi_extra") or []) if x]
-
-    fixed: List[dict] = []
-    for entry in (data.get("entries") or []):
-        if not isinstance(entry, dict):
-            continue
-        try:
-            date_str = str(entry.get("date", "")).strip()
-            doctor = str(entry.get("doctor", "")).strip()
-            shift_raw = str(entry.get("shift", "")).strip().lower()
-            # explicit 'column' field overrides shift-to-column mapping
-            col = entry.get("column") or _FESTIVI_SHIFT_TO_COL.get(shift_raw)
-            if not date_str or not doctor or not col:
-                continue
-            dt.date.fromisoformat(date_str)  # validate format
-            fixed.append({
-                "doctor": doctor,
-                "date": date_str,
-                "column": str(col).strip().upper(),
-            })
-        except Exception:
-            continue
-
-    return {"festivi_extra": festivi_extra, "fixed_assignments": fixed}
 
 
 def create_month_template_xlsx(
@@ -6548,8 +6520,12 @@ def generate_schedule(
     historical_stats: Optional[dict] = None,
     pool_config: Optional[dict] = None,
     prior_usage: Optional[dict] = None,
+    turni_festivi: Optional[dict] = None,
 ):
     """Generate schedules without Tkinter.
+
+    turni_festivi: {"festivi_extra": [iso], "fixed_assignments": [...]} (the app
+    passes the admin page's data); None = local data/turni_festivi.yml.
 
     This is the function used by Streamlit (and can be used programmatically).
     fixed_assignments: [{"doctor":str,"date":"YYYY-MM-DD","column":str}, ...]
@@ -6573,8 +6549,8 @@ def generate_schedule(
 
     requested_fixed_assignments = list(fixed_assignments or [])
 
-    # Merge pre-assigned holiday shifts from data/turni_festivi.yml
-    tf = load_turni_festivi()
+    # Merge pre-assigned holiday shifts (admin page "Festivi", or data/turni_festivi.yml)
+    tf = turni_festivi if turni_festivi is not None else load_turni_festivi()
     if tf["festivi_extra"]:
         existing_fe = list(cfg.get("festivi_extra") or [])
         existing_fe_set = set(str(x).strip() for x in existing_fe)
