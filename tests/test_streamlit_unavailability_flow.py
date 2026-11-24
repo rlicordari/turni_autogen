@@ -608,22 +608,38 @@ class DoctorUnavailabilityFlowTests(unittest.TestCase):
         import yaml
         return yaml.safe_load(self.gh.files["data/doctor_contacts.yml"][0]) or {}
 
-    def test_admin_changes_one_doctor_email_from_the_pool_panel(self):
+    # ── Pagina Medici (schede) ─────────────────────────────────────────────────
+    def doctors_page(self, doctor: str) -> AppTest:
+        admin = self.admin_session("👩‍⚕️ Admin — Medici")
+        admin.selectbox(key="doc_sel").set_value(doctor)
+        admin.run()
+        self.assertFalse(admin.exception, admin.exception)
+        return admin
+
+    def card_key(self, admin: AppTest, doctor: str) -> str:
+        ver = admin.session_state["doc_ver"] if "doc_ver" in admin.session_state else 0
+        return f"{doctor}::{ver}"
+
+    def registry(self) -> dict:
+        import doctor_registry as dr
+        return dr.from_text(self.gh.files["data/doctor_registry.json"][0])
+
+    def test_admin_changes_one_doctor_email_from_the_card(self):
         self.seed_pool()
         self.gh.seed("data/doctor_contacts.yml", f"{DOCTOR}:\n  email: migliorato@example.org\n  phone: '+39333'\nRossi:\n  email: rossi@example.org\n")
-        admin = self.admin_session("🔧 Admin — Configurazione")
+        admin = self.doctors_page(DOCTOR)
+        k = self.card_key(admin, DOCTOR)
 
-        admin.selectbox(key="contact_doctor").set_value(DOCTOR)
-        admin.run()
-        self.assertEqual(admin.text_input(key=f"contact_email::{DOCTOR}").value, "migliorato@example.org")
-        admin.text_input(key=f"contact_email::{DOCTOR}").input("nuova.migliorato@example.org")
-        admin.button(key="contact_save").click()
+        self.assertEqual(admin.text_input(key=f"d_email::{k}").value, "migliorato@example.org")
+        admin.text_input(key=f"d_email::{k}").input("nuova.migliorato@example.org")
+        admin.button(key=f"d_save::{k}").click()
         admin.run()
 
         self.assertFalse(admin.exception, admin.exception)
         self.assertEqual(self.contacts()[DOCTOR], {"email": "nuova.migliorato@example.org", "phone": "+39333"})
         self.assertEqual(self.contacts()["Rossi"], {"email": "rossi@example.org"})
-        self.assertIn("Email di Migliorato aggiornata", self.page_text(admin))
+        self.assertIn("Email aggiornata", self.page_text(admin))
+        self.assertNotIn("data/doctor_registry.json", self.gh.files, "scheda invariata: nessuna scrittura")
 
         # La mail di resoconto successiva va al nuovo indirizzo.
         doc = self.login(self.new_session())
@@ -633,16 +649,81 @@ class DoctorUnavailabilityFlowTests(unittest.TestCase):
 
     def test_invalid_doctor_email_is_not_saved(self):
         self.seed_pool()
-        admin = self.admin_session("🔧 Admin — Configurazione")
-        admin.selectbox(key="contact_doctor").set_value(DOCTOR)
-        admin.run()
+        admin = self.doctors_page(DOCTOR)
+        k = self.card_key(admin, DOCTOR)
 
-        admin.text_input(key=f"contact_email::{DOCTOR}").input("non-valida")
-        admin.button(key="contact_save").click()
+        admin.text_input(key=f"d_email::{k}").input("non-valida")
+        admin.button(key=f"d_save::{k}").click()
         admin.run()
 
         self.assertEqual(self.contacts()[DOCTOR], {"email": "migliorato@example.org"})
         self.assertIn("non valido", self.page_text(admin))
+
+    def test_saving_a_card_changes_only_that_doctor(self):
+        # 18/11/2026: le colonne messe a D'Angelo finirono su Allegra.
+        import doctor_registry as dr
+        self.seed_pool()
+        expected = dr.normalize(load_registry_for_test(self))["doctors"]
+        admin = self.doctors_page("Trio")
+        k = self.card_key(admin, "Trio")
+
+        admin.checkbox(key=f"d_active::{k}").uncheck()
+        admin.checkbox(key=f"d_rep::{k}").uncheck()
+        admin.button(key=f"d_save::{k}").click()
+        admin.run()
+
+        self.assertFalse(admin.exception, admin.exception)
+        saved = self.registry()["doctors"]
+        self.assertFalse(saved["Trio"]["active"])
+        self.assertFalse(saved["Trio"]["reperibilita"])
+        self.assertEqual(saved["Trio"]["services"], expected["Trio"]["services"])
+        for name, card in expected.items():
+            if name != "Trio":
+                self.assertEqual(saved[name], card, name)
+        self.assertIn("Scheda di Trio salvata", self.page_text(admin))
+
+    def test_card_changed_by_another_session_is_not_overwritten(self):
+        import doctor_registry as dr
+        self.seed_pool()
+        admin = self.doctors_page("Trio")
+        admin.button(key="doc_save_all").click()          # prima scrittura delle schede
+        admin.run()
+        self.assertIn("Schede medici salvate", self.page_text(admin))
+        admin.selectbox(key="doc_sel").set_value("Trio")
+        admin.run()
+        k = self.card_key(admin, "Trio")
+
+        # Un'altra sessione salva la scheda di Trio nel frattempo.
+        reg = self.registry()
+        reg = dr.set_doctor(reg, "Trio", {**reg["doctors"]["Trio"], "note": "salvata altrove"})
+        self.gh.seed("data/doctor_registry.json", dr.to_text(reg))
+
+        admin.checkbox(key=f"d_active::{k}").uncheck()
+        admin.button(key=f"d_save::{k}").click()
+        admin.run()
+
+        self.assertEqual(self.registry()["doctors"]["Trio"]["note"], "salvata altrove")
+        self.assertTrue(self.registry()["doctors"]["Trio"]["active"])
+        self.assertIn("modificata da un'altra sessione", self.page_text(admin))
+
+    # ── Pagina Storico turni definitivi ────────────────────────────────────────
+    def test_history_page_shows_definitive_months_only(self):
+        import shift_history as sh
+        hist, _ = sh.merge_upload({}, {"days": [
+            {"date": "2026-11-29", "dow": "Sun", "is_holiday": True, "assignments": {"D": ["Trio"], "E": ["Trio"], "J": ["Cusmà"]}},
+            {"date": "2026-11-30", "dow": "Mon", "is_holiday": False, "assignments": {"J": ["Licordari"], "C": ["Trio"]}},
+        ]})
+        self.gh.seed("data/shift_history.json", sh.history_to_json(hist))
+
+        admin = self.admin_session("📊 Admin — Storico turni")
+
+        self.assertFalse(admin.exception, admin.exception)
+        captions = " ".join(str(c.value) for c in admin.caption)
+        self.assertIn("2026-11 (2 giorni)", captions)
+        table = admin.dataframe[0].value
+        row = table[table["Medico"] == "Trio"].iloc[0]
+        self.assertEqual(int(row["Domeniche/festivi di giorno"]), 1)
+        self.assertEqual(int(row["Reperibilità"]), 1)
 
     # ── Pagina Festivi ─────────────────────────────────────────────────────────
     def festivi_page(self):
@@ -680,6 +761,14 @@ class DoctorUnavailabilityFlowTests(unittest.TestCase):
         admin = self.festivi_page()
 
         self.assertIn("Cimino non attivo", self.page_text(admin))
+
+
+def load_registry_for_test(case) -> dict:
+    """Cards the page shows before the first save (rebuilt from pool_config.json)."""
+    import doctor_registry as dr
+    import turni_generator
+    pool = json.loads(case.gh.files["data/pool_config.json"][0])
+    return dr.migrate(pool, turni_generator.load_rules(Path("Regole_Turni.yml")))
 
 
 class DoctorUnavailabilityFlowUnderChaosTests(DoctorUnavailabilityFlowTests):

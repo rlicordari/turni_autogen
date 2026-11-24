@@ -37,7 +37,8 @@ import festivi_store as fstore
 import unavailability_store as ustore
 import xlsx_utils
 import shift_history as sh
-import generation_memory as gmem
+import doctor_registry as dreg
+import doctor_admin_ui
 from fixed_assignment_options import parse_fixed_assignment_rows
 
 # Import generator
@@ -486,51 +487,9 @@ def _github_cfg() -> dict:
         "contacts_path": _get_secret(("GITHUB_DOCTOR_CONTACTS_PATH",), "data/doctor_contacts.yml"),
         "availability_path": _get_secret(("GITHUB_AVAIL_PATH",), "data/availability_store.csv"),
         "pool_config_path": _get_secret(("GITHUB_POOL_CONFIG_PATH",), "data/pool_config.json"),
-        "generation_memory_path": _get_secret(("GITHUB_GENERATION_MEMORY_PATH",), gmem.MEMORY_PATH_DEFAULT),
     }
 
 # ---------------- Shift history helpers ----------------
-def _generation_memory_path() -> str:
-    g = _github_cfg()
-    return str(
-        g.get("generation_memory_path")
-        or g.get("generated_memory_path")
-        or g.get("generated_shift_memory_path")
-        or gmem.MEMORY_PATH_DEFAULT
-    )
-
-
-def load_generation_memory_from_github_st() -> tuple[dict, str | None]:
-    g = _github_cfg()
-    return gmem.load_memory_from_github(
-        owner=g["owner"],
-        repo=g["repo"],
-        token=g["token"],
-        branch=g.get("branch", "main"),
-        path=_generation_memory_path(),
-    )
-
-
-def save_generation_memory_to_github_st(memory: dict, sha: str | None) -> str | None:
-    g = _github_cfg()
-    resp = gmem.save_memory_to_github(
-        memory,
-        owner=g["owner"],
-        repo=g["repo"],
-        token=g["token"],
-        branch=g.get("branch", "main"),
-        sha=sha,
-        path=_generation_memory_path(),
-    )
-    try:
-        content = resp.get("content") if isinstance(resp, dict) else None
-        if isinstance(content, dict) and content.get("sha"):
-            return str(content["sha"])
-    except Exception:
-        pass
-    return None
-
-
 def _load_shift_history() -> tuple[dict, str | None]:
     """Carica lo storico turni da GitHub."""
     try:
@@ -1741,6 +1700,59 @@ def load_pool_config_from_github_st() -> tuple[dict, str | None]:
     )
 
 
+def _registry_path() -> str:
+    g = _github_cfg()
+    return g.get("doctor_registry_path") or dreg.REGISTRY_PATH_DEFAULT
+
+
+def _load_registry_uncached() -> tuple[dict, str | None, bool]:
+    """(registry, sha, on_github). Until the first save the cards are rebuilt
+    from the previous configuration (pool_config.json + rules file)."""
+    g = _github_cfg()
+    reg, sha = None, None
+    if g.get("token") and g.get("owner") and g.get("repo"):
+        reg, sha = dreg.load_from_github(g["owner"], g["repo"], g["token"], g.get("branch", "main"), _registry_path())
+    if reg is not None:
+        return reg, sha, True
+    try:
+        pool_v1, _ = load_pool_config_from_github_st()
+    except Exception:
+        pool_v1 = {}
+    return dreg.migrate(pool_v1 or None, tg.load_rules(DEFAULT_RULES_PATH)), None, False
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_registry() -> tuple[dict, str | None, bool]:
+    return _load_registry_uncached()
+
+
+def update_registry(change, message: str, max_retries: int = 4) -> dict:
+    """Re-read the registry, apply `change` (it touches one doctor or the
+    service settings and refuses if they moved meanwhile) and write it back."""
+    g = _github_cfg()
+    if not (g.get("token") and g.get("owner") and g.get("repo")):
+        raise RuntimeError("GitHub non configurato.")
+    for attempt in range(max_retries):
+        reg, sha, on_github = _load_registry_uncached()
+        new = change(reg)
+        try:
+            dreg.save_to_github(new, g["owner"], g["repo"], g["token"], g.get("branch", "main"),
+                                sha=sha if on_github else None, path=_registry_path(), message=message)
+            load_registry.clear()
+            _pool_config_for_doctor_list.clear()
+            return new
+        except Exception as e:
+            if _is_sha_conflict_error(e) and attempt < max_retries - 1:
+                continue
+            raise
+    raise RuntimeError("Salvataggio non riuscito dopo vari tentativi.")
+
+
+def registry_active_doctors(include_placeholder: bool = False) -> list[str]:
+    reg, _, _ = load_registry()
+    return [d for d in dreg.active_doctors(reg) if include_placeholder or d != dreg.PLACEHOLDER]
+
+
 def save_doctor_email(doctor: str, email: str, max_retries: int = 4) -> None:
     """Set (or remove, if empty) one doctor's email in doctor_contacts.yml on GitHub.
 
@@ -1802,6 +1814,122 @@ def save_festivi(data: dict, sha: str | None) -> None:
         text=fstore.to_text(data), branch=g.get("branch", "main"), sha=sha,
     )
     load_festivi.clear()
+
+
+def _update_shift_history(change, max_retries: int = 4) -> dict:
+    """Re-read the history, apply `change`, write it back (retry on conflict)."""
+    sec = st.secrets["github_unavailability"]
+    for attempt in range(max_retries):
+        history, sha = sh.load_history_from_github(sec["owner"], sec["repo"], sec["token"], sec.get("branch", "main"))
+        new = change(dict(history or {}))
+        try:
+            sh.save_history_to_github(new, sec["owner"], sec["repo"], sec["token"], sec.get("branch", "main"), sha)
+            return new
+        except Exception as e:
+            if _is_sha_conflict_error(e) and attempt < max_retries - 1:
+                continue
+            raise
+    raise RuntimeError("Storico non salvato dopo vari tentativi.")
+
+
+def _history_table_rows(stats_by_doc: dict, with_months: bool) -> list[dict]:
+    rows = []
+    for doc in sorted(k for k in stats_by_doc if not str(k).startswith("_")):
+        ds = stats_by_doc[doc]
+        c = tg.history_counts(stats_by_doc, doc)
+        j = ds.get("J") or {}
+        row = {"Medico": doc}
+        if with_months:
+            row["Mesi"] = ds.get("_months_counted", 0)
+        row.update({
+            "Notti": c["J"],
+            "Notti sabato": j.get("sabati", 0) if isinstance(j, dict) else 0,
+            "Notti domenica": j.get("domeniche", 0) if isinstance(j, dict) else 0,
+            "Domeniche/festivi di giorno": c["festivi"],
+            "Reperibilità": c["C"],
+        })
+        rows.append(row)
+    return rows
+
+
+def render_admin_history_page(valid_doctors: list[str]) -> None:
+    st.markdown("### 📊 Storico turni definitivi")
+    st.caption(
+        "Carica gli Excel **definitivi** (quelli dopo le modifiche finali). Il generatore bilancia "
+        "notti, notti di sabato/domenica, domeniche e festivi di giorno e reperibilità su **tutti i mesi "
+        "caricati**, tenendo conto dei mesi di presenza di ciascuno. Le generazioni non definitive non contano."
+    )
+    flash = st.session_state.pop("_hist_flash", None)
+    if flash:
+        (st.success if flash[0] == "success" else st.error)(flash[1])
+
+    files = st.file_uploader("Excel turni definitivi (anche più file, anche a cavallo di due mesi)",
+                             type=["xlsx"], accept_multiple_files=True, key="hist_upload")
+    if files and st.button("📥 Importa nello storico", key="btn_import_hist", type="primary"):
+        loaded, errors = [], []
+        valid = set(valid_doctors) if valid_doctors else None
+        for f in files:
+            tmp = Path(tempfile.gettempdir()) / f"hist_{int(time.time() * 1000)}.xlsx"
+            try:
+                tmp.write_bytes(f.getvalue())
+                parsed = sh.parse_finalized_xlsx(str(tmp))
+                if not parsed["days"]:
+                    errors.append(f"{f.name}: nessun giorno trovato")
+                    continue
+                touched: list[str] = []
+
+                def _merge(h, parsed=parsed, touched=touched):
+                    merged, months_done = sh.merge_upload(h, parsed, valid)
+                    touched[:] = months_done
+                    return merged
+
+                _update_shift_history(_merge)
+                loaded.append(f"{f.name} → {', '.join(touched)} ({len(parsed['days'])} giorni)")
+            except Exception as e:
+                errors.append(f"{f.name}: {e}")
+            finally:
+                if tmp.exists():
+                    tmp.unlink()
+        if loaded:
+            st.session_state["_hist_flash"] = ("success", "Importati: " + "; ".join(loaded)
+                                               + ((" — Errori: " + "; ".join(errors)) if errors else ""))
+        else:
+            st.session_state["_hist_flash"] = ("error", "Niente importato: " + "; ".join(errors))
+        st.rerun()
+
+    history, _sha = _load_shift_history()
+    months = sorted(k for k in (history or {}) if not str(k).startswith("_"))
+    if not months:
+        st.info("Nessun mese definitivo caricato: il generatore bilancia solo dentro il periodo.", icon="ℹ️")
+        return
+    st.caption("Mesi caricati: " + ", ".join(
+        f"{m}" + ("" if (history[m].get("_meta") or {}).get("days_loaded") in (None, 28, 29, 30, 31)
+                  else f" ({history[m]['_meta']['days_loaded']} giorni)")
+        for m in months))
+    agg = sh.aggregate_multi_month({m: history[m] for m in months})
+    tab_tot, tab_month, tab_chart = st.tabs(["Totale", "Per mese", "Grafico"])
+    with tab_tot:
+        st.dataframe(pd.DataFrame(_history_table_rows(agg, with_months=True)), width="stretch", hide_index=True)
+    with tab_month:
+        sel = st.selectbox("Mese", months, index=len(months) - 1, key="hist_tab_mese")
+        st.dataframe(pd.DataFrame(_history_table_rows(history[sel], with_months=False)), width="stretch", hide_index=True)
+    with tab_chart:
+        what = st.selectbox("Mostra", ["Notti", "Notti sabato", "Notti domenica", "Domeniche/festivi di giorno", "Reperibilità"],
+                            key="hist_graf_sel")
+        df = pd.DataFrame(_history_table_rows(agg, with_months=True))
+        if not df.empty:
+            fig = px.bar(df, x="Medico", y=what, title=f"{what} (tutti i mesi caricati)")
+            fig.update_layout(xaxis_tickangle=-45, height=400)
+            st.plotly_chart(fig, width="stretch")
+    with st.expander("🗑️ Rimuovi un mese dallo storico"):
+        m_del = st.selectbox("Mese da rimuovere", months, key="hist_del")
+        if st.button("Rimuovi", key="btn_del_hist"):
+            try:
+                _update_shift_history(lambda h: {k: v for k, v in h.items() if k != m_del})
+                st.session_state["_hist_flash"] = ("success", f"Mese {m_del} rimosso.")
+            except Exception as e:
+                st.session_state["_hist_flash"] = ("error", f"Mese non rimosso: {e}")
+            st.rerun()
 
 
 def render_admin_festivi_page(cfg_admin: dict, active_doctors: list[str]) -> None:
@@ -1968,38 +2096,6 @@ def render_admin_festivi_page(cfg_admin: dict, active_doctors: list[str]) -> Non
                 st.session_state.pop(k, None)
             st.session_state["fest_ver"] = ver + 1
             st.rerun()
-
-
-def save_pool_config_with_retry(cfg: dict, sha: str | None, max_retries: int = 3) -> tuple[bool, str]:
-    """Salva pool_config su GitHub con retry in caso di conflitto SHA.
-
-    Ritorna (ok: bool, message: str).
-    """
-    import pool_config_store as _pcs
-    g = _github_cfg()
-    path = g.get("pool_config_path") or _pcs.POOL_CONFIG_PATH_DEFAULT
-    current_sha = sha
-    for attempt in range(max_retries):
-        try:
-            _pcs.save_pool_config_to_github(
-                cfg=cfg,
-                owner=g["owner"],
-                repo=g["repo"],
-                token=g["token"],
-                branch=g.get("branch", "main"),
-                sha=current_sha,
-                path=path,
-            )
-            _pool_config_for_doctor_list.clear()
-            return True, "Configurazione pool salvata."
-        except Exception as e:
-            if _is_sha_conflict_error(e) and attempt < max_retries - 1:
-                # Ricarica SHA aggiornato e riprova
-                fresh, fresh_sha = load_pool_config_from_github_st()
-                current_sha = fresh_sha
-                continue
-            return False, f"Errore salvataggio pool config: {e}"
-    return False, "Impossibile salvare dopo i tentativi massimi."
 
 
 def _audit_path_for_month(mk: str) -> str:
@@ -2827,20 +2923,20 @@ def render_admin_generate_panel(cfg_admin: dict, doctors: list[str], rules_path:
         if label in _disabled_col_labels
     ]
 
-    # Auto-carryover da storico: chi ha fatto notte l’ultimo giorno del mese precedente
+    # Chi ha fatto la notte il giorno prima del periodo, dai turni definitivi
+    # (vale anche se il periodo non inizia il 1° del mese).
     _carry_default = []
     try:
         _prev_period_day = period_start - timedelta(days=1)
-        _mk_minus1 = f"{_prev_period_day.year:04d}-{_prev_period_day.month:02d}"
         _hd_carry, _ = _load_shift_history()
-        if _hd_carry:
-            _last_month = sorted(_hd_carry.keys())[-1]
-            if _last_month == _mk_minus1:
-                _meta = _hd_carry[_last_month].get("_meta", {})
-                _carry_default = [
-                    d for d in _meta.get("last_day_night_doctors", [])
-                    if d in doctors
-                ]
+        _carry_default = [d for d in sh.night_doctors_on(_hd_carry, _prev_period_day.isoformat()) if d in doctors]
+        if not _carry_default and _hd_carry:
+            # Mesi importati prima del salvataggio per giorno: solo fine mese
+            _mk_minus1 = f"{_prev_period_day.year:04d}-{_prev_period_day.month:02d}"
+            _last_month_day = (period_start.replace(day=1) == period_start)
+            _meta = (_hd_carry.get(_mk_minus1) or {}).get("_meta", {})
+            if _last_month_day and not (_hd_carry.get(_mk_minus1) or {}).get("_days"):
+                _carry_default = [d for d in _meta.get("last_day_night_doctors", []) if d in doctors]
     except Exception:
         pass
 
@@ -2892,43 +2988,6 @@ def render_admin_generate_panel(cfg_admin: dict, doctors: list[str], rules_path:
     for _dd in _period_dates:
         _iso_w = _dd.isocalendar()[:2]
         _weeks_j.setdefault(_iso_w, {})[_dd.weekday()] = _dd
-
-    _generation_memory_loaded = gmem.empty_memory()
-    _generation_memory_sha = None
-    _generation_memory_load_error = None
-    try:
-        _generation_memory_loaded, _generation_memory_sha = load_generation_memory_from_github_st()
-    except Exception as _gme:
-        _generation_memory_load_error = _gme
-    _generation_versions = list((_generation_memory_loaded or {}).get("versions") or [])
-    _version_rows = []
-    for _v in _generation_versions:
-        _assignments = _v.get("assignments") if isinstance(_v.get("assignments"), dict) else {}
-        _n_days = len(_assignments)
-        _n_slots = 0
-        for _by_col in _assignments.values():
-            if isinstance(_by_col, dict):
-                _n_slots += sum(len(_docs) for _docs in _by_col.values() if isinstance(_docs, list))
-        _version_rows.append({
-            "Attiva": bool(_v.get("active", True)),
-            "Etichetta": _v.get("label", ""),
-            "Dal": _v.get("start_date", ""),
-            "Al": _v.get("end_date", ""),
-            "Creata": _v.get("created_at", ""),
-            "Giorni": _n_days,
-            "Slot": _n_slots,
-            "ID": _v.get("id", ""),
-        })
-    _version_label_by_id = {
-        str(row["ID"]): f"{row['Etichetta']} · {row['Dal']}–{row['Al']} · {str(row['ID'])[:8]}"
-        for row in _version_rows
-        if str(row.get("ID") or "")
-    }
-    _default_selected_ids = [
-        str(row["ID"])
-        for row in _version_rows
-        if bool(row.get("Attiva", True)) and str(row.get("ID") or "")
-    ]
 
     with st.form(f"admin_generation_options_form_{mk}"):
         st.markdown("### Opzioni generazione")
@@ -3077,37 +3136,6 @@ def render_admin_generate_panel(cfg_admin: dict, doctors: list[str], rules_path:
         else:
             _confirm_j_non_default_draft = False
 
-        st.markdown("### 7) Memoria generazioni")
-        _use_generation_memory_draft = st.checkbox(
-            "Usa generazioni precedenti attive per ricalibrare quote/spaziature",
-            value=bool(_options_state.get("use_generation_memory", True)),
-            key=f"use_generation_memory_draft_{mk}",
-            help="Per periodi parziali dello stesso mese, il solver conta i turni già generati prima del periodo corrente.",
-        )
-        _store_generation_memory_draft = st.checkbox(
-            "Salva questa generazione in memoria dopo la creazione",
-            value=bool(_options_state.get("store_generation_memory", False)),
-            key=f"store_generation_memory_draft_{mk}",
-            help="Crea una nuova versione. Le versioni precedenti restano disponibili e puoi attivarle/disattivarle.",
-        )
-        _generation_memory_label_draft = st.text_input(
-            "Etichetta nuova versione",
-            value=str(_options_state.get("generation_memory_label") or f"{period_start:%d/%m/%Y}-{period_end:%d/%m/%Y}"),
-            key=f"generation_memory_label_draft_{mk}",
-        )
-        _selected_default_ids = _options_state.get("selected_generation_version_ids")
-        if not isinstance(_selected_default_ids, list):
-            _selected_default_ids = _default_selected_ids
-        _selected_generation_version_ids_draft = st.multiselect(
-            "Versioni da usare per questa generazione",
-            options=list(_version_label_by_id.keys()),
-            default=[vid for vid in _selected_default_ids if vid in _version_label_by_id],
-            format_func=lambda vid: _version_label_by_id.get(str(vid), str(vid)),
-            key=f"generation_memory_selected_versions_draft_{mk}",
-            help="Le versioni non selezionate restano salvate ma non vengono usate.",
-            disabled=not _use_generation_memory_draft,
-        )
-
         _form_cols = st.columns([1, 1, 1, 2])
         with _form_cols[0]:
             apply_generation_options = st.form_submit_button("Applica opzioni")
@@ -3140,10 +3168,6 @@ def render_admin_generate_panel(cfg_admin: dict, doctors: list[str], rules_path:
                 "v_double": dict(_v_double_draft or {}),
                 "j_blank": dict(_j_blank_draft or {}),
                 "confirm_j_non_default": bool(_confirm_j_non_default_draft),
-                "use_generation_memory": bool(_use_generation_memory_draft),
-                "store_generation_memory": bool(_store_generation_memory_draft),
-                "generation_memory_label": _generation_memory_label_draft,
-                "selected_generation_version_ids": list(_selected_generation_version_ids_draft or []),
             }
             st.session_state[_options_key] = _options_state
         if generate and _j_non_default_draft and not _confirm_j_non_default_draft:
@@ -3246,23 +3270,6 @@ def render_admin_generate_panel(cfg_admin: dict, doctors: list[str], rules_path:
                 icon="🌙",
             )
 
-    _use_generation_memory = bool(_options_state.get("use_generation_memory", True))
-    _store_generation_memory = bool(_options_state.get("store_generation_memory", False))
-    _generation_memory_label = str(_options_state.get("generation_memory_label") or f"{period_start:%d/%m/%Y}-{period_end:%d/%m/%Y}")
-    _selected_generation_version_ids = gmem.resolve_selected_version_ids(
-        _options_state.get("selected_generation_version_ids"),
-        _default_selected_ids,
-    )
-    if not _use_generation_memory:
-        _selected_generation_version_ids = set()
-    # Festivi locali (es. 3 giugno Messina) contano come festivi anche nella memoria.
-    try:
-        _memory_festive_dates = list(cfg_admin.get("festivi_extra") or []) + list(
-            fstore.to_solver(load_festivi()).get("festivi_extra") or []
-        )
-    except Exception:
-        _memory_festive_dates = list(cfg_admin.get("festivi_extra") or [])
-
     with st.expander("📜 Log inserimenti/modifiche indisponibilità (Audit)", expanded=False):
         st.caption("Il log resta separato dalle opzioni di generazione per evitare altri submit del pannello principale.")
         mk_log = f"{int(year)}-{int(month):02d}"
@@ -3284,65 +3291,6 @@ def render_admin_generate_panel(cfg_admin: dict, doctors: list[str], rules_path:
                 st.dataframe(df_audit.head(200), width="stretch", hide_index=True)
             except Exception:
                 pass
-
-    with st.expander("Versioni salvate", expanded=False):
-        if _generation_memory_load_error:
-            st.warning(f"Memoria generazioni non leggibile: {_generation_memory_load_error}")
-        elif not _version_rows:
-            st.caption("Nessuna generazione salvata.")
-        else:
-            _versions_df = pd.DataFrame(_version_rows)
-            with st.form(f"generation_memory_versions_form_{mk}"):
-                _edited_versions = st.data_editor(
-                    _versions_df,
-                    column_config={
-                        "Attiva": st.column_config.CheckboxColumn("Attiva"),
-                        "Etichetta": st.column_config.TextColumn("Etichetta", disabled=True),
-                        "Dal": st.column_config.TextColumn("Dal", disabled=True),
-                        "Al": st.column_config.TextColumn("Al", disabled=True),
-                        "Creata": st.column_config.TextColumn("Creata", disabled=True),
-                        "Giorni": st.column_config.NumberColumn("Giorni", disabled=True),
-                        "Slot": st.column_config.NumberColumn("Slot", disabled=True),
-                        "ID": st.column_config.TextColumn("ID", disabled=True),
-                    },
-                    hide_index=True,
-                    width="stretch",
-                    key=f"generation_memory_versions_{mk}",
-                    num_rows="fixed",
-                )
-                _save_versions = st.form_submit_button("💾 Salva stato versioni")
-            if _save_versions:
-                try:
-                    _active_by_id = {
-                        str(row.get("ID") or ""): bool(row.get("Attiva", True))
-                        for _, row in _edited_versions.iterrows()
-                    }
-                    _fresh_mem, _fresh_sha = load_generation_memory_from_github_st()
-                    _to_save = gmem.set_version_active(_fresh_mem, _active_by_id)
-                    save_generation_memory_to_github_st(_to_save, _fresh_sha)
-                    st.success("Stato versioni salvato.")
-                    _rerun_fragment_or_app()
-                except Exception as _e:
-                    st.error(f"Errore salvataggio memoria generazioni: {_e}")
-
-            try:
-                _hist_preview, _ = _load_shift_history()
-                _finalized_preview = set((_hist_preview or {}).keys())
-            except Exception:
-                _finalized_preview = set()
-            _prior_preview = gmem.build_solver_prior_usage(
-                _generation_memory_loaded,
-                period_start,
-                period_end,
-                finalized_months=_finalized_preview,
-                selected_version_ids=_selected_generation_version_ids,
-                festive_dates=_memory_festive_dates,
-            )
-            _used = [v for v in _prior_preview.get("versions_used", []) if v]
-            if _used:
-                st.caption(f"Per questo periodo verrebbero usate {len(_used)} versioni precedenti selezionate.")
-            else:
-                st.caption("Per questo periodo non risultano versioni precedenti da conteggiare.")
 
     st.divider()
 
@@ -3427,51 +3375,15 @@ def render_admin_generate_panel(cfg_admin: dict, doctors: list[str], rules_path:
                     all_avail_prefs = []
                     st.warning(f"Impossibile caricare preferenze da GitHub: {_e}")
 
-                # Pool config overlay (se presente su GitHub)
-                _pool_cfg_for_solver, _ = load_pool_config_from_github_st()
+                # Chi può fare cosa: solo dalle schede medico
+                _registry_for_solver, _, _ = _load_registry_uncached()
 
+                # Bilanciamento: SOLO turni definitivi caricati (pagina Storico turni)
                 _hist_data2, _ = _load_shift_history()
-                _finalized_months_for_memory = set((_hist_data2 or {}).keys())
-
-                _prior_usage_for_solver = None
-                _gen_mem_fresh = None
-                if _use_generation_memory:
-                    status.update(label="Carico memoria generazioni…", state="running")
-                    _gen_mem_fresh, _gen_mem_sha_fresh = load_generation_memory_from_github_st()
-                    _prior_usage_for_solver = gmem.build_solver_prior_usage(
-                        _gen_mem_fresh,
-                        period_start,
-                        period_end,
-                        finalized_months=_finalized_months_for_memory,
-                        selected_version_ids=_selected_generation_version_ids,
-                        festive_dates=_memory_festive_dates,
-                    )
-                    _used_versions = [v for v in _prior_usage_for_solver.get("versions_used", []) if v]
-                    if _used_versions:
-                        st.caption(f"Memoria generazioni: uso {len(_used_versions)} versione/i precedenti selezionate.")
-
-                # Storico aggregato effettivo per il solver:
-                # definitivo importato + generazioni attive non ancora sostituite da definitivo.
-                _effective_hist_data = dict(_hist_data2 or {})
-                _gen_hist_for_solver = {}
-                if _use_generation_memory and _gen_mem_fresh is not None:
-                    _gen_hist_for_solver = gmem.memory_to_shift_history(
-                        _gen_mem_fresh,
-                        start_date=period_start,
-                        end_date=period_end,
-                        finalized_months=set(_effective_hist_data.keys()),
-                        valid_doctors=set(doctors) if doctors else None,
-                        selected_version_ids=_selected_generation_version_ids,
-                    )
-                    for _hmk, _hstats in _gen_hist_for_solver.items():
-                        if _hmk not in _effective_hist_data:
-                            _effective_hist_data[_hmk] = _hstats
-                _hist_agg_for_solver = sh.aggregate_multi_month(_effective_hist_data) if _effective_hist_data else None
-                if _gen_hist_for_solver:
-                    st.caption(
-                        "Memoria storica effettiva: include generazioni attive per "
-                        + ", ".join(sorted(_gen_hist_for_solver.keys()))
-                    )
+                _hist_months = {k: v for k, v in (_hist_data2 or {}).items() if not str(k).startswith("_")}
+                _hist_agg_for_solver = sh.aggregate_multi_month(_hist_months) if _hist_months else None
+                if _hist_months:
+                    st.caption(f"Bilanciamento con {len(_hist_months)} mesi definitivi caricati.")
 
                 status.update(label="Generazione turni…", state="running")
                 stats, log_path = tg.generate_schedule(
@@ -3487,8 +3399,7 @@ def render_admin_generate_panel(cfg_admin: dict, doctors: list[str], rules_path:
                     j_blank_week_overrides=_j_blank_week_overrides if _j_blank_week_overrides else None,
                     disabled_columns=disabled_columns_list if disabled_columns_list else None,
                     historical_stats=_hist_agg_for_solver,
-                    pool_config=_pool_cfg_for_solver if _pool_cfg_for_solver else None,
-                    prior_usage=_prior_usage_for_solver,
+                    doctor_registry=_registry_for_solver,
                     turni_festivi=fstore.to_solver(load_festivi()),
                 )
 
@@ -3514,34 +3425,6 @@ def render_admin_generate_panel(cfg_admin: dict, doctors: list[str], rules_path:
                     )
                     raise ValueError(f"Assegnazioni fisse non rispettate: {details}")
 
-                _saved_generation_memory = None
-                if _store_generation_memory:
-                    status.update(label="Salvo memoria generazione…", state="running")
-                    _assignments_for_memory = gmem.parse_generated_xlsx_assignments(out_path)
-                    if _assignments_for_memory:
-                        _mem_latest, _mem_latest_sha = load_generation_memory_from_github_st()
-                        _version_id = str(uuid.uuid4())
-                        _mem_to_save = gmem.append_version(
-                            _mem_latest,
-                            version_id=_version_id,
-                            label=_generation_memory_label or f"{period_start:%d/%m/%Y}-{period_end:%d/%m/%Y}",
-                            start_date=period_start,
-                            end_date=period_end,
-                            assignments=_assignments_for_memory,
-                            active=True,
-                        )
-                        save_generation_memory_to_github_st(_mem_to_save, _mem_latest_sha)
-                        _saved_generation_memory = {
-                            "version_id": _version_id,
-                            "days": len(_assignments_for_memory),
-                        }
-                    else:
-                        _saved_generation_memory = {
-                            "version_id": None,
-                            "days": 0,
-                            "warning": "Nessuna assegnazione letta dall'Excel generato.",
-                        }
-
                 status.update(label="Completato ✅", state="complete")
 
                 # Persist outputs in session_state so that download clicks do not
@@ -3560,11 +3443,6 @@ def render_admin_generate_panel(cfg_admin: dict, doctors: list[str], rules_path:
                     "stats": stats,
                     "elapsed_s": round(time.time() - t0, 2),
                     "generated_at": datetime.now().isoformat(timespec="seconds"),
-                    "generation_memory": {
-                        "used": bool(_use_generation_memory),
-                        "versions_used": (_prior_usage_for_solver or {}).get("versions_used", []) if _prior_usage_for_solver else [],
-                        "saved": _saved_generation_memory,
-                    },
                 }
 
         except Exception:
@@ -3593,18 +3471,6 @@ def render_admin_generate_panel(cfg_admin: dict, doctors: list[str], rules_path:
                 if _generated_fixed else ""
             )
         )
-        _gm_last = last.get("generation_memory") if isinstance(last.get("generation_memory"), dict) else {}
-        if _gm_last:
-            _gm_parts = []
-            if _gm_last.get("used"):
-                _gm_parts.append(f"memoria usata: {len(_gm_last.get('versions_used') or [])} versioni")
-            _gm_saved = _gm_last.get("saved") if isinstance(_gm_last.get("saved"), dict) else None
-            if _gm_saved and _gm_saved.get("version_id"):
-                _gm_parts.append(f"salvata nuova versione ({_gm_saved.get('days', 0)} giorni)")
-            elif _gm_saved and _gm_saved.get("warning"):
-                st.warning(str(_gm_saved.get("warning")))
-            if _gm_parts:
-                st.caption("Memoria generazioni: " + " · ".join(_gm_parts))
         # Mostra solver_error se INFEASIBLE (per diagnostica)
         if str(_stats.get("status","")).upper() == "INFEASIBLE":
             _month_stats = (_stats.get("months") or {}).get(mk, {}) or {}
@@ -3731,33 +3597,17 @@ st.markdown("""
 
 mode = st.sidebar.radio(
     "Sezione",
-    ["📋 Le mie indisponibilità", "⚙️ Admin — Genera turni", "🎄 Admin — Festivi", "🔧 Admin — Configurazione"],
+    ["📋 Le mie indisponibilità", "⚙️ Admin — Genera turni", "👩‍⚕️ Admin — Medici", "🎄 Admin — Festivi", "📊 Admin — Storico turni", "🔧 Admin — Configurazione"],
     index=0,
 )
 
-# Load default rules (for doctor list)
+# Doctor list: only the doctor cards (Admin → Medici)
 cfg_default = tg.load_rules(DEFAULT_RULES_PATH)
-doctors_default = doctors_from_cfg(cfg_default)
-
-# Aggiungi medici attivi dal pool_config non già presenti nel YAML
-# (permette di aggiungere nuovi medici dalla GUI senza toccare Regole_Turni.yml)
 try:
-    _pc_login = _pool_config_for_doctor_list()
-    if _pc_login:
-        _existing_dn = {tg.norm_name(d) for d in doctors_default}
-        _new_from_pc = [
-            d for d, dc in _pc_login.get("doctors", {}).items()
-            if dc.get("active", True)
-            and tg.norm_name(d) not in _existing_dn
-            and d != "Recupero"
-        ]
-        if _new_from_pc:
-            doctors_default = sorted(
-                doctors_default + _new_from_pc,
-                key=lambda s: (s == "Recupero", s.lower()),
-            )
+    # Anche i non attivi (malattia, maternità) possono entrare a segnare le assenze.
+    doctors_default = [d for d in dreg.all_doctors(load_registry()[0]) if d != dreg.PLACEHOLDER]
 except Exception:
-    pass
+    doctors_default = [d for d in doctors_from_cfg(cfg_default) if d != "Recupero"]
 
 # =====================================================================
 #                        MEDICO – Indisponibilità
@@ -4646,38 +4496,38 @@ else:
 
     # Carica cfg una volta per entrambi i rami (Genera e Configurazione)
     cfg_admin = tg.load_rules(DEFAULT_RULES_PATH)
-    doctors = doctors_from_cfg(cfg_admin)
     try:
-        _pc_admin, _ = load_pool_config_from_github_st()
-        if _pc_admin:
-            _dn_set = {tg.norm_name(d) for d in doctors}
-            _new = [
-                d for d, dc in _pc_admin.get("doctors", {}).items()
-                if dc.get("active", True)
-                and tg.norm_name(d) not in _dn_set
-                and d != "Recupero"
-            ]
-            if _new:
-                doctors = sorted(
-                    doctors + _new,
-                    key=lambda s: (s == "Recupero", s.lower()),
-                )
+        doctors = registry_active_doctors(include_placeholder=True)
     except Exception:
-        pass
+        doctors = doctors_from_cfg(cfg_admin)
     rules_path = DEFAULT_RULES_PATH
+
+    # ── Ramo Medici ───────────────────────────────────────────────────────
+    if mode == "👩‍⚕️ Admin — Medici":
+        try:
+            _contacts_med = load_doctor_contacts_from_github()
+        except Exception:
+            _contacts_med = {}
+        doctor_admin_ui.render(
+            load_registry=load_registry,
+            update_registry=update_registry,
+            contacts=_contacts_med,
+            save_email=save_doctor_email,
+        )
+        st.stop()
+
+    # ── Ramo Storico ──────────────────────────────────────────────────────
+    if mode == "📊 Admin — Storico turni":
+        try:
+            _hist_valid = [d for d in dreg.all_doctors(load_registry()[0]) if d != dreg.PLACEHOLDER]
+        except Exception:
+            _hist_valid = [d for d in doctors if d != "Recupero"]
+        render_admin_history_page(_hist_valid)
+        st.stop()
 
     # ── Ramo Festivi ──────────────────────────────────────────────────────
     if mode == "🎄 Admin — Festivi":
         _active_for_fest = list(doctors)
-        try:
-            _pc_f, _ = load_pool_config_from_github_st()
-            if _pc_f:
-                _active_for_fest = sorted(
-                    (d for d, dc in (_pc_f.get("doctors") or {}).items() if dc.get("active", True)),
-                    key=lambda s: (s == "Recupero", s.lower()),
-                )
-        except Exception:
-            pass
         render_admin_festivi_page(cfg_admin, _active_for_fest)
         st.stop()
 
@@ -4820,543 +4670,9 @@ else:
         with st.expander("🗂️ Gestione admin indisponibilità / preferenze", expanded=False):
             render_admin_doctor_data_editor(doctors, date.today().year, date.today().month)
 
-        # ── Gestione Pool Medici ──────────────────────────────────────────
-        with st.expander("🩺 Gestione Pool Medici", expanded=False):
-            _pool_cfg_loaded, _pool_cfg_sha = load_pool_config_from_github_st()
-            _pool_cfg_exists = bool(_pool_cfg_loaded)
+        st.info("Medici, servizi, quote e regole personali si gestiscono nella pagina **👩‍⚕️ Admin — Medici**.", icon="👩‍⚕️")
 
-            if not _pool_cfg_exists:
-                st.warning("Nessuna configurazione pool trovata su GitHub. Inizializza dal YAML attuale per cominciare.", icon="⚠️")
-                if st.button("🔧 Inizializza da YAML attuale", key="btn_init_pool_cfg"):
-                    import pool_config_store as _pcs_init
-                    _migrated = _pcs_init.migrate_from_yaml(cfg_admin)
-                    _ok, _msg = save_pool_config_with_retry(_migrated, None)
-                    if _ok:
-                        st.success("Configurazione pool inizializzata dal YAML. Ricarica la pagina per modificarla.", icon="✅")
-                        st.rerun()
-                    else:
-                        st.error(_msg)
-            else:
-                _pool_draft_key = "pool_cfg_draft"
-                if _pool_draft_key not in st.session_state:
-                    import copy as _copy_pool
-                    st.session_state[_pool_draft_key] = _copy_pool.deepcopy(_pool_cfg_loaded)
-
-                _draft = st.session_state[_pool_draft_key]
-                _draft_doctors: dict = _draft.get("doctors", {})
-                _LIBRE_COLS = {"AD", "AE", "AF", "AG"}
-                # AA copia automaticamente K+T; AC è sempre Migliorato (fixed) — non esporre nella GUI
-                _AUTO_COLS = {"AA", "AC"}
-                _all_cols = sorted(k for k in cfg_admin.get("columns", {}).keys() if k not in _LIBRE_COLS and k not in _AUTO_COLS)
-                _all_docs_list = sorted(_draft_doctors.keys(), key=lambda s: (s == "Recupero", s.lower()))
-
-                import pool_config_store as _pcs_ui
-                _tab_med, _tab_col, _tab_lim, _tab_serv = st.tabs(
-                    ["👨‍⚕️ Medici", "📋 Colonne", "⚖️ Limiti", "🔗 Servizi"]
-                )
-
-                with _tab_med:
-                    st.markdown("**Stato e flag per ogni medico** — aggiungi righe con ＋, elimina con ✕")
-                    import pandas as _pd_pool
-                    try:
-                        _contacts_now = load_doctor_contacts_from_github()
-                    except Exception:
-                        _contacts_now = {}
-                    _med_rows = []
-                    for _dname in _all_docs_list:
-                        _dc = _draft_doctors[_dname]
-                        _med_rows.append({
-                            "Medico": _dname,
-                            "Attivo": bool(_dc.get("active", True)),
-                            "Reperibilità": not bool(_dc.get("excluded_from_reperibilita", False)),
-                            "No sabato diurno": bool(_dc.get("exclude_saturday_day", False)),
-                            "Festivi diurni": bool(_dc.get("festivi_diurni", True)),
-                            "Festivi notti": bool(_dc.get("festivi_notti", True)),
-                            "Universitario": bool(_dc.get("university_doctor")),
-                            "Email": str((_contacts_now.get(_dname) or {}).get("email") or ""),
-                        })
-                    _med_df = _pd_pool.DataFrame(_med_rows)
-                    _edited_med = st.data_editor(
-                        _med_df,
-                        column_config={
-                            "Medico": st.column_config.TextColumn("Medico", help="Cognome esatto (maiuscola iniziale)"),
-                            "Attivo": st.column_config.CheckboxColumn("Attivo"),
-                            "Reperibilità": st.column_config.CheckboxColumn("Reperibilità C"),
-                            "No sabato diurno": st.column_config.CheckboxColumn("No sabato mattina/pomeriggio"),
-                            "Festivi diurni": st.column_config.CheckboxColumn("Festivi diurni"),
-                            "Festivi notti": st.column_config.CheckboxColumn("Festivi notti"),
-                            "Universitario": st.column_config.CheckboxColumn("Universitario"),
-                            "Email": st.column_config.TextColumn(
-                                "Email", disabled=True,
-                                help="Riceve codici PIN e mail di resoconto. Si modifica nel riquadro qui sotto.",
-                            ),
-                        },
-                        hide_index=True,
-                        width="stretch",
-                        key="pool_med_editor",
-                        num_rows="dynamic",
-                    )
-                    _edited_names: set[str] = set()
-                    for _, _row in _edited_med.iterrows():
-                        _dn = (_row.get("Medico") or "").strip()
-                        if not _dn:
-                            continue
-                        _edited_names.add(_dn)
-                        if _dn not in _draft_doctors:
-                            _draft_doctors[_dn] = {
-                                "active": True, "columns": [],
-                                "festivi_diurni": True, "festivi_notti": True,
-                                "exclude_saturday_day": False,
-                                "excluded_from_reperibilita": False,
-                                "university_doctor": None, "column_overrides": {},
-                                "email": None,
-                            }
-                        _draft_doctors[_dn]["active"] = bool(_row["Attivo"])
-                        _draft_doctors[_dn]["excluded_from_reperibilita"] = not bool(_row["Reperibilità"])
-                        _draft_doctors[_dn]["exclude_saturday_day"] = bool(_row["No sabato diurno"])
-                        _draft_doctors[_dn]["festivi_diurni"] = bool(_row["Festivi diurni"])
-                        _draft_doctors[_dn]["festivi_notti"] = bool(_row["Festivi notti"])
-                        _is_uni = bool(_row["Universitario"])
-                        if _is_uni:
-                            _draft_doctors[_dn]["university_doctor"] = {"ratio": 0.6}
-                        else:
-                            _draft_doctors[_dn]["university_doctor"] = None
-                    for _dn_old in list(_draft_doctors.keys()):
-                        if _dn_old not in _edited_names:
-                            del _draft_doctors[_dn_old]
-
-                    st.markdown("**✉️ Email del medico** — riceve i codici PIN e la mail di resoconto dopo ogni invio")
-                    _no_email = [
-                        _d for _d in _all_docs_list
-                        if _draft_doctors[_d].get("active", True) and not (_contacts_now.get(_d) or {}).get("email")
-                    ]
-                    if _no_email:
-                        st.warning(
-                            "Senza email (niente mail di resoconto né codici PIN via mail): " + ", ".join(_no_email),
-                            icon="⚠️",
-                        )
-                    _ce1, _ce2, _ce3 = st.columns([2, 3, 1], vertical_alignment="bottom")
-                    with _ce1:
-                        _c_doc = st.selectbox("Medico", _all_docs_list, key="contact_doctor")
-                    with _ce2:
-                        _c_email = st.text_input(
-                            "Email",
-                            value=str((_contacts_now.get(_c_doc) or {}).get("email") or ""),
-                            key=f"contact_email::{_c_doc}",
-                            placeholder="nome@esempio.it (vuoto = nessuna email)",
-                        )
-                    with _ce3:
-                        _c_save = st.button("💾 Salva email", key="contact_save", width="stretch")
-                    if _c_save and _c_doc:
-                        try:
-                            save_doctor_email(_c_doc, _c_email)
-                            st.session_state["_cfg_flash"] = (
-                                "success",
-                                f"Email di {_c_doc} aggiornata: {_mask_email(_c_email.strip())}"
-                                if _c_email.strip() else f"Email di {_c_doc} rimossa.",
-                            )
-                            st.session_state.pop(f"contact_email::{_c_doc}", None)
-                            st.rerun()
-                        except ValueError as _ce:
-                            st.error(f"{_ce}: niente è stato salvato.")
-                        except Exception as _ce:
-                            st.error(f"Email non salvata ({type(_ce).__name__}: {_ce}).")
-
-                    st.divider()
-                    with st.expander("📌 Vincoli strutturali fissi (sola lettura — modificabili solo da YAML)", expanded=False):
-                        st.info(
-                            "Questi vincoli sono hardcoded nel YAML e non modificabili da questa GUI:\n\n"
-                            "- **Cimino** esatto 2 turni U al mese\n"
-                            "- **Crea** unico medico per i sabati AB (2/mese)\n"
-                            "- **Allegra** vincolo lunedì V+U (stessa giornata)\n"
-                            "- **De Gregorio** max 3 giorni feriali su I\n"
-                            "- **Grimaldi e Calabrò** esenti dal vincolo 'min 2 weekend liberi/mese'\n"
-                            "- **Pugliatti** fisso martedì su W",
-                            icon="🔒",
-                        )
-
-                with _tab_col:
-                    _sel_doc = st.selectbox("Seleziona medico", _all_docs_list, key="pool_col_doc_sel")
-                    if _sel_doc and _sel_doc in _draft_doctors:
-                        _doc_cols = set(_draft_doctors[_sel_doc].get("columns") or [])
-                        st.markdown(f"**Colonne assegnate a {_sel_doc}** — clicca per aggiungere/rimuovere")
-                        _col_names = cfg_admin.get("columns", {})
-                        _cols_per_row = 4
-                        _col_items = sorted(_col_names.items())
-                        for _ci in range(0, len(_col_items), _cols_per_row):
-                            _chunk = _col_items[_ci:_ci + _cols_per_row]
-                            _gcols = st.columns(len(_chunk))
-                            for _gci, ((_col_letter, _col_name), _gc) in enumerate(zip(_chunk, _gcols)):
-                                _is_on = _col_letter in _doc_cols
-                                _locked = _col_letter == "C"
-                                if _locked:
-                                    _gc.markdown(f"{'🔵' if _is_on else '⚫'} **{_col_letter}** — {_col_name}  \n*(C gestita da Reperibilità)*")
-                                else:
-                                    if _gc.checkbox(f"{_col_letter} · {_col_name}", value=_is_on,
-                                                    key=f"pool_col_{_sel_doc}_{_col_letter}"):
-                                        _doc_cols.add(_col_letter)
-                                    else:
-                                        _doc_cols.discard(_col_letter)
-                        _draft_doctors[_sel_doc]["columns"] = sorted(_doc_cols)
-
-                with _tab_lim:
-                    st.markdown("**Impostazioni globali per colonna**")
-                    _col_settings: dict = _draft.setdefault("column_settings", {})
-                    _cs_rows = []
-                    for _cl in _all_cols:
-                        _cs = _col_settings.get(_cl) or {}
-                        _cs_rows.append({
-                            "Colonna": _cl,
-                            "Nome": (cfg_admin.get("columns") or {}).get(_cl, ""),
-                            "Target mensile": _cs.get("monthly_target"),
-                            "Spacing min (gg)": int(_cs.get("spacing_min_days", 0) or 0),
-                            "Spacing pref (gg)": int(_cs.get("spacing_preferred_days", 0) or 0),
-                            "Conta come": int(_cs.get("counts_as", 1) if _cl != "C" else 0),
-                        })
-                    _cs_df = _pd_pool.DataFrame(_cs_rows)
-                    _edited_cs = st.data_editor(
-                        _cs_df,
-                        column_config={
-                            "Colonna": st.column_config.TextColumn("Col", disabled=True),
-                            "Nome": st.column_config.TextColumn("Nome", disabled=True),
-                            "Target mensile": st.column_config.NumberColumn("Target", min_value=0, max_value=31, step=1),
-                            "Spacing min (gg)": st.column_config.NumberColumn("Spacing min", min_value=0, max_value=30, step=1),
-                            "Spacing pref (gg)": st.column_config.NumberColumn("Spacing pref", min_value=0, max_value=30, step=1, help="Solo per J — soft preference"),
-                            "Conta come": st.column_config.NumberColumn("Conta come", min_value=0, max_value=4, step=1, help="C=0 (bloccato), J=2, altri=1"),
-                        },
-                        hide_index=True, width="stretch", key="pool_cs_editor", num_rows="fixed",
-                    )
-                    for _, _row in _edited_cs.iterrows():
-                        _cl = _row["Colonna"]
-                        _csd = _col_settings.setdefault(_cl, {})
-                        _mt = _row["Target mensile"]
-                        _csd["monthly_target"] = int(_mt) if _mt is not None and not _pd_pool.isna(_mt) else None
-                        _csd["spacing_min_days"] = int(_row["Spacing min (gg)"] or 0)
-                        _csd["spacing_preferred_days"] = int(_row["Spacing pref (gg)"] or 0)
-                        _csd["counts_as"] = 0 if _cl == "C" else int(_row["Conta come"] or 1)
-
-                    st.divider()
-                    st.markdown("**Override quota per singolo medico**")
-                    _ov_rows = []
-                    for _dname, _dc in _draft_doctors.items():
-                        for _col, _ov in (_dc.get("column_overrides") or {}).items():
-                            if not isinstance(_ov, dict):
-                                continue
-                            _ov_rows.append({
-                                "Medico": _dname, "Colonna": _col,
-                                "Quota mensile": _ov.get("monthly_quota"),
-                                "Tipo": _ov.get("quota_type", "fixed"),
-                                "Notti weekend": _ov.get("weekend_nights", True) if _col == "J" else None,
-                            })
-                    _ov_df = _pd_pool.DataFrame(_ov_rows) if _ov_rows else _pd_pool.DataFrame(
-                        columns=["Medico", "Colonna", "Quota mensile", "Tipo", "Notti weekend"]
-                    )
-                    _edited_ov = st.data_editor(
-                        _ov_df,
-                        column_config={
-                            "Medico": st.column_config.SelectboxColumn("Medico", options=_all_docs_list),
-                            "Colonna": st.column_config.SelectboxColumn("Colonna", options=_all_cols),
-                            "Quota mensile": st.column_config.NumberColumn("Quota", min_value=0, max_value=31),
-                            "Tipo": st.column_config.SelectboxColumn("Tipo", options=["fixed", "max", "min"]),
-                            "Notti weekend": st.column_config.CheckboxColumn("Notti weekend (J)", help="Solo per col. J"),
-                        },
-                        hide_index=True, width="stretch", key="pool_ov_editor", num_rows="dynamic",
-                    )
-                    _new_overrides: dict[str, dict] = {}
-                    for _, _row in _edited_ov.iterrows():
-                        _dname = _row.get("Medico")
-                        _col = _row.get("Colonna")
-                        if not _dname or not _col or _dname not in _draft_doctors:
-                            continue
-                        _ov_entry: dict = {}
-                        _mq = _row.get("Quota mensile")
-                        if _mq is not None and not _pd_pool.isna(_mq):
-                            _ov_entry["monthly_quota"] = int(_mq)
-                            _ov_entry["quota_type"] = str(_row.get("Tipo") or "fixed")
-                        if _col == "J":
-                            _wn = _row.get("Notti weekend")
-                            if _wn is not None and not _pd_pool.isna(_wn):
-                                _ov_entry["weekend_nights"] = bool(_wn)
-                        if _ov_entry:
-                            _new_overrides.setdefault(_dname, {})[_col] = _ov_entry
-                    for _dname in _draft_doctors:
-                        _draft_doctors[_dname]["column_overrides"] = _new_overrides.get(_dname, {})
-
-                with _tab_serv:
-                    st.markdown("**Combinazioni same-day**")
-                    _combos: list = _draft.setdefault("service_combinations", [])
-                    _combo_rows = [
-                        {
-                            "Col 1": c["columns"][0],
-                            "Col 2": c["columns"][1],
-                            "Modalità": "fallback"
-                            if tuple(sorted(str(_cc).strip().upper() for _cc in c.get("columns", []))) == ("K", "T")
-                            and c.get("mode") == "always"
-                            else c["mode"],
-                        }
-                        for c in _combos if len(c.get("columns", [])) == 2
-                    ]
-                    _combo_df = _pd_pool.DataFrame(_combo_rows) if _combo_rows else _pd_pool.DataFrame(columns=["Col 1", "Col 2", "Modalità"])
-                    _edited_combo = st.data_editor(
-                        _combo_df,
-                        column_config={
-                            "Col 1": st.column_config.SelectboxColumn("Col 1", options=_all_cols),
-                            "Col 2": st.column_config.SelectboxColumn("Col 2", options=_all_cols),
-                            "Modalità": st.column_config.SelectboxColumn("Modalità", options=["always", "fallback", "preferred"]),
-                        },
-                        hide_index=True, width="stretch", key="pool_combo_editor", num_rows="dynamic",
-                    )
-                    _new_combos = []
-                    for _, _row in _edited_combo.iterrows():
-                        _c1, _c2, _mode = _row.get("Col 1"), _row.get("Col 2"), _row.get("Modalità")
-                        if _c1 and _c2 and _mode:
-                            if tuple(sorted([str(_c1).strip().upper(), str(_c2).strip().upper()])) == ("K", "T"):
-                                _mode = "fallback"
-                            _new_combos.append({"columns": [str(_c1), str(_c2)], "same_day": True, "mode": str(_mode)})
-                    _draft["service_combinations"] = _new_combos
-
-                    st.divider()
-                    st.markdown("**Servizi indispensabili**")
-                    st.info(
-                        "Le colonne marcate come **indispensabili** hanno un fallback automatico: "
-                        "se il pool primario è esaurito (per ferie, indisponibilità, smonti notte), "
-                        "il solver può assegnare **qualsiasi medico disponibile** in quel turno. "
-                        "Il medico di emergenza riceve una penalità alta — viene usato solo se "
-                        "non esiste alternativa — ma la colonna non rimane vuota.",
-                        icon="🚨",
-                    )
-                    _critical: dict = _draft.setdefault("critical_services", {})
-                    # Colonne attualmente marcate come indispensabili (fallback=any)
-                    _curr_critical_cols = sorted(
-                        col for col, spec in _critical.items() if spec.get("fallback") == "any"
-                    )
-                    _selected_critical = st.multiselect(
-                        "Colonne indispensabili (fallback → qualsiasi medico)",
-                        options=_all_cols,
-                        default=[c for c in _curr_critical_cols if c in _all_cols],
-                        key="pool_critical_multisel",
-                        help="Seleziona le colonne che non devono mai rimanere vuote. "
-                             "D, F, H, I, J sono tipicamente indispensabili.",
-                    )
-                    # Aggiorna critical_services mantenendo eventuali fallback custom (lista medici)
-                    _new_crit: dict = {}
-                    for _col in _selected_critical:
-                        # Se aveva già un fallback custom (lista), mantienilo; altrimenti "any"
-                        _existing = _critical.get(_col, {})
-                        if isinstance(_existing.get("fallback"), list):
-                            _new_crit[_col] = _existing
-                        else:
-                            _new_crit[_col] = {"fallback": "any"}
-                    _draft["critical_services"] = _new_crit
-
-                st.divider()
-                _audit = _pcs_ui.audit_pool_config(_draft, cfg_admin)
-                with st.expander("🧪 Controllo configurazione prima del salvataggio", expanded=bool(_audit["errors"])):
-                    if _audit["errors"]:
-                        st.error("Errori bloccanti:\n\n" + "\n".join(f"- {e}" for e in _audit["errors"]))
-                    else:
-                        st.success("Nessun errore bloccante nella configurazione.")
-                    if _audit["warnings"]:
-                        st.warning("Avvisi:\n\n" + "\n".join(f"- {w}" for w in _audit["warnings"]))
-                    _pool_preview = [
-                        {
-                            "Colonna": _col,
-                            "Medici attivi nel pool": ", ".join(_docs) if _docs else "—",
-                            "N": len(_docs),
-                        }
-                        for _col, _docs in sorted((_audit.get("preview") or {}).get("column_pools", {}).items())
-                    ]
-                    if _pool_preview:
-                        st.dataframe(_pd_pool.DataFrame(_pool_preview), width="stretch", hide_index=True)
-
-                _col_save, _col_reset = st.columns([3, 1])
-                with _col_reset:
-                    if st.button("↩️ Reset draft", key="btn_pool_reset"):
-                        del st.session_state["pool_cfg_draft"]
-                        st.rerun()
-                with _col_save:
-                    if st.button("💾 Salva configurazione pool", type="primary", key="btn_pool_save"):
-                        import copy as _copy_save
-                        from datetime import datetime as _dt_save, timezone as _tz_save
-                        _to_save = _pcs_ui.normalize_pool_config(_copy_save.deepcopy(_draft))
-                        _to_save["updated_at"] = _dt_save.now(_tz_save.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-                        _to_save["updated_by"] = "admin"
-                        _errs = _pcs_ui.validate_pool_config(_to_save, cfg_admin)
-                        if _errs:
-                            st.error("Configurazione non valida:\n\n" + "\n".join(f"- {e}" for e in _errs))
-                        else:
-                            _ok_save, _msg_save = save_pool_config_with_retry(_to_save, _pool_cfg_sha)
-                            if _ok_save:
-                                del st.session_state["pool_cfg_draft"]
-                                st.session_state["_cfg_flash"] = ("success", _msg_save)
-                                st.rerun()
-                            else:
-                                st.session_state["_cfg_flash"] = ("error", _msg_save)
-                                st.rerun()
-
-        # ── Memoria storica turni ────────────────────────────────────────
-        with st.expander("📊 Memoria storica turni", expanded=False):
-            st.info(
-                "Carica i file Excel **definitivi** dei mesi precedenti per costruire "
-                "una memoria storica. Il solver userà questi dati per bilanciare le "
-                "quote tra i mesi.",
-                icon="🧠",
-            )
-            _hist_data, _hist_sha = _load_shift_history()
-
-            with st.expander("📤 Carica mese definitivo", expanded=False):
-                _hist_upload = st.file_uploader(
-                    "File Excel turni definitivo", type=["xlsx"], key="hist_upload",
-                    help="Il file Excel finale (dopo le modifiche del primario) di un mese passato.",
-                )
-                if _hist_upload is not None:
-                    if st.button("📥 Importa nel storico", key="btn_import_hist"):
-                        _tmp = Path(tempfile.gettempdir()) / f"hist_{int(time.time())}.xlsx"
-                        try:
-                            _tmp.write_bytes(_hist_upload.getvalue())
-                            _parsed = sh.parse_finalized_xlsx(str(_tmp))
-                            _ml = _parsed["month_label"]
-                            if not _ml:
-                                st.error("Impossibile determinare il mese dal file Excel.")
-                            else:
-                                _valid_docs = set(doctors) if doctors else None
-                                _ms = sh.compute_doctor_stats(_parsed, valid_doctors=_valid_docs)
-                                _last_night = []
-                                if _parsed["days"]:
-                                    _last_night = _parsed["days"][-1].get("assignments", {}).get("J", [])
-                                _ms["_meta"] = {"last_day_night_doctors": _last_night}
-                                _hist_data[_ml] = _ms
-                                if _save_shift_history(_hist_data, _hist_sha):
-                                    st.success(f"✅ Mese **{_ml}** importato ({len(_parsed['days'])} giorni)")
-                                    st.rerun()
-                        except Exception as _e:
-                            st.error(f"Errore parsing: {_e}")
-                        finally:
-                            if _tmp.exists():
-                                _tmp.unlink()
-
-            _gen_hist_data = {}
-            _gen_hist_error = None
-            try:
-                _gen_mem_hist, _ = load_generation_memory_from_github_st()
-                _gen_hist_data = gmem.memory_to_shift_history(
-                    _gen_mem_hist,
-                    finalized_months=set((_hist_data or {}).keys()),
-                    valid_doctors=set(doctors) if doctors else None,
-                )
-            except Exception as _e:
-                _gen_hist_error = _e
-                _gen_hist_data = {}
-
-            _effective_hist_data = dict(_hist_data or {})
-            for _hmk, _hstats in (_gen_hist_data or {}).items():
-                if _hmk not in _effective_hist_data:
-                    _effective_hist_data[_hmk] = _hstats
-
-            if _gen_hist_error:
-                st.warning(f"Memoria generazioni non leggibile nella vista storica: {_gen_hist_error}")
-
-            if _effective_hist_data:
-                _sorted_months = sorted(_effective_hist_data.keys())
-                _final_months = sorted((_hist_data or {}).keys())
-                _gen_months = sorted((_gen_hist_data or {}).keys())
-                if _final_months:
-                    st.caption(f"Mesi definitivi importati: {', '.join(_final_months)}")
-                if _gen_months:
-                    st.caption(
-                        "Mesi provvisori da generazioni attive: "
-                        + ", ".join(_gen_months)
-                        + " (ignorati automaticamente se esiste il definitivo dello stesso mese)"
-                    )
-                _agg_hist = sh.aggregate_multi_month(_effective_hist_data)
-
-                with st.expander("📋 Tabella riepilogativa", expanded=True):
-                    _tab_cum, _tab_mese = st.tabs(["Cumulativo", "Per mese"])
-                    with _tab_cum:
-                        _rows_hist = []
-                        for _doc in sorted(_agg_hist.keys()):
-                            _ds = _agg_hist[_doc]
-                            _j = _ds.get("J", {}); _c = _ds.get("C", {})
-                            _h = _ds.get("H", {}); _i = _ds.get("I", {})
-                            _rows_hist.append({
-                                "Medico": _doc, "Mesi": _ds.get("_months_counted", 0),
-                                "Notti (J)": _j.get("total", 0) if isinstance(_j, dict) else 0,
-                                "Notti Sab": _j.get("sabati", 0) if isinstance(_j, dict) else 0,
-                                "Notti Dom": _j.get("domeniche", 0) if isinstance(_j, dict) else 0,
-                                "Reperibilità (C)": _c.get("total", 0) if isinstance(_c, dict) else 0,
-                                "Festivi (D/E/H/I)": _ds.get("_festivi_DE_HI", 0),
-                                "Domeniche": _ds.get("_domeniche", 0), "Sabati": _ds.get("_sabati", 0),
-                                "H pom. (fer.)": _h.get("feriali", 0) if isinstance(_h, dict) else 0,
-                                "I pom. (fer.)": _i.get("feriali", 0) if isinstance(_i, dict) else 0,
-                            })
-                        _df_hist = pd.DataFrame(_rows_hist)
-                        st.dataframe(_df_hist, width="stretch", hide_index=True)
-                    with _tab_mese:
-                        _sel_mese = st.selectbox("Mese", _sorted_months, key="hist_tab_mese", index=len(_sorted_months)-1)
-                        _ms_sel = _effective_hist_data[_sel_mese]
-                        _src = "definitivo" if _sel_mese in (_hist_data or {}) else "generazione attiva"
-                        st.caption(f"Origine mese: **{_src}**")
-                        _rows_mese = []
-                        for _doc in sorted(k for k in _ms_sel.keys() if k != "_meta"):
-                            _ds = _ms_sel[_doc]
-                            _j = _ds.get("J", {}); _c = _ds.get("C", {})
-                            _h = _ds.get("H", {}); _i = _ds.get("I", {})
-                            _rows_mese.append({
-                                "Medico": _doc,
-                                "Notti (J)": _j.get("total", 0) if isinstance(_j, dict) else 0,
-                                "Notti Sab": _j.get("sabati", 0) if isinstance(_j, dict) else 0,
-                                "Notti Dom": _j.get("domeniche", 0) if isinstance(_j, dict) else 0,
-                                "Reperibilità (C)": _c.get("total", 0) if isinstance(_c, dict) else 0,
-                                "Festivi (D/E/H/I)": _ds.get("_festivi_DE_HI", 0),
-                                "Domeniche": _ds.get("_domeniche", 0), "Sabati": _ds.get("_sabati", 0),
-                                "H pom. (fer.)": _h.get("feriali", 0) if isinstance(_h, dict) else 0,
-                                "I pom. (fer.)": _i.get("feriali", 0) if isinstance(_i, dict) else 0,
-                            })
-                        st.dataframe(pd.DataFrame(_rows_mese), width="stretch", hide_index=True)
-
-                with st.expander("📈 Grafici", expanded=False):
-                    if _rows_hist:
-                        _graf_scelta = st.selectbox("Grafico", [
-                            "Notti totali (cumulativo)", "Notti: feriali / sabato / domenica (cumulativo)",
-                            "Domeniche lavorate (cumulativo)", "Reperibilità (cumulativo)",
-                            "Evoluzione notti mese per mese",
-                        ], key="hist_graf_sel")
-                        if _graf_scelta == "Notti totali (cumulativo)":
-                            _fig = px.bar(_df_hist, x="Medico", y="Notti (J)", title="Notti totali per medico (cumulativo)", color="Notti (J)", color_continuous_scale="Reds")
-                            _fig.update_layout(xaxis_tickangle=-45, height=400); st.plotly_chart(_fig, width="stretch")
-                        elif _graf_scelta == "Notti: feriali / sabato / domenica (cumulativo)":
-                            _df_j2 = pd.DataFrame([{"Medico": r["Medico"], "Feriali": r["Notti (J)"]-r["Notti Sab"]-r["Notti Dom"], "Sabato": r["Notti Sab"], "Domenica": r["Notti Dom"]} for r in _rows_hist])
-                            _fig = px.bar(_df_j2, x="Medico", y=["Feriali","Sabato","Domenica"], title="Notti: distribuzione feriali/sabato/domenica", barmode="stack")
-                            _fig.update_layout(xaxis_tickangle=-45, height=400); st.plotly_chart(_fig, width="stretch")
-                        elif _graf_scelta == "Domeniche lavorate (cumulativo)":
-                            _fig = px.bar(_df_hist, x="Medico", y="Domeniche", title="Domeniche lavorate per medico (cumulativo)", color="Domeniche", color_continuous_scale="Blues")
-                            _fig.update_layout(xaxis_tickangle=-45, height=400); st.plotly_chart(_fig, width="stretch")
-                        elif _graf_scelta == "Reperibilità (cumulativo)":
-                            _fig = px.bar(_df_hist, x="Medico", y="Reperibilità (C)", title="Reperibilità per medico (cumulativo)", color="Reperibilità (C)", color_continuous_scale="Greens")
-                            _fig.update_layout(xaxis_tickangle=-45, height=400); st.plotly_chart(_fig, width="stretch")
-                        elif _graf_scelta == "Evoluzione notti mese per mese":
-                            if len(_sorted_months) > 1:
-                                _evo = []
-                                for _ml2 in _sorted_months:
-                                    for _doc2, _ds2 in _effective_hist_data[_ml2].items():
-                                        if _doc2 == "_meta": continue
-                                        _j2 = _ds2.get("J", {})
-                                        _evo.append({"Mese": _ml2, "Medico": _doc2, "Notti": _j2.get("total", 0) if isinstance(_j2, dict) else 0})
-                                _fig = px.line(pd.DataFrame(_evo), x="Mese", y="Notti", color="Medico", title="Evoluzione notti per medico", markers=True)
-                                _fig.update_layout(height=400); st.plotly_chart(_fig, width="stretch")
-                            else:
-                                st.info("Servono almeno 2 mesi per il grafico di evoluzione.")
-
-                if _final_months:
-                    with st.expander("🗑️ Rimuovi mese definitivo dallo storico", expanded=False):
-                        _month_del = st.selectbox("Seleziona mese definitivo da rimuovere", _final_months, key="hist_del")
-                        if st.button("Rimuovi", key="btn_del_hist"):
-                            if _month_del in _hist_data:
-                                del _hist_data[_month_del]
-                                if _save_shift_history(_hist_data, _hist_sha):
-                                    st.success(f"Mese {_month_del} rimosso."); st.rerun()
-            else:
-                st.caption("Nessun mese caricato nella memoria storica.")
+        st.info("I turni definitivi per il bilanciamento si caricano nella pagina **📊 Admin — Storico turni**.", icon="📊")
 
         # ── Contatore turni universitari ──────────────────────────────────
         with st.expander("🎓 Contatore turni universitari", expanded=False):

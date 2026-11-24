@@ -229,6 +229,15 @@ def put_file(
     if sha:
         payload["sha"] = sha
     r = request("PUT", url, headers=_headers(token), json=payload, timeout=timeout_s, max_wait=max_wait, write=True)
+    if r.status_code in (409, 412, 422):
+        # A lost response after a successful commit makes the retry look like a
+        # conflict. If the file already holds exactly this text, it is saved.
+        try:
+            current = get_file(owner, repo, path, token, branch, timeout_s=timeout_s, max_wait=max_wait)
+        except Exception:
+            current = None
+        if current is not None and current.text == text:
+            return {"content": {"sha": current.sha, "path": path}, "already_saved": True}
     _raise_for_status(r)
     try:
         return r.json()

@@ -8,12 +8,17 @@ import openpyxl
 
 import generation_memory as gm
 from pool_config_store import audit_pool_config, normalize_pool_config
+import doctor_registry as _dr
+
+
+def _cards_cfg(cfg_yaml, pool_cfg):
+    """Solver cfg from the doctor cards migrated from an old pool_config."""
+    return _dr.to_solver_cfg(cfg_yaml, _dr.migrate(pool_cfg, cfg_yaml))
 from turni_generator import (
     DayRow,
     Slot,
     _repair_heavy_festive_assignments,
     assign_reperibilita_C,
-    apply_pool_config,
     create_period_template_xlsx,
     load_template_days,
     solve_across_months,
@@ -109,7 +114,9 @@ class SolverRegressionTests(unittest.TestCase):
 
     def test_fixed_v_on_double_day_targets_one_slot(self):
         cfg = {
-            "rules": {"V": {"pool": ["Crea", "Dattilo", "Allegra"]}},
+            "rules": {"V": {"pool": ["Crea", "Dattilo", "Allegra"],
+                            "friday_required_doctor": "Crea",       # scheda: titolare doppio
+                            "double_partners": ["Dattilo", "Allegra"]}},  # scheda: secondo
             "global_constraints": {},
         }
         day = DayRow(dt.date(2026, 11, 6), "Fri", 2)
@@ -502,7 +509,7 @@ class SolverRegressionTests(unittest.TestCase):
             },
         }
 
-        merged = apply_pool_config(cfg_yaml, pool_cfg)
+        merged = _cards_cfg(cfg_yaml, pool_cfg)
 
         self.assertEqual(merged["rules"]["D_F"]["allowed"], [])
 
@@ -536,7 +543,7 @@ class SolverRegressionTests(unittest.TestCase):
             },
         }
 
-        merged = apply_pool_config(cfg_yaml, pool_cfg)
+        merged = _cards_cfg(cfg_yaml, pool_cfg)
 
         self.assertEqual(merged["rules"]["D_F"]["allowed"], ["Grimaldi"])
 
@@ -592,7 +599,9 @@ class SolverRegressionTests(unittest.TestCase):
         self.assertEqual(d_docs, f_docs)
         self.assertEqual(len(set(d_docs)), 1)
 
-    def test_df_fallback_uses_h_pool_before_any_available_doctor(self):
+    def test_df_fallback_uses_reserve_preferring_h_pool(self):
+        # Coppia D/F assente: la copre chi ha D/F "di riserva" nella scheda,
+        # preferendo chi è nel pool H. Chi non ha D/F nella scheda non entra.
         cfg = {
             "rules": {
                 "D_F": {
@@ -600,9 +609,10 @@ class SolverRegressionTests(unittest.TestCase):
                     "days": "Mon-Sat",
                 },
                 "H": {"pool_mon_fri": ["Rubino"]},
-                "J": {"pool_other": ["Dattilo"]},
+                "J": {"pool_other": ["Dattilo", "Trio"]},
             },
             "global_constraints": {},
+            "reserve_pools": {"D": ["Rubino", "Dattilo"], "F": ["Rubino", "Dattilo"]},
         }
         day = DayRow(dt.date(2026, 8, 3), "Mon", 2)
         unav = {
@@ -1401,7 +1411,7 @@ class SolverRegressionTests(unittest.TestCase):
             "column_settings": {"K": {"monthly_target": 1, "counts_as": 1}},
         }
 
-        merged = apply_pool_config(cfg_yaml, pool_cfg)
+        merged = _cards_cfg(cfg_yaml, pool_cfg)
 
         self.assertEqual(merged["pool_monthly_targets"]["K"], 1)
 
@@ -1428,7 +1438,7 @@ class SolverRegressionTests(unittest.TestCase):
             },
         }
 
-        merged = apply_pool_config(cfg_yaml, pool_cfg)
+        merged = _cards_cfg(cfg_yaml, pool_cfg)
 
         self.assertEqual(merged["pool_saturday_day_excluded"], {"A"})
 
@@ -1617,6 +1627,77 @@ class SolverRegressionTests(unittest.TestCase):
 
         self.assertTrue(all(assignment.get(f"{d.date}-C") for d in days))
         self.assertIn("OK", diag["C_reperibilita_diag"]["status"])
+
+    def _c_case(self, allowed_by_day, assignment, historical_stats=None, spacing=0):
+        cfg = {"rules": {"C_reperibilita": {"min_per_doctor": 0, "max_per_doctor": 5, "target_per_doctor": 0,
+                                            "spacing_min_days": spacing, "excluded": [], "constraints": []}},
+               "global_constraints": {}}
+        names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        days, slots = [], []
+        for i, docs in enumerate(allowed_by_day):
+            d = DayRow(dt.date(2026, 8, 3) + dt.timedelta(days=i), names[i % 7], i + 2)
+            days.append(d)
+            slots.append(Slot(d, f"{d.date}-C", ["C"], list(docs), required=True, shift="Any", rule_tag="C_reperibilita"))
+            slots.append(Slot(d, f"{d.date}-J", ["J"], list(docs), required=True, shift="Notte", rule_tag="J"))
+        return assign_reperibilita_C(cfg, days, slots, dict(assignment), historical_stats=historical_stats)
+
+    def test_reperibilita_relaxes_night_distance_before_back_to_back_days(self):
+        # 2-3-4/1/2027: Rubino tre reperibilità di fila con Licordari libero.
+        # B ha la notte il 6/8: a ±2 giorni non andrebbe il 4 e il 5, a ±1 solo il 5.
+        assignment, _ = self._c_case([["A", "B"]] * 3, {"2026-08-06-J": "B"}, spacing=3)
+        got = [assignment[f"2026-08-0{d}-C"] for d in (3, 4, 5)]
+        for x, y in zip(got, got[1:]):
+            self.assertNotEqual(x, y, got)
+
+    def test_reperibilita_never_the_day_after_own_night(self):
+        # 3/12/2026: Cusmà notte il 2, reperibilità il 3 (il rilassamento "a 0 giorni").
+        assignment, diag = self._c_case([["A", "B"], ["A"]], {"2026-08-03-J": "A"})
+
+        self.assertIsNone(assignment["2026-08-04-C"], "meglio vuota (gialla) che il giorno dopo la notte")
+        self.assertIn("2026-08-04", " ".join(diag["C_reperibilita_diag"].get("relaxation_warnings", [])))
+
+    def test_reperibilita_extra_turn_goes_to_who_did_fewer_in_the_definitive_history(self):
+        hist = {"A": {"C": {"total": 9}, "_months_counted": 3}, "B": {"C": {"total": 3}, "_months_counted": 3}}
+        assignment, _ = self._c_case([["A", "B"]] * 3, {}, historical_stats=hist)
+        got = [assignment[f"2026-08-0{d}-C"] for d in (3, 4, 5)]
+        self.assertEqual(got.count("B"), 2)
+        self.assertEqual(got.count("A"), 1)
+
+    def test_history_targets_even_out_definitive_shifts(self):
+        import turni_generator as tg
+        hist = {"A": {"J": {"total": 10}, "_months_counted": 5},
+                "B": {"J": {"total": 2}, "_months_counted": 5},
+                "Nuovo": {"_months_counted": 0}}
+        t = tg.history_fair_targets(hist, "J", {"A": 10, "B": 10, "Nuovo": 10}, n_period=9)
+        self.assertGreater(t["B"], t["A"])
+        self.assertGreaterEqual(sum(t.values()), 9)
+        # chi non ha storico vale la media del gruppo, non zero (non deve fare tutto lui)
+        self.assertLess(t["Nuovo"], t["B"])
+        self.assertGreater(t["Nuovo"], t["A"])
+        # storico per mese di presenza: arrivato da 1 mese con 1 notte = come chi ne ha 5 in 5 mesi
+        even = tg.history_fair_targets(
+            {"X": {"J": {"total": 5}, "_months_counted": 5}, "Y": {"J": {"total": 1}, "_months_counted": 1}},
+            "J", {"X": 10, "Y": 10}, n_period=4)
+        self.assertEqual(even["X"], even["Y"])
+
+    def test_solver_gives_the_extra_night_to_who_did_fewer_in_history(self):
+        cfg = {"rules": {"J": {"pool_other": ["A", "B"]}}, "global_constraints": {"night_spacing_days_min": 0}}
+        days = [DayRow(dt.date(2026, 8, 3) + dt.timedelta(days=i), ["Mon", "Tue", "Wed"][i], i + 2) for i in range(3)]
+        slots = [Slot(d, f"{d.date}-J", ["J"], ["A", "B"], required=True, shift="Notte", rule_tag="J") for d in days]
+        for who_did_fewer in ("A", "B"):
+            other = "B" if who_did_fewer == "A" else "A"
+            hist = {who_did_fewer: {"J": {"total": 2}, "_months_counted": 4},
+                    other: {"J": {"total": 12}, "_months_counted": 4}}
+            assignment, _ = solve_with_ortools(cfg, days, slots, historical_stats=hist)
+            got = [assignment[s.slot_id] for s in slots]
+            self.assertEqual(got.count(who_did_fewer), 2, got)
+
+    def test_reperibilita_newcomer_without_history_is_not_first_for_extras(self):
+        hist = {"A": {"C": {"total": 9}, "_months_counted": 3}, "B": {"C": {"total": 3}, "_months_counted": 3}}
+        assignment, _ = self._c_case([["A", "B", "Nuovo"]] * 5, {}, historical_stats=hist)
+        got = [assignment[f"2026-08-0{d}-C"] for d in (3, 4, 5, 6, 7)]
+        self.assertGreaterEqual(got.count("B"), got.count("Nuovo"))
+        self.assertGreaterEqual(got.count("Nuovo"), got.count("A"))
 
     def test_reperibilita_c_desired_distribution_is_not_a_hard_cap(self):
         docs = ["A", "B", "C"]

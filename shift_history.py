@@ -464,8 +464,8 @@ def aggregate_multi_month(all_months: dict[str, dict]) -> dict:
         if not month_label or not isinstance(month_stats, dict):
             continue
         for doc, ds in month_stats.items():
-            if doc == "_meta":
-                continue
+            if str(doc).startswith("_"):
+                continue  # _meta, _days: not doctors
             if doc not in agg:
                 agg[doc] = {
                     "_festivi_DE_HI": 0,
@@ -490,6 +490,51 @@ def aggregate_multi_month(all_months: dict[str, dict]) -> dict:
                         ad[key][subkey] = ad[key].get(subkey, 0) + subval
 
     return agg
+
+
+# ── 3b. Caricamento per giorno (file a cavallo di due mesi, mesi parziali) ──
+
+def split_by_month(parsed: dict) -> dict[str, list[dict]]:
+    """Days of a definitive file grouped by calendar month ("2026-12": [...])."""
+    out: dict[str, list[dict]] = {}
+    for d in parsed.get("days") or []:
+        out.setdefault(str(d["date"])[:7], []).append(d)
+    return out
+
+
+def merge_upload(history: dict, parsed: dict, valid_doctors: set[str] | None = None) -> tuple[dict, list[str]]:
+    """Add a definitive file to the history, day by day.
+
+    Each month keeps its days (`_days`); a new upload replaces only the days it
+    contains, so a file 1/12-7/1 followed by the January file does not count
+    1-7 January twice, and the stats are always recomputed from the days.
+    """
+    history = dict(history or {})
+    months = []
+    for mk, new_days in sorted(split_by_month(parsed).items()):
+        entry = history.get(mk) or {}
+        days = dict(entry.get("_days") or {})
+        for d in new_days:
+            days[d["date"]] = {"dow": d["dow"], "is_holiday": d["is_holiday"], "assignments": d["assignments"]}
+        ordered = [{"date": k, **v} for k, v in sorted(days.items())]
+        stats = compute_doctor_stats({"days": ordered}, valid_doctors=valid_doctors)
+        stats["_days"] = days
+        stats["_meta"] = {
+            "last_day_night_doctors": list((ordered[-1]["assignments"] or {}).get("J", [])) if ordered else [],
+            "days_loaded": len(ordered),
+        }
+        history[mk] = stats
+        months.append(mk)
+    return history, months
+
+
+def night_doctors_on(history: dict, date_iso: str) -> list[str]:
+    """Who did the night J on a given day according to the definitive shifts."""
+    entry = (history or {}).get(str(date_iso)[:7]) or {}
+    day = (entry.get("_days") or {}).get(str(date_iso))
+    if day:
+        return list((day.get("assignments") or {}).get("J", []))
+    return []
 
 
 # ── 4. Serializzazione ────────────────────────────────────────────────────

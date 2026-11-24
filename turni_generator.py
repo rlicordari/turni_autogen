@@ -387,7 +387,8 @@ class Slot:
 
 def assign_reperibilita_C(cfg: dict, days: List[DayRow], slots: List[Slot],
                          assignment: Dict[str, Optional[str]],
-                         fixed_assignments: Optional[List[dict]] = None) -> Tuple[Dict[str, Optional[str]], Dict]:
+                         fixed_assignments: Optional[List[dict]] = None,
+                         historical_stats: Optional[dict] = None) -> Tuple[Dict[str, Optional[str]], Dict]:
     """Assign/Reassign Reperibilità (column C) as a final layer (STRICT).
 
     HARD rules (no automatic relaxation):
@@ -564,8 +565,11 @@ def assign_reperibilita_C(cfg: dict, days: List[DayRow], slots: List[Slot],
                     continue
                 if doc not in set(allowed_norm_by_date.get(d, [])):
                     continue
-                # not_night_same_day sempre attivo
+                # Mai la reperibilità il giorno della propria notte né il giorno
+                # dopo (smonto): queste due regole non si rilassano mai.
                 if assignment.get(f"{d}-{night_col}") == doc:
+                    continue
+                if assignment.get(f"{(d - dt.timedelta(days=1))}-{night_col}") == doc:
                     continue
                 # Proximity J rilassabile
                 blocked = False
@@ -586,28 +590,41 @@ def assign_reperibilita_C(cfg: dict, days: List[DayRow], slots: List[Slot],
             result[d] = cands
         return result
 
-    # Costruisci candidati con proximity progressivamente rilassata
+    # Candidati per livello di vicinanza alle notti (±2, ±1, solo smonto).
+    # Si rilassa prima la vicinanza e poi la distanza tra due reperibilità:
+    # tre reperibilità di fila allo stesso medico sono peggio di una C a due
+    # giorni da una sua notte (3/1/2027: Rubino 2-3-4 gennaio).
     _c_relaxation_warnings: List[str] = []
     candidates_by_date: Dict[dt.date, List[str]] = {}
+    _cand_levels: List[Tuple[int, Dict[dt.date, List[str]]]] = []
     for _night_prox in [2, 1, 0]:
         candidates_by_date = build_candidates_with_prox(_night_prox)
         _empty_days = [d for d in c_dates if not candidates_by_date[d]]
         if not _empty_days:
-            if _night_prox < 2:
-                _c_relaxation_warnings.append(
-                    f"C reperibilità: vincolo J proximity rilassato a ±{_night_prox} giorni "
-                    f"per trovare candidati."
-                )
-            break
+            _cand_levels.append((_night_prox, candidates_by_date))
+            continue
         if _night_prox == 0:
             # Ultimo resort: ignora del tutto la disponibilità per i giorni problematici
             for d in _empty_days:
                 fallback = ([fixed_c_by_date[d]] if d in fixed_c_by_date
                             else (list(allowed_norm_by_date.get(d, [])) or pool[:]))
+                prev_day = d - dt.timedelta(days=1)
+                fallback = [
+                    doc for doc in fallback
+                    if assignment.get(f"{d}-{night_col}") != doc
+                    and assignment.get(f"{prev_day}-{night_col}") != doc
+                ]
                 candidates_by_date[d] = fallback
-                _c_relaxation_warnings.append(
-                    f"C reperibilità: {d} senza candidati strict → usato pool completo ({len(fallback)} dottori)."
-                )
+                if fallback:
+                    _c_relaxation_warnings.append(
+                        f"C reperibilità: {d} senza candidati strict → usato pool completo ({len(fallback)} dottori)."
+                    )
+                else:
+                    _c_relaxation_warnings.append(
+                        f"C reperibilità: {d} nessun medico possibile (notte o smonto per tutti) → lasciata vuota."
+                    )
+            _cand_levels.append((0, candidates_by_date))
+    candidates_by_date = _cand_levels[0][1]
 
     total_days = len(c_dates)
     n_docs = len(pool)
@@ -634,7 +651,18 @@ def assign_reperibilita_C(cfg: dict, days: List[DayRow], slots: List[Slot],
     desired = {doc: (min_per if min_per > 0 else 0) for doc in pool}
     cur = sum(desired.values())
     remaining = total_days - cur
-    order_docs = pool[:]
+    # Chi nello storico definitivo ha fatto meno reperibilità (per mese di
+    # presenza) prende per primo quella in più.
+    # Chi non ha storico vale come la media del gruppo (non "zero", altrimenti
+    # un medico appena arrivato prenderebbe tutte le reperibilità in più).
+    _hist_c = historical_stats or {}
+    _known_rates = {}
+    for _d in pool:
+        _hc = history_counts(_hist_c, _d)
+        if _hc["months"] > 0:
+            _known_rates[_d] = _hc["C"] / _hc["months"]
+    _avg_rate = (sum(_known_rates.values()) / len(_known_rates)) if _known_rates else 0.0
+    order_docs = sorted(pool, key=lambda d: (_known_rates.get(d, _avg_rate), d.lower()))
     while remaining > 0:
         progress = False
         for doc in order_docs:
@@ -662,7 +690,8 @@ def assign_reperibilita_C(cfg: dict, days: List[DayRow], slots: List[Slot],
     def _run_dfs_attempt(sp: int) -> bool:
         _cnt = {doc: 0 for doc in pool}
         _dates_by_doc: Dict[str, List[dt.date]] = {doc: [] for doc in pool}
-        _c_dates_sorted = sorted(c_dates, key=lambda d: (len(candidates_by_date[d]), d))
+        _c_dates_sorted = sorted((d for d in c_dates if candidates_by_date[d]),
+                                 key=lambda d: (len(candidates_by_date[d]), d))
 
         def _spacing_ok(doc: str, d: dt.date) -> bool:
             if sp > 1:
@@ -706,21 +735,29 @@ def assign_reperibilita_C(cfg: dict, days: List[DayRow], slots: List[Slot],
     _spacing_tried = spacing_min
     _cap_tried = max_per
     cap_values = list(range(max_per, total_days + 1))
-    for _cap in cap_values:
-        hard_cap_by_doc = {doc: _cap for doc in pool}
-        for _sp in ([spacing_min] + list(range(spacing_min - 1, -1, -1))):
-            solved = _run_dfs_attempt(_sp)
+    for _sp in ([spacing_min] + list(range(spacing_min - 1, -1, -1))):
+        for _cap in cap_values:
+            hard_cap_by_doc = {doc: _cap for doc in pool}
+            for _prox, _cands in _cand_levels:
+                candidates_by_date = _cands
+                solved = _run_dfs_attempt(_sp)
+                if solved:
+                    _spacing_tried = _sp
+                    _cap_tried = _cap
+                    if _prox < 2:
+                        _c_relaxation_warnings.append(
+                            f"C reperibilità: vincolo J proximity rilassato a ±{_prox} giorni per trovare candidati."
+                        )
+                    if _sp < spacing_min:
+                        _c_relaxation_warnings.append(
+                            f"C reperibilità: spacing rilassato a {_sp} giorni (originale {spacing_min})."
+                        )
+                    if _cap > max_per:
+                        _c_relaxation_warnings.append(
+                            f"C reperibilità: max_per_doctor rilassato a {_cap} per compatibilità con ferie/vincoli."
+                        )
+                    break
             if solved:
-                _spacing_tried = _sp
-                _cap_tried = _cap
-                if _sp < spacing_min:
-                    _c_relaxation_warnings.append(
-                        f"C reperibilità: spacing rilassato a {_sp} giorni (originale {spacing_min})."
-                    )
-                if _cap > max_per:
-                    _c_relaxation_warnings.append(
-                        f"C reperibilità: max_per_doctor rilassato a {_cap} per compatibilità con ferie/vincoli."
-                    )
                 break
         if solved:
             break
@@ -786,228 +823,14 @@ def load_rules(path: Path) -> dict:
     return cfg
 
 
-def apply_pool_config(cfg_yaml: dict, pool_cfg: Optional[dict]) -> dict:
-    """Sovrascrive pool/quote/flag nel cfg YAML con i valori del pool_config JSON.
 
-    Se pool_cfg è None o vuoto ritorna una deep copy di cfg_yaml invariata.
-    La funzione è idempotente: applicata più volte produce lo stesso risultato.
-    """
-    import copy as _copy
-
-    cfg = _copy.deepcopy(cfg_yaml)
-    if not pool_cfg or not pool_cfg.get("doctors"):
-        return cfg
-    try:
-        from pool_config_store import normalize_pool_config as _normalize_pool_config
-        pool_cfg = _normalize_pool_config(pool_cfg)
-    except Exception:
-        pass
-
-    doctors: dict = pool_cfg.get("doctors", {})
-    col_settings: dict = pool_cfg.get("column_settings", {})
-    rules = cfg.setdefault("rules", {})
-    gc = cfg.setdefault("global_constraints", {})
-
-    # 1. active=false → absolute_exclusions
-    abs_excl: list = list(cfg.get("absolute_exclusions") or [])
-    abs_excl_set = {norm_name(x) for x in abs_excl}
-    for doc, dcfg in doctors.items():
-        if not dcfg.get("active", True) and norm_name(doc) not in abs_excl_set:
-            abs_excl.append(doc)
-            abs_excl_set.add(norm_name(doc))
-    cfg["absolute_exclusions"] = abs_excl
-
-    # Medici attivi (normalizzati)
-    active_docs = [doc for doc, dcfg in doctors.items() if dcfg.get("active", True)]
-    active_set = {norm_name(d) for d in active_docs}
-
-    # 2. Mappa colonna → pool key nel YAML (per sostituire i pool)
-    _COL_RULE: dict[str, list[tuple[str, str]]] = {
-        # (rule_key, pool_field)
-        "C":  [("C_reperibilita", None)],         # C si gestisce via excluded, non pool
-        # D/F share one solver rule, but D is the primary ward column.
-        # A doctor enabled only on F must remain a fallback/support candidate,
-        # not become part of the primary Grimaldi/Calabro pair.
-        "D":  [("D_F", "allowed")],
-        "F":  [],
-        "E":  [("E_G", "allowed")],
-        "G":  [("E_G", "allowed")],
-        "H":  [("H", "pool_mon_fri"), ("H", "distribution_pool")],
-        "I":  [("I", "distribution_pool")],
-        "J":  [("J", "pool_other")],
-        "K":  [("K", "pool")],
-        "L":  [("L", "pool_other")],
-        "Q":  [("Q", "pool")],
-        "R":  [("R", "pool")],
-        "S":  [("S", "pool")],
-        "T":  [("T", "pool")],
-        "U":  [("U", "pool")],
-        "V":  [("V", "pool")],
-        "W":  [("W", "other_days_pool")],
-        "Y":  [("Y", "other_pool")],
-        "Z":  [("Z", "pool")],
-        "AB": [("AB", "fallback_pool")],
-    }
-
-    for col, rule_targets in _COL_RULE.items():
-        if col == "C":
-            continue  # gestito separatamente al punto 5
-        new_pool = [
-            doc for doc, dcfg in doctors.items()
-            if dcfg.get("active", True) and col in (dcfg.get("columns") or [])
-        ]
-        for rule_key, pool_field in rule_targets:
-            rules.setdefault(rule_key, {})[pool_field] = new_pool
-
-    # 3. Pool festivi diurni (D/E/H/I nei giorni festivi)
-    fest_incl = [
-        doc for doc, dcfg in doctors.items()
-        if dcfg.get("active", True) and dcfg.get("festivi_diurni", True)
-    ]
-    fest_excl = [
-        doc for doc, dcfg in doctors.items()
-        if dcfg.get("active", True) and not dcfg.get("festivi_diurni", True)
-    ]
-    if fest_incl:
-        rules.setdefault("Festivi", {})["pool"] = fest_incl
-    if fest_excl:
-        rules.setdefault("Festivi", {})["excluded"] = fest_excl
-
-    # 4. Pool festivi notti (J nei giorni festivi)
-    festivi_notti_excl = [
-        doc for doc, dcfg in doctors.items()
-        if dcfg.get("active", True)
-        and "J" in (dcfg.get("columns") or [])
-        and not dcfg.get("festivi_notti", True)
-    ]
-    cfg["pool_festivi_notti_excluded"] = {norm_name(d) for d in festivi_notti_excl}
-
-    # 4b. Esclusione sabato diurno: vale per turni Mattina/Pomeriggio,
-    # non per J notte e non per C reperibilita'.
-    saturday_day_excl = [
-        doc for doc, dcfg in doctors.items()
-        if dcfg.get("active", True) and dcfg.get("exclude_saturday_day", False)
-    ]
-    cfg["pool_saturday_day_excluded"] = {norm_name(d) for d in saturday_day_excl}
-
-    # 5. Reperibilità C: sostituisce excluded list
-    c_excl = [
-        doc for doc, dcfg in doctors.items()
-        if dcfg.get("active", True) and dcfg.get("excluded_from_reperibilita", False)
-    ]
-    # Aggiungi anche i non-attivi (non assegnabili comunque ma meglio espliciti)
-    for doc, dcfg in doctors.items():
-        if not dcfg.get("active", True) and doc not in c_excl:
-            c_excl.append(doc)
-    rules.setdefault("C_reperibilita", {})["excluded"] = c_excl
-
-    # 6. Weekend J excluded — non richiede J in columns (può entrare via monthly_quotas)
-    j_weekend_excl = [
-        doc for doc, dcfg in doctors.items()
-        if dcfg.get("active", True)
-        and not (dcfg.get("column_overrides") or {}).get("J", {}).get("weekend_nights", True)
-    ]
-    rules.setdefault("J", {})["weekend_excluded_doctors"] = j_weekend_excl
-
-    # 7. Quote J fixed → J.monthly_quotas (compatibile con solver esistente)
-    j_mq: dict = dict(rules.get("J", {}).get("monthly_quotas") or {})
-    quota_overrides: dict = {}  # (doc_norm, col) → {type, value}
-
-    for doc, dcfg in doctors.items():
-        dn = norm_name(doc)
-        overrides: dict = dcfg.get("column_overrides") or {}
-        for col, ov in overrides.items():
-            if not isinstance(ov, dict):
-                continue
-            mq = ov.get("monthly_quota")
-            qt = ov.get("quota_type", "fixed")
-            if mq is None:
-                continue
-            if col == "J" and qt == "fixed":
-                j_mq[doc] = mq  # usa chiave originale per compatibilità
-            else:
-                quota_overrides[(dn, col)] = {"type": qt, "value": int(mq)}
-
-    rules.setdefault("J", {})["monthly_quotas"] = j_mq
-    cfg["pool_quota_overrides"] = quota_overrides
-
-    # 8. counts_as per colonna
-    counts_as_map: dict[str, int] = {}
-    monthly_targets: dict[str, int] = {}
-    for col, cs in col_settings.items():
-        if isinstance(cs, dict) and "counts_as" in cs:
-            counts_as_map[col] = int(cs["counts_as"])
-        if isinstance(cs, dict) and cs.get("monthly_target") is not None:
-            try:
-                monthly_targets[str(col).strip().upper()] = int(cs.get("monthly_target"))
-            except Exception:
-                pass
-    if counts_as_map:
-        cfg["pool_counts_as"] = counts_as_map
-    if monthly_targets:
-        cfg["pool_monthly_targets"] = monthly_targets
-
-    # 9. service_combinations
-    combos = pool_cfg.get("service_combinations")
-    if combos is not None:
-        cfg["pool_service_combinations"] = combos
-
-    # 10. critical_services
-    critical = pool_cfg.get("critical_services")
-    if critical is not None:
-        cfg["pool_critical_services"] = critical
-
-    # 11. Spacing J: scrive direttamente nei global_constraints già letti dal solver
-    j_cs = col_settings.get("J", {})
-    if isinstance(j_cs, dict):
-        if "spacing_min_days" in j_cs:
-            gc["night_spacing_days_min"] = int(j_cs["spacing_min_days"])
-        if "spacing_preferred_days" in j_cs:
-            gc["night_spacing_days_preferred"] = int(j_cs["spacing_preferred_days"])
-
-    # 11b. service_combinations → mappa alle chiavi relief_valves esistenti
-    combos = pool_cfg.get("service_combinations") or []
-    relief = gc.setdefault("relief_valves", {})
-    for combo in combos:
-        cols = tuple(sorted(combo.get("columns") or []))
-        mode = combo.get("mode", "fallback")
-        if cols == ("K", "T"):
-            if mode in ("fallback", "always"):
-                relief["enable_kt_share"] = True
-            elif mode == "preferred":
-                relief["enable_kt_share"] = False  # preferred = soft, solver gestisce a bassa penalità
-        # Q+R: già gestito da allow_blank_columns.R — nessuna modifica necessaria
-
-    # 12. university_doctors — aggiorna da pool_config
-    gc_uni: dict = dict(gc.get("university_doctors") or {})
-    for doc, dcfg in doctors.items():
-        uni = dcfg.get("university_doctor")
-        if uni and isinstance(uni, dict):
-            ratio = float(uni.get("ratio", gc.get("university_ratio", 0.6)))
-            night_double = "J" in (dcfg.get("columns") or [])
-            gc_uni[doc] = {
-                "type": "university",
-                "night_counts_double": night_double,
-            }
-            gc["university_ratio"] = ratio
-        elif doc in gc_uni and uni is None:
-            # Rimosso da pool_config → rimuovi anche da gc_uni
-            del gc_uni[doc]
-    gc["university_doctors"] = gc_uni
-
-    # 13. Soft balance per colonne senza balance nel YAML
-    # U (Contr.PM) non ha balance:true nel YAML — lo aggiungiamo quando pool_config
-    # definisce il pool, così il solver bilancia automaticamente il carico.
-    _u_pool = [
-        doc for doc, dcfg in doctors.items()
-        if dcfg.get("active", True) and "U" in (dcfg.get("columns") or [])
-    ]
-    if _u_pool:
-        rules.setdefault("U", {}).setdefault("balance", True)
-        rules["U"].setdefault("balance_weight", 200)
-
-    return cfg
-
+def load_solver_cfg(path: Path, doctor_registry: Optional[dict] = None) -> dict:
+    """YAML column rules + doctors only from the doctor cards (built from the
+    YAML pools when no registry is given, as the CLI does)."""
+    import doctor_registry as _dreg
+    cfg_yaml = load_rules(Path(path))
+    reg = doctor_registry if doctor_registry is not None else _dreg.migrate(None, cfg_yaml)
+    return _dreg.to_solver_cfg(cfg_yaml, reg)
 
 def _hint_current_solution(model, solver) -> None:
     """Use the solution just found as the starting point of the next solve."""
@@ -1335,6 +1158,11 @@ def collect_doctors(cfg: dict) -> List[str]:
     Union of all pools/allowed in YAML, minus absolute_exclusions.
     Keeps special placeholder 'Recupero' if present.
     """
+    if isinstance(cfg.get("doctors"), list):
+        # Doctor registry (schede medico): the only source of active doctors.
+        abs_excl = {norm_name(x) for x in (cfg.get("absolute_exclusions") or [])}
+        listed = {norm_name(d) for d in cfg["doctors"] if norm_name(d) and norm_name(d) not in abs_excl}
+        return sorted(listed, key=lambda s: (s == "Recupero", s.lower()))
     doctors: Set[str] = set()
     # From unavailability section too
     for d in (cfg.get("unavailability") or {}).keys():
@@ -1390,7 +1218,7 @@ def _never_in_j_set(cfg: dict) -> Set[str]:
     """Doctors that must never be assigned to night J, even via UI overrides."""
     rules = cfg.get("rules") or {}
     rJ = rules.get("J", {}) if isinstance(rules.get("J", {}), dict) else {}
-    return {norm_name(d) for d in (rJ.get("never_in_J") or ["De Gregorio", "Manganaro"])}
+    return {norm_name(d) for d in (rJ.get("never_in_J") or [])}
 
 
 def check_fixed_assignments(fixed, *, slots, assignment, active_doctors, cfg=None) -> List[dict]:
@@ -1623,16 +1451,20 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                 forced_j_today = forced_j_by_date.get(day.date, set())
                 pair_avail = [d for d in pair_avail if d not in forced_j_today]
 
-                # Fallback source = H.pool_mon_fri (as requested)
+                # Fallback quando la coppia titolare manca: medici con F nella
+                # scheda + riserve di D/F, preferendo chi è nel pool H (come prima).
                 h_rule = rules.get("H", {}) if isinstance(rules.get("H", {}), dict) else {}
-                h_pool = mk_allowed(h_rule.get("pool_mon_fri") or [])
-                h_avail = apply_unavailability(h_pool, day, "Mattina", unav)
-
-                # Ultimate fallback: any doctor available that morning (MAI Recupero)
-                _recupero_n = norm_name("Recupero")
-                any_pool = apply_unavailability(
-                    [d for d in sorted(doctors_set) if d != _recupero_n], day, "Mattina", unav
-                )
+                h_pool = set(mk_allowed(h_rule.get("pool_mon_fri") or []))
+                _reserve_df = (cfg.get("reserve_pools") or {})
+                _fb_base: List[str] = []
+                for _d in (mk_allowed(r.get("f_pool") or [])
+                           + mk_allowed(_reserve_df.get("D") or [])
+                           + mk_allowed(_reserve_df.get("F") or [])):
+                    if _d not in _fb_base and _d != "Recupero":
+                        _fb_base.append(_d)
+                _fb_avail = apply_unavailability(_fb_base, day, "Mattina", unav)
+                h_avail = [d for d in _fb_avail if d in h_pool]
+                any_pool = _fb_avail
 
                 # Se solo uno del pair disponibile → share obbligatorio (lui fa D e F)
                 # Se nessuno del pair → fallback ordinato:
@@ -1643,7 +1475,7 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                     allowed_df = pair_avail
                     prefer_share = True
                 elif len(pair_avail) == 0:
-                    allowed_df = h_avail or any_pool or sorted(doctors_set)
+                    allowed_df = h_avail or any_pool
                     prefer_share = True
                 else:
                     allowed_df = pair_avail
@@ -1664,9 +1496,6 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                 # Saturdays must be covered; for Mon-Fri, use pool_mon_fri only
                 if day.dow == "Sat" or dayspec_contains(day.dow, "Mon-Fri"):
                     allowed = mk_allowed(rH.get("pool_mon_fri") or [])
-                    # Grimaldi e Calabrò esclusi esplicitamente da H
-                    _h_excl = {norm_name("Grimaldi"), norm_name("Calabrò")}
-                    allowed = [d for d in allowed if norm_name(d) not in _h_excl]
                     allowed = apply_unavailability(allowed, day, "Pomeriggio", unav)
                     slots.append(Slot(day, f"{day.date}-H", ["H"], allowed, required=True, shift="Pomeriggio", rule_tag="H"))
             if "I" in rules and dayspec_contains(day.dow, "Mon-Sat"):
@@ -1724,7 +1553,7 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                             allowed.append(special)
                     allowed = [d for d in allowed if d != "Recupero"]
                     # Esclusioni permanenti da J (mai in notte, qualunque giorno)
-                    j_never = {norm_name(d) for d in (rJ.get("never_in_J") or ["De Gregorio", "Manganaro"])}
+                    j_never = {norm_name(d) for d in (rJ.get("never_in_J") or [])}
                     allowed = [d for d in allowed if norm_name(d) not in j_never]
                     # Weekend exclusions (e.g., Calabrò not allowed on Sat/Sun nights)
                     wex = [norm_name(x) for x in (rJ.get('weekend_excluded_doctors') or [])]
@@ -1806,21 +1635,19 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                 u_shift = "Pomeriggio" if day.dow == "Mon" else "Mattina"
                 pool = mk_allowed(r.get("pool") or [])
                 pool = apply_unavailability(pool, day, u_shift, unav)
-                # MODIFICA 3: se lunedì e V ha solo Allegra disponibile (o è assegnato ad Allegra),
-                # U deve essere SOLO Crea o Dattilo.
-                if day.dow == "Mon" and r.get("v_allegra_monday_constraint", False):
+                # Regola della scheda medico: "il lunedì, se faccio Sala PM, Contr.PM
+                # va a uno di questi". Se quel medico è l'unico disponibile in V,
+                # U si restringe subito ai suoi partner.
+                if day.dow == "Mon":
                     rV = rules.get("V", {})
                     v_pool_avail = apply_unavailability(mk_allowed(rV.get("pool") or []), day, "Pomeriggio", unav)
-                    _allegra = norm_name("Allegra")
-                    _crea = norm_name("Crea")
-                    _dattilo = norm_name("Dattilo")
-                    # Se Allegra è l'unico disponibile in V (o i soli disponibili sono Allegra),
-                    # oppure Crea e Dattilo non sono nel pool V → forza U = {Crea, Dattilo}
-                    only_allegra_in_v = all(norm_name(d) == _allegra for d in v_pool_avail) if v_pool_avail else False
-                    if only_allegra_in_v:
-                        restricted = [d for d in pool if norm_name(d) in {_crea, _dattilo}]
-                        if restricted:  # applica solo se almeno uno è disponibile
-                            pool = restricted
+                    for _mrule in (r.get("monday_v_rules") or []):
+                        _vdoc = norm_name(_mrule.get("v_doctor"))
+                        _partners = {norm_name(p) for p in (_mrule.get("u_doctors") or [])}
+                        if v_pool_avail and all(norm_name(d) == _vdoc for d in v_pool_avail):
+                            restricted = [d for d in pool if norm_name(d) in _partners]
+                            if restricted:  # applica solo se almeno uno è disponibile
+                                pool = restricted
                 slots.append(Slot(day, f"{day.date}-U", ["U"], pool, required=True, shift=u_shift, rule_tag="U"))
         # ---- V Sala PM (Mon,Wed,Fri)
         # Default: venerdì = turno doppio (Crea + Dattilo|Allegra), lun/mer = singolo.
@@ -1839,9 +1666,11 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                 _is_default_double = (day.dow == "Fri") and (_week_key not in _v_override_weeks)
                 _is_double_day = _is_override_double or _is_default_double
                 if _is_double_day:
-                    crea = norm_name(r.get("friday_required_doctor") or "Crea")
-                    pool_crea = [crea] if crea in pool_base else []
-                    other_allowed = {norm_name("Dattilo"), norm_name("Allegra")}
+                    crea = norm_name(r.get("friday_required_doctor") or "")
+                    pool_crea = [crea] if crea and crea in pool_base else []
+                    _partners = r.get("double_partners")
+                    other_allowed = ({norm_name(d) for d in _partners} if _partners is not None
+                                     else {norm_name(d) for d in pool_base})
                     pool_other = [d for d in pool_base if norm_name(d) in other_allowed and norm_name(d) != crea]
                     # Turno doppio: solo se entrambi i pool sono non vuoti
                     if (not pool_crea) or (not pool_other):
@@ -1906,8 +1735,8 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
             # Slot aggiuntivo al Sabato (2 al mese) SOLO con CREA (quota gestita nel solver)
             sat_n = int(r.get("saturday_per_month", 0) or 0)
             if sat_n > 0 and day.dow == "Sat":
-                doc_sat = norm_name(r.get("saturday_only_doctor") or "Crea")
-                pool_sat = [doc_sat] if doc_sat in doctors_set else []
+                doc_sat = norm_name(r.get("saturday_only_doctor") or "")
+                pool_sat = [doc_sat] if doc_sat and doc_sat in doctors_set else []
                 pool_sat = apply_unavailability(pool_sat, day, "Mattina", unav)
                 slots.append(Slot(day, f"{day.date}-AB_SAT", ["AB"], pool_sat, required=False, shift="Mattina", rule_tag="AB_SAT"))
         # ---- AC Scintigrafia (Tue/Wed fixed)
@@ -1932,60 +1761,23 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
             _filtered_slots.append(s)
         slots = _filtered_slots
 
-    # ── Espansione pool per colonne indispensabili (critical_services) ──────────
-    # Per ogni colonna marcata come "indispensabile" in pool_critical_services:
-    # se il pool primario è vuoto o molto ridotto, si espande a qualsiasi medico
-    # disponibile per quel turno (con penalità nel solver per scoraggiarne l'uso).
-    _abs_excl_norm = {norm_name(x) for x in (cfg.get("absolute_exclusions") or [])}
-    # Grimaldi e Calabrò vanno SOLO in D/F (mai in pool di emergenza di altre colonne)
-    _df_only_norm = {norm_name("Grimaldi"), norm_name("Calabrò")}
-    _emerg_any_pool = [d for d in doctors_all
-                       if norm_name(d) not in _abs_excl_norm
-                       and norm_name(d) != "Recupero"
-                       and norm_name(d) not in _df_only_norm]
-    _critical_svc = cfg.get("pool_critical_services") or {}
-
+    # ── Riserve (scheda medico, livello "riserva") ──────────────────────────────
+    # Uno slot obbligatorio senza nessun medico del pool disponibile si apre ai
+    # medici che nella propria scheda hanno quel servizio "di riserva" (con
+    # penalità nel solver). Nessun altro: chi non ha il servizio non entra mai.
+    _reserve_pools = cfg.get("reserve_pools") or {}
     for s in slots:
-        if not s.required:
+        if not s.required or s.allowed or s.rule_tag in ("D_F.D", "D_F.F"):
             continue
-        _match_col = next((c for c in (s.columns or []) if c in _critical_svc), None)
-        if not _match_col:
-            continue
-        _spec = _critical_svc.get(_match_col, {})
-        _fb = _spec.get("fallback", "")
-        if _fb == "any":
-            _fb_base = _emerg_any_pool
-        elif isinstance(_fb, list) and _fb:
-            _fb_base = [norm_name(d) for d in _fb
-                        if norm_name(d) in doctors_set and norm_name(d) != "Recupero"]
-        else:
-            continue
-        _primary_set = set(s.allowed)
-        if _primary_set:
-            continue
-        _fb_avail = apply_unavailability(_fb_base, s.day, s.shift, unav)
-        _new_emerg = [d for d in _fb_avail if d not in _primary_set]
-        if _new_emerg:
-            s.allowed = s.allowed + _new_emerg
-            s.emergency_doctors = _new_emerg
-
-    # ── Emergency expansion per H e E/G ────────────────────────────────────
-    # Se il pool primario non copre: qualsiasi medico disponibile eccetto
-    # Recupero, Grimaldi e Calabrò (che vanno solo in D/F).
-    _h_eg_excl_norm = _df_only_norm | {"Recupero"} | _abs_excl_norm
-    _h_eg_emerg_base = [d for d in doctors_all if norm_name(d) not in _h_eg_excl_norm]
-    for s in slots:
-        if not s.required or s.rule_tag not in {"H", "E_G"}:
-            continue
-        _primary_set = set(s.allowed)
-        if _primary_set:
-            continue
-        _emerg_avail = apply_unavailability(_h_eg_emerg_base, s.day, s.shift, unav)
-        _new_emerg = [d for d in _emerg_avail if d not in _primary_set]
-        if _new_emerg:
-            s.allowed = s.allowed + _new_emerg
-            existing = s.emergency_doctors or []
-            s.emergency_doctors = existing + _new_emerg
+        _base: List[str] = []
+        for _c in (s.columns or []):
+            for _d in mk_allowed(_reserve_pools.get(_c) or []):
+                if _d not in _base and _d != "Recupero":
+                    _base.append(_d)
+        _r_avail = apply_unavailability(_base, s.day, s.shift, unav)
+        if _r_avail:
+            s.allowed = list(_r_avail)
+            s.emergency_doctors = list(_r_avail)
 
     # ── Safety: rimuove Recupero da qualsiasi slot festivo (DE, HI) ─────────────
     # Recupero è un placeholder — non lavora mai nei festivi.
@@ -2398,6 +2190,89 @@ def _repair_heavy_festive_assignments(
     return repaired, swaps
 
 
+HISTORY_BALANCE_WEIGHTS = {"J": 200_000, "J_weekend": 150_000, "festivi": 150_000}
+
+
+def history_counts(hist: dict, doc: str) -> dict:
+    """Definitive-history totals of one doctor: J, J_weekend, festivi, C, months."""
+    h = (hist or {}).get(doc) or {}
+    j = h.get("J") or {}
+    return {
+        "J": int(j.get("total", 0) or 0),
+        "J_weekend": int(j.get("sabati", 0) or 0) + int(j.get("domeniche", 0) or 0),
+        "festivi": int(h.get("_festivi_DE_HI", 0) or 0),
+        "C": int((h.get("C") or {}).get("total", 0) or 0),
+        "months": int(h.get("_months_counted", 0) or 0),
+    }
+
+
+def history_fair_targets(hist: dict, category: str, capacity: Dict[str, int], n_period: int) -> Dict[str, int]:
+    """Period target per doctor so that history + period evens out.
+
+    History is turned into a rate per month of presence (a doctor who joined
+    later is not "behind"); a doctor with no history gets the group average.
+    Then a common level L is found with sum(max(0, L - h_d)) = n_period
+    (water filling, capped by what each doctor can do in the period).
+    """
+    docs = sorted(capacity)
+    if not docs or n_period <= 0:
+        return {}
+    rates = {}
+    for d in docs:
+        c = history_counts(hist, d)
+        if c["months"] > 0:
+            rates[d] = c[category] / c["months"]
+    avg = (sum(rates.values()) / len(rates)) if rates else 0.0
+    horizon = max([history_counts(hist, d)["months"] for d in docs] + [1])
+    h = {d: rates.get(d, avg) * horizon for d in docs}
+    lo, hi = min(h.values()), max(h.values()) + n_period
+    for _ in range(60):
+        mid = (lo + hi) / 2
+        filled = sum(min(capacity[d], max(0.0, mid - h[d])) for d in docs)
+        if filled < n_period:
+            lo = mid
+        else:
+            hi = mid
+    return {d: int(math.ceil(min(capacity[d], max(0.0, hi - h[d])) - 1e-6)) for d in docs}
+
+
+def _count_category_slots(slots: List[Slot], category: str) -> int:
+    if category == "festivi":
+        return sum(1 for s in slots if s.rule_tag in ("Festivo_DE", "Festivo_HI"))
+    nights = [s for s in slots if s.columns == ["J"] and s.allowed]
+    if category == "J_weekend":
+        return sum(1 for s in nights if s.day.dow in ("Sat", "Sun"))
+    return len(nights)
+
+
+def _history_balance_categories(cfg, days, slots, x, night_var_by_day_doc, doctors):
+    """(category, weight, {doc: [vars]}, {doc with a fixed quota: quota}) for the history balance."""
+    rJ = (cfg.get("rules") or {}).get("J") or {}
+    j_fixed = {norm_name(k): int(v) for k, v in (rJ.get("monthly_quotas") or {}).items()}
+    fest_fixed = {norm_name(k): int(v) for k, v in
+                  ((((cfg.get("rules") or {}).get("Festivi") or {}).get("quotas") or {}).items())}
+    j_all: Dict[str, list] = defaultdict(list)
+    j_we: Dict[str, list] = defaultdict(list)
+    for (date_, doc), v in night_var_by_day_doc.items():
+        if doc == "Recupero":
+            continue
+        j_all[doc].append(v)
+        if date_.weekday() >= 5:
+            j_we[doc].append(v)
+    fest: Dict[str, list] = defaultdict(list)
+    for s in slots:
+        if s.rule_tag in ("Festivo_DE", "Festivo_HI"):
+            for doc in s.allowed:
+                v = x.get((s.slot_id, doc))
+                if v is not None and doc != "Recupero":
+                    fest[doc].append(v)
+    return [
+        ("J", HISTORY_BALANCE_WEIGHTS["J"], dict(j_all), j_fixed),
+        ("J_weekend", HISTORY_BALANCE_WEIGHTS["J_weekend"], dict(j_we), {}),
+        ("festivi", HISTORY_BALANCE_WEIGHTS["festivi"], dict(fest), fest_fixed),
+    ]
+
+
 def solve_with_ortools(
     cfg: dict,
     days: List[DayRow],
@@ -2621,15 +2496,17 @@ def solve_with_ortools(
                 f"Assegnazione fissa {fa_doc} del {fa_date}: turno {fa_col} non presente in quel giorno."
             )
         if len(target_slots) > 1 and fa_col == "V":
-            required_v_doc = norm_name(((cfg.get("rules") or {}).get("V") or {}).get("friday_required_doctor") or "Crea")
+            _rv = (cfg.get("rules") or {}).get("V") or {}
+            required_v_doc = norm_name(_rv.get("friday_required_doctor") or "")
+            _v_partners = {norm_name(d) for d in (_rv.get("double_partners") or [])}
             if fa_doc == required_v_doc:
                 v_slot_suffix = "-V1"
-            elif fa_doc in {norm_name("Dattilo"), norm_name("Allegra")}:
+            elif fa_doc in _v_partners:
                 v_slot_suffix = "-V2"
             else:
                 raise ValueError(
                     f"Assegnazione fissa V del {fa_date}: nel turno doppio sono ammessi "
-                    f"{required_v_doc}, Dattilo o Allegra; richiesto {fa_doc}."
+                    f"{', '.join([required_v_doc] + sorted(_v_partners))}; richiesto {fa_doc}."
                 )
             target_slots = [s for s in target_slots if s.slot_id.endswith(v_slot_suffix)]
         if len(target_slots) != 1:
@@ -3336,9 +3213,9 @@ def solve_with_ortools(
     if "rules" in cfg and "D_F" in cfg["rules"] and isinstance(cfg["rules"]["D_F"], dict):
         rDF = cfg["rules"]["D_F"]
         if rDF.get("pattern_3_3", False):
-            doc1 = norm_name(rDF.get("pattern_doc1") or "Grimaldi")
-            doc2 = norm_name(rDF.get("pattern_doc2") or "Calabrò")
-            pair = {doc1, doc2}
+            doc1 = norm_name(rDF.get("pattern_doc1") or "")
+            doc2 = norm_name(rDF.get("pattern_doc2") or "")
+            pair = {doc1, doc2} - {""}
             fallback_share_by_date: Dict[dt.date, Dict[str, object]] = {}
             fallback_share_by_doc: Dict[str, List[object]] = defaultdict(list)
 
@@ -3592,7 +3469,8 @@ def solve_with_ortools(
     # soft [min_per, max_per] gestito più sotto (target 2, fino a 3 se necessario).
     J_QUOTA_DEV_PENALTY = 8_000_000   # default
     J_QUOTA_STRICT_PENALTY = 25_000_000  # Zito, Dattilo, Calabrò — quasi-obbligatorio
-    _j_strict_docs = {norm_name("Zito"), norm_name("Dattilo"), norm_name("Calabrò")}
+    # Quota "fissa" nella scheda medico = quasi obbligatoria e mai superata.
+    _j_strict_docs = {norm_name(k) for k in ((cfg.get("rules") or {}).get("J") or {}).get("monthly_quotas") or {}}
     if "rules" in cfg and "J" in cfg["rules"]:
         mq = cfg["rules"]["J"].get("monthly_quotas") or {}
         for doc_raw, q in mq.items():
@@ -3640,7 +3518,8 @@ def solve_with_ortools(
     # Pool quota overrides max/min — da pool_config (tutti i tipi e colonne)
     qov = cfg.get("pool_quota_overrides") or {}
     for (doc_n, col), spec in qov.items():
-        col_slots = [s for s in slots if col in (s.columns or [])]
+        col_slots = [s for s in slots if col in (s.columns or [])
+                     and s.rule_tag not in ("Festivo_DE", "Festivo_HI")]
         vars_ = [x.get((s.slot_id, doc_n)) for s in col_slots]
         vars_ = [v for v in vars_ if v is not None]
         if not vars_:
@@ -4003,7 +3882,7 @@ def solve_with_ortools(
         # periods it is common that the only available Sunday-night candidates
         # already have one weekend night; leaving J blank is worse than breaking
         # the generic cap. Explicit per-doctor caps above (e.g. Zito) remain hard.
-        _j_wex = {norm_name(d) for d in (rJ.get("weekend_excluded_doctors") or ["Calabrò"])}
+        _j_wex = {norm_name(d) for d in (rJ.get("weekend_excluded_doctors") or [])}
         weekend_docs = night_pool - _j_wex
         import math as _math
         total_we_nights = sum(
@@ -4333,8 +4212,6 @@ def solve_with_ortools(
                 model.Add(sun_diff == sun_max - sun_min)
                 extra_obj.append(sunday_balance_penalty * sun_diff)
     # H monthly quotas Mon-Fri
-    # MODIFICA 1: Grimaldi e Calabrò sono esclusi da H; ignora eventuali quote riferite a loro
-    _h_df_pair = {norm_name("Grimaldi"), norm_name("Calabrò")}
     if "rules" in cfg and "H" in cfg["rules"]:
         mqH = cfg["rules"]["H"].get("monthly_quotas") or {}
         for key, q in mqH.items():
@@ -4345,8 +4222,6 @@ def solve_with_ortools(
             doc = norm_name(m.group(1))
             if doc not in doctors:
                 continue
-            if doc in _h_df_pair:
-                continue   # Grimaldi/Calabrò non vanno mai in H
             vars_ = []
             for day in days:
                 if day.dow in ["Mon","Tue","Wed","Thu","Fri"]:
@@ -4410,78 +4285,26 @@ def solve_with_ortools(
     # ------------------------------------------------------------
     # Vincoli richiesti aggiuntivi (Roberto)
     # ------------------------------------------------------------
-    # U (Contr.PM) – Cimino esattamente N volte/mese (default: 2)
-    if "rules" in cfg and "U" in cfg["rules"] and "Cimino" in doctors:
-        rU = cfg["rules"]["U"] or {}
-        exact = int(rU.get("cimino_exact_per_month", 0) or 0)
-        if exact > 0:
-            vars_ = []
-            for s in slots:
-                if s.columns == ["U"] and (s.slot_id, "Cimino") in x:
-                    vars_.append(x[(s.slot_id, "Cimino")])
-            if vars_:
-                effective_exact = min(_monthly_target_for_period(exact, "Cimino", "U"), len(vars_))
-                effective_cap = min(_monthly_cap_for_period(exact, "Cimino", "U"), len(vars_))
-                effective_cap = max(effective_cap, effective_exact)
-                # Hard upper bound + soft lower
-                model.Add(sum(vars_) <= effective_cap)
-                _cudef = model.NewIntVar(0, len(vars_), f"cudef_{effective_exact}")
-                model.Add(_cudef >= effective_exact - sum(vars_))
-                model.Add(_cudef >= 0)
-                extra_obj.append(J_QUOTA_DEV_PENALTY * _cudef)
-                if effective_cap > effective_exact:
-                    _cusup = model.NewIntVar(0, len(vars_), f"cusup_{effective_exact}")
-                    model.Add(_cusup >= sum(vars_) - effective_exact)
-                    model.Add(_cusup >= 0)
-                    extra_obj.append(J_QUOTA_DEV_PENALTY * _cusup)
-                if effective_exact < exact and not period_is_partial_month:
-                    pre_solve_warnings.append(
-                        f"Cimino U: richiesti esattamente {exact} ma solo {len(vars_)} slot disponibili, ridotto a {effective_exact}."
-                    )
-            else:
-                pre_solve_warnings.append(
-                    f"Cimino non ha slot U disponibili questo mese: vincolo cimino_exact_per_month ignorato"
-                )
-
-    # MODIFICA 3: se lunedì V=Allegra allora U deve essere Crea o Dattilo (hard constraint nel solver)
+    # Scheda medico "lunedì Sala PM -> Contr.PM con...": se il lunedì V è di quel
+    # medico, U può andare solo a lui stesso o ai partner indicati (hard).
     if "rules" in cfg and "U" in cfg["rules"] and "V" in cfg["rules"]:
-        rU_c = cfg["rules"]["U"] or {}
-        if rU_c.get("v_allegra_monday_constraint", False):
-            _allegra = norm_name("Allegra")
-            _crea = norm_name("Crea")
-            _dattilo = norm_name("Dattilo")
-            _forbidden_in_u_if_v_allegra = [d for d in doctors if norm_name(d) not in {_crea, _dattilo, _allegra}]
+        for _mrule in ((cfg["rules"]["U"] or {}).get("monday_v_rules") or []):
+            _vdoc = norm_name(_mrule.get("v_doctor"))
+            _ok_u = {norm_name(p) for p in (_mrule.get("u_doctors") or [])} | {_vdoc}
+            _forbidden_u = [d for d in doctors if norm_name(d) not in _ok_u]
             for day in [d for d in days if d.dow == "Mon"]:
                 sV = next((s for s in slots_by_day[day.date] if s.columns == ["V"]), None)
                 sU = next((s for s in slots_by_day[day.date] if s.columns == ["U"]), None)
                 if sV is None or sU is None:
                     continue
-                v_allegra = x.get((sV.slot_id, _allegra))
-                if v_allegra is None:
+                v_on = x.get((sV.slot_id, _vdoc))
+                if v_on is None:
                     continue
-                # Se V=Allegra il lunedì → U deve essere Crea o Dattilo
-                for forb in _forbidden_in_u_if_v_allegra:
+                for forb in _forbidden_u:
                     u_forb = x.get((sU.slot_id, forb))
                     if u_forb is not None:
-                        # u_forb=0 when v_allegra=1
-                        model.Add(u_forb == 0).OnlyEnforceIf(v_allegra)
+                        model.Add(u_forb == 0).OnlyEnforceIf(v_on)
 
-    # I (Cardiologia pomeriggio) – De Gregorio max N nei feriali (i festivi sono HI, quindi esclusi)
-    if "rules" in cfg and "I" in cfg["rules"] and "De Gregorio" in doctors:
-        rI = cfg["rules"]["I"] or {}
-        max_i = int(rI.get("degregorio_max_weekdays", 0) or 0)
-        if max_i > 0:
-            vars_ = []
-            for s in slots:
-                # Count only real I slots on Mon-Sat. Festivi use the unified HI slot.
-                if (
-                    s.columns == ["I"]
-                    and getattr(s.day, "dow", "") in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
-                    and (s.slot_id, "De Gregorio") in x
-                ):
-                    vars_.append(x[(s.slot_id, "De Gregorio")])
-            if vars_:
-                model.Add(sum(vars_) <= max_i)
 # ------------------------------------------------------------
     # Vincoli specifici per 'Recupero' (richiesti):
     # - T (Interni): almeno N/mese (hard) + target soft (es. 5)
@@ -4598,6 +4421,8 @@ def solve_with_ortools(
             doc = norm_name(doc_raw)
             if doc not in doctors:
                 continue
+            _doc_ratio = float((doc_cfg or {}).get("ratio", uni_ratio) or uni_ratio)
+            target = round(working_days * _doc_ratio)
             night_double = bool((doc_cfg or {}).get("night_counts_double", False))
             counts_as_map = cfg.get("pool_counts_as") or {}
             weighted_terms = []
@@ -4659,7 +4484,7 @@ def solve_with_ortools(
             extra_obj.append(50 * ab_max_per_doc)  # minimizza il massimo → bilanciamento
 
         # Sabati: quota hard con il medico dedicato finché ci sono abbastanza date eleggibili.
-        sat_doc = norm_name(rAB.get("saturday_only_doctor") or "Crea")
+        sat_doc = norm_name(rAB.get("saturday_only_doctor") or "")
         sat_n = _monthly_target_for_period(int(rAB.get("saturday_per_month", 0) or 0), sat_doc, "AB")
         sat_cap = _monthly_cap_for_period(int(rAB.get("saturday_per_month", 0) or 0), sat_doc, "AB")
         if sat_n > 0 and sat_doc in doctors:
@@ -4880,86 +4705,32 @@ def solve_with_ortools(
             objective_terms.append(3 * sum(penalties))
     # Weekend night concentration: già gestito nel blocco J sopra con hard max=2 e strong soft
 
-    # ── Historical balance: soft constraints from previous months ────────────
+    # ── Bilanciamento con i turni DEFINITIVI caricati (tutti i mesi) ─────────
+    # Per ogni categoria (notti, notti sab/dom, domeniche/festivi di giorno) il
+    # medico che finora ne ha fatti meno (per mese di presenza) riceve una quota
+    # equa più alta in questo periodo: obiettivo = livello comune "a riempimento"
+    # (storico + periodo uguale per tutti). Supera l'obiettivo solo se serve.
+    # Peso sotto l'equità del periodo (min/max notti, quote fisse, coperture),
+    # sopra le preferenze minori: decide soprattutto chi fa il turno in più.
     _hist = historical_stats or {}
     if _hist:
-        HIST_NIGHT_PENALTY = 150
-        HIST_FEST_PENALTY = 200
-
-        # Notti J: penalizza medici con più notti storiche
-        _rJ_cfg = (cfg.get("rules") or {}).get("J") or {}
-        _mq_fixed_hist = set()
-        for _k in (_rJ_cfg.get("monthly_quotas") or {}).keys():
-            _mq_fixed_hist.add(norm_name(_k))
-        try:
-            _night_pool_hist = night_pool  # defined inside "J" block
-        except NameError:
-            _night_pool_hist = set()
-        _night_pool_free_hist = [d for d in sorted(_night_pool_hist) if d not in _mq_fixed_hist]
-
-        for _doc in _night_pool_free_hist:
-            _j_data = _hist.get(_doc, {}).get("J", {})
-            _hist_j_total = _j_data.get("total", 0) if isinstance(_j_data, dict) else 0
-            if _hist_j_total <= 0:
-                continue
-            _vars = [night_var_by_day_doc.get((d.date, _doc)) for d in days
-                     if night_var_by_day_doc.get((d.date, _doc)) is not None]
-            if _vars:
-                _cnt = model.NewIntVar(0, len(days), f"hist_j_{abs(hash(_doc)) % 10 ** 6}")
-                model.Add(_cnt == sum(_vars))
-                extra_obj.append(HIST_NIGHT_PENALTY * _hist_j_total * _cnt)
-
-        # Domeniche J: penalizza notti domenicali storiche
-        for _doc in sorted(_night_pool_hist):
-            _j_data2 = _hist.get(_doc, {}).get("J", {})
-            _hist_dom_j = _j_data2.get("domeniche", 0) if isinstance(_j_data2, dict) else 0
-            if _hist_dom_j <= 0:
-                continue
-            _sun_vars = [night_var_by_day_doc.get((d.date, _doc))
-                         for d in days if d.dow == "Sun"
-                         if night_var_by_day_doc.get((d.date, _doc)) is not None]
-            if _sun_vars:
-                _sun_cnt = model.NewIntVar(0, len(_sun_vars), f"hist_sunj_{abs(hash(_doc)) % 10 ** 6}")
-                model.Add(_sun_cnt == sum(_sun_vars))
-                extra_obj.append(HIST_FEST_PENALTY * _hist_dom_j * _sun_cnt)
-
-        # Sabati J: penalizza notti di sabato storiche (stessa logica delle domeniche)
-        for _doc in sorted(_night_pool_hist):
-            _j_data3 = _hist.get(_doc, {}).get("J", {})
-            _hist_sab_j = _j_data3.get("sabati", 0) if isinstance(_j_data3, dict) else 0
-            if _hist_sab_j <= 0:
-                continue
-            _sat_vars = [night_var_by_day_doc.get((d.date, _doc))
-                         for d in days if d.dow == "Sat"
-                         if night_var_by_day_doc.get((d.date, _doc)) is not None]
-            if _sat_vars:
-                _sat_cnt = model.NewIntVar(0, len(_sat_vars), f"hist_satj_{abs(hash(_doc)) % 10 ** 6}")
-                model.Add(_sat_cnt == sum(_sat_vars))
-                extra_obj.append(HIST_FEST_PENALTY * _hist_sab_j * _sat_cnt)
-
-        # Festivi DEHI: penalizza medici con più festivi storici (solo pool senza quota fissa)
-        HIST_DEHI_PENALTY = 200
-        _rFest_cfg = (cfg.get("rules") or {}).get("Festivi") or {}
-        _fest_fixed_hist = {norm_name(k) for k in (_rFest_cfg.get("quotas") or {}).keys()}
-        _fest_pool_hist = [norm_name(d) for d in (_rFest_cfg.get("pool") or [])
-                          if norm_name(d) in doctors and norm_name(d) != "Recupero"]
-        _fest_pool_free_hist = [d for d in _fest_pool_hist if d not in _fest_fixed_hist]
-        _festivo_slots_hist = [s for s in slots if s.rule_tag in ("Festivo_DE", "Festivo_HI")]
-
-        if _fest_pool_free_hist and _festivo_slots_hist:
-            for _doc in _fest_pool_free_hist:
-                _hist_dehi = _hist.get(_doc, {}).get("_festivi_DE_HI", 0)
-                if not isinstance(_hist_dehi, int):
-                    _hist_dehi = 0
-                if _hist_dehi <= 0:
+        for _cat, _weight, _cat_vars, _cat_quotas in _history_balance_categories(
+            cfg, days, slots, x, night_var_by_day_doc, doctors
+        ):
+            # Chi ha una quota fissa fa la sua quota: il resto si bilancia tra gli altri.
+            _reserved = sum(min(len(_cat_vars.get(d, [])), q) for d, q in _cat_quotas.items())
+            _targets = history_fair_targets(
+                _hist, _cat,
+                {d: len(v) for d, v in _cat_vars.items() if d not in _cat_quotas},
+                n_period=max(0, _count_category_slots(slots, _cat) - _reserved),
+            )
+            for _doc, _vars in sorted(_cat_vars.items()):
+                if _doc not in _targets or not _vars:
                     continue
-                _fvars = [x.get((s.slot_id, _doc)) for s in _festivo_slots_hist
-                          if (s.slot_id, _doc) in x]
-                if _fvars:
-                    _fcnt = model.NewIntVar(0, len(_festivo_slots_hist),
-                                            f"hist_dehi_{abs(hash(_doc)) % 10 ** 6}")
-                    model.Add(_fcnt == sum(_fvars))
-                    extra_obj.append(HIST_DEHI_PENALTY * _hist_dehi * _fcnt)
+                _t = _targets[_doc]
+                _over = model.NewIntVar(0, len(_vars), f"hist_{_cat}_over_{abs(hash(_doc)) % 10 ** 6}")
+                model.Add(_over >= sum(_vars) - _t)
+                extra_obj.append(_weight * _over)
 
     full_objective_terms = objective_terms + extra_obj + coverage_obj_terms
     coverage_expr = sum(coverage_obj_terms) if coverage_obj_terms else 0
@@ -5362,7 +5133,8 @@ def solve_with_ortools(
 
     # Final layer: assign/reassign Reperibilità (C) using definitive rules
     assignment, cdiag = assign_reperibilita_C(
-        cfg, days, slots, assignment, fixed_assignments=fixed_assignments
+        cfg, days, slots, assignment, fixed_assignments=fixed_assignments,
+        historical_stats=historical_stats,
     )
     if isinstance(cdiag, dict):
         stats.update(cdiag)
@@ -5652,7 +5424,7 @@ def write_output(
     # Medici in never_in_J non fanno mai notti → togli "N" dal loro eligible
     # (l'emergency expansion di J li aggiunge come fallback ma non possono davvero fare J)
     if cfg and isinstance(cfg.get("rules"), dict):
-        _j_never = {norm_name(d) for d in ((cfg["rules"].get("J") or {}).get("never_in_J") or ["De Gregorio", "Manganaro"])}
+        _j_never = {norm_name(d) for d in ((cfg["rules"].get("J") or {}).get("never_in_J") or [])}
         for _elig_map in doc_eligible_by_date.values():
             for _dn in _j_never:
                 if _dn in _elig_map:
@@ -6540,6 +6312,7 @@ def generate_schedule(
     disabled_columns: Optional[List[str]] = None,
     historical_stats: Optional[dict] = None,
     pool_config: Optional[dict] = None,
+    doctor_registry: Optional[dict] = None,
     prior_usage: Optional[dict] = None,
     turni_festivi: Optional[dict] = None,
 ):
@@ -6558,9 +6331,14 @@ def generate_schedule(
     outp = Path(out_xlsx)
     unav = Path(unavailability_path) if unavailability_path else None
 
-    cfg = load_rules(rules)
-    if pool_config:
-        cfg = apply_pool_config(cfg, pool_config)
+    cfg_yaml = load_rules(rules)
+    # Who can do what comes ONLY from the doctor cards (doctor_registry). Without
+    # a registry (CLI, first start) the cards are built from the old pool_config
+    # / YAML pools, losing nothing.
+    import doctor_registry as _dreg
+    if doctor_registry is None:
+        doctor_registry = _dreg.migrate(pool_config, cfg_yaml)
+    cfg = _dreg.to_solver_cfg(cfg_yaml, doctor_registry)
     if disabled_columns:
         cfg["disabled_columns"] = sorted({
             str(c).strip().upper()
@@ -6628,7 +6406,7 @@ def run_gui():
             outp = Path(out_var.get())
             if not template.exists() or not rules.exists() or not outp:
                 raise ValueError("Seleziona template, regole e output.")
-            cfg = load_rules(rules)
+            cfg = load_solver_cfg(rules)
             wb, ws, days = load_template_days(template)
             unav_map = load_unavailability(unav)
             slots, assignment, stats = solve_across_months(cfg, days, unav_map)
@@ -6680,7 +6458,7 @@ def main():
     rules = Path(args.rules)
     outp = Path(args.out)
     unav = Path(args.unavailability) if args.unavailability.strip() else None
-    cfg = load_rules(rules)
+    cfg = load_solver_cfg(rules)
     wb, ws, days = load_template_days(template, sheet_name=args.sheet if args.sheet else None)
     unav_map = load_unavailability(unav)
     slots, assignment, stats = solve_across_months(cfg, days, unav_map)

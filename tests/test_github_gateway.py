@@ -126,7 +126,18 @@ class GatewayTests(unittest.TestCase):
             github_utils.put_file("o", "r", "x", "t", "msg", "text", sha="old", max_wait=30)
 
         self.assertEqual(ctx.exception.response.status_code, 409)
-        self.assertEqual(len(self.calls), 1)
+        self.assertEqual([m for m, _t in self.calls].count("PUT"), 1, "il PUT non viene ripetuto")
+
+    def test_conflict_on_a_file_that_already_holds_the_text_is_a_success(self):
+        # Commit riuscito ma risposta persa: il nuovo tentativo vede "conflitto".
+        import base64
+        body = ('{"content": "%s", "sha": "new"}' % base64.b64encode(b"text").decode()).encode()
+        self.replies = [response(422, b'{"message": "sha wasn\'t supplied"}'), response(200, body)]
+
+        out = github_utils.put_file("o", "r", "x", "t", "msg", "text", sha="old", max_wait=30)
+
+        self.assertTrue(out.get("already_saved"))
+        self.assertEqual(out["content"]["sha"], "new")
 
     def test_writes_are_paced_under_github_content_limit(self):
         for i in range(5):
