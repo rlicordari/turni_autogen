@@ -3619,7 +3619,8 @@ def render_admin_generate_panel(cfg_admin: dict, doctors: list[str], rules_path:
                     "Assegnazioni fisse/sorteggio NON applicabili (aggiorna il sorteggio nella pagina Festivi): "
                     + "; ".join(
                         f"{check.get('date')} {check.get('column')}: {check.get('reason')} "
-                        f"→ assegnato a {', '.join(check.get('actual') or []) or 'nessuno'}"
+                        + (f"→ assegnato a {', '.join(check['actual'])}" if check.get('actual')
+                           else "→ lasciato vuoto (cella gialla)")
                         for check in _skipped_fixed
                     ),
                     icon="⚠️",

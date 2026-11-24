@@ -1486,15 +1486,21 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
     forced_j_by_date: Dict[dt.date, Set[str]] = {}
     forced_de_by_date: Dict[dt.date, str] = {}  # sorteggio DE (Mattina) festivi
     forced_hi_by_date: Dict[dt.date, str] = {}  # sorteggio HI (Pomeriggio) festivi
+    # Turni assegnati a un medico non attivo (es. in malattia dopo il sorteggio):
+    # restano VUOTI e gialli finché l'admin non li riassegna, mai dati al pool.
+    vacant_by_date: Dict[dt.date, Set[str]] = {}
     for fa in (fixed_assignments or []):
         fa_col = str(fa.get("column","")).strip().upper()
         try:
             fa_date = dt.date.fromisoformat(str(fa.get("date","")).strip())
             fa_doc = norm_name(str(fa.get("doctor","")).strip())
+            if fa_col in ("D", "H", "J") and fa_doc not in doctors_set:
+                vacant_by_date.setdefault(fa_date, set()).add(fa_col)
+                continue
             if fa_col == "J":
                 ok_fixed, _reason = _fixed_assignment_allowed(cfg, fa_col, fa_doc)
-                if not ok_fixed or fa_doc not in doctors_set:
-                    continue   # medico non attivo: la notte la copre il pool normale
+                if not ok_fixed:
+                    continue
                 forced_j_by_date.setdefault(fa_date, set()).add(fa_doc)
             elif fa_col == "D" and fa_doc in doctors_set:
                 # Il medico sorteggiato potrebbe non essere nel pool Festivi (es. Grimaldi, Calabrò)
@@ -1573,8 +1579,11 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
             # Se c'è un medico sorteggiato (anche escluso dal pool Festivi, es. Grimaldi/Calabrò),
             # lo mettiamo come UNICO allowed per evitare sum(allowed)==0==1 nel CP-SAT.
             _forced_de = forced_de_by_date.get(day.date)
+            _vacant_today = vacant_by_date.get(day.date, set())
             if _forced_de:
                 allowed_de = [_forced_de]
+            elif "D" in _vacant_today:
+                allowed_de = []
             else:
                 fest_pool_m = rFest.get("pool_mattina") or rFest.get("pool") or []
                 allowed_de = mk_allowed(fest_pool_m)
@@ -1583,12 +1592,16 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                 else:
                     allowed_de = [d for d in allowed_de if d not in fest_excl and d != "Recupero"]
                 allowed_de = apply_unavailability(allowed_de, day, "Mattina", unav)
-            slots.append(Slot(day, f"{day.date}-DE", ["D","E"], allowed_de, required=True, shift="Mattina", rule_tag="Festivo_DE"))
+            _vac = "D" in _vacant_today and not _forced_de
+            slots.append(Slot(day, f"{day.date}-DE", ["D","E"], allowed_de, required=not _vac,
+                              blank_penalty=5000 if _vac else 0, shift="Mattina", rule_tag="Festivo_DE"))
 
             # HI unified (H+I) – required
             _forced_hi = forced_hi_by_date.get(day.date)
             if _forced_hi:
                 allowed_hi = [_forced_hi]
+            elif "H" in _vacant_today:
+                allowed_hi = []
             else:
                 fest_pool_p = rFest.get("pool_pomeriggio") or rFest.get("pool") or []
                 allowed_hi = mk_allowed(fest_pool_p)
@@ -1597,7 +1610,9 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                 else:
                     allowed_hi = [d for d in allowed_hi if d not in fest_excl and d != "Recupero"]
                 allowed_hi = apply_unavailability(allowed_hi, day, "Pomeriggio", unav)
-            slots.append(Slot(day, f"{day.date}-HI", ["H","I"], allowed_hi, required=True, shift="Pomeriggio", rule_tag="Festivo_HI"))
+            _vac = "H" in _vacant_today and not _forced_hi
+            slots.append(Slot(day, f"{day.date}-HI", ["H","I"], allowed_hi, required=not _vac,
+                              blank_penalty=5000 if _vac else 0, shift="Pomeriggio", rule_tag="Festivo_HI"))
         else:
             # D / F (Mon-Sat)
             if "D_F" in rules and dayspec_contains(day.dow, rules["D_F"].get("days")):
@@ -1689,7 +1704,8 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                 _skip_j = (_is_normal_thu_blank and not _thu_suppressed_by_override) or _is_override_blank
             # Una notte assegnata dall'admin o dal sorteggio festivi (es. Vigilia di
             # Natale di giovedì) esiste sempre, anche nel giorno di J vuota.
-            if forced_j_by_date.get(day.date):
+            _vacant_j = "J" in vacant_by_date.get(day.date, set()) and not forced_j_by_date.get(day.date)
+            if forced_j_by_date.get(day.date) or _vacant_j:
                 _skip_j = False
             if not _skip_j:
                 # Se esiste un fixed_assignment in J per questo giorno,
@@ -1698,6 +1714,8 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                 forced_j_today = forced_j_by_date.get(day.date, set())
                 if forced_j_today:
                     allowed = [d for d in forced_j_today if d in doctors_set]
+                elif _vacant_j:
+                    allowed = []
                 else:
                     allowed = mk_allowed(rJ.get("pool_other") or [])
                     # add quota doctors even if not in pool_other
@@ -1718,7 +1736,8 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                         if _fest_notti_excl:
                             allowed = [d for d in allowed if norm_name(d) not in _fest_notti_excl]
                     allowed = apply_unavailability(allowed, day, "Notte", unav)
-                slots.append(Slot(day, f"{day.date}-J", ["J"], allowed, required=True, shift="Notte", rule_tag="J"))
+                slots.append(Slot(day, f"{day.date}-J", ["J"], allowed, required=not _vacant_j,
+                                  blank_penalty=5000 if _vacant_j else 0, shift="Notte", rule_tag="J"))
         # ---- K Letto (daily, but blank on Sundays/festivi)
         # If merge_KT_sat is enabled, we create a single combined slot K+T on Saturday.
         if merge_KT_sat:

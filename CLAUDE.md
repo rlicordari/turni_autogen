@@ -139,7 +139,7 @@ starttls = true
 
 ### Solver a fasi: mai perdere una soluzione già trovata
 
-`solve_with_ortools()` risolve in fasi successive (copertura → condivisioni K+T → servizi pesanti → obiettivo finale), ognuna con un vincolo "non peggio di prima". Ogni fase parte dalla soluzione della precedente (`_hint_current_solution`) e, se il tempo scade senza nuova soluzione, la riusa (`_solve_keeping_previous`). Fino a novembre 2026 l'ultima fase ripartiva da zero: dicembre 2026 (molte assenze a Natale) trovava l'ottimo alla fase 3, poi l'ultima fase restava UNKNOWN dopo 60 s e l'intero mese usciva "INFEASIBLE" e vuoto. Un'assegnazione fissa/sorteggio di un medico non attivo è "non applicabile" (avviso, il pool copre il turno); una notte assegnata in un giovedì di J vuota viene creata.
+`solve_with_ortools()` risolve in fasi successive (copertura → condivisioni K+T → servizi pesanti → obiettivo finale), ognuna con un vincolo "non peggio di prima". Ogni fase parte dalla soluzione della precedente (`_hint_current_solution`) e, se il tempo scade senza nuova soluzione, la riusa (`_solve_keeping_previous`). Fino a novembre 2026 l'ultima fase ripartiva da zero: dicembre 2026 (molte assenze a Natale) trovava l'ottimo alla fase 3, poi l'ultima fase restava UNKNOWN dopo 60 s e l'intero mese usciva "INFEASIBLE" e vuoto. Un'assegnazione fissa/sorteggio (D, H, J) di un medico non attivo è "non applicabile": il turno resta **vuoto e giallo** (mai dato al pool né al pool di emergenza) finché l'admin non lo riassegna nella pagina Festivi. Il sorteggio prevale sulle altre regole (le indisponibilità in conflitto vengono ignorate, `_strip_festivi_unavailability`); una notte assegnata in un giovedì di J vuota viene creata.
 
 ### IMPORTANTE: `num_search_workers` del CP-SAT solver
 

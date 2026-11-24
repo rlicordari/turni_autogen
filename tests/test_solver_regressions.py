@@ -266,18 +266,48 @@ class SolverRegressionTests(unittest.TestCase):
         self.assertEqual(assignment["2026-12-24-J"], "Trio")
         self.assertNotIn(stats.get("status"), ("INFEASIBLE", "PARTIAL"))
 
-    def test_night_draw_of_inactive_doctor_falls_back_to_the_pool(self):
-        # Sorteggio con un medico poi messo non attivo (malattia): la notte non deve
-        # restare senza candidati, la copre il pool normale.
+    def test_draw_of_inactive_doctor_leaves_the_shift_empty_and_yellow(self):
+        # Sorteggio con un medico poi messo non attivo (malattia): il turno NON va
+        # dato a un altro medico, resta vuoto e giallo finché l'admin non lo riassegna.
         import turni_generator as tg
-        cfg = {"rules": {"J": {"pool_other": ["Trio", "Cusmà"]}}, "global_constraints": {}}
+        cfg = {
+            "rules": {
+                "J": {"pool_other": ["Trio", "Cusmà"]},
+                "Festivi": {"pool": ["Trio", "Cusmà"]},
+            },
+            "global_constraints": {},
+            "pool_critical_services": {"D": {"fallback": "any"}, "H": {"fallback": "any"}, "J": {"fallback": "any"}},
+        }
         day = DayRow(dt.date(2026, 12, 25), "Fri", 26)
+        fixed = [
+            {"doctor": "Cimino", "date": "2026-12-25", "column": "D"},
+            {"doctor": "Cimino", "date": "2026-12-25", "column": "H"},
+            {"doctor": "Cimino", "date": "2026-12-25", "column": "J"},
+        ]
 
-        slots = tg.slots_for_month(cfg, [day], {}, fixed_assignments=[{"doctor": "Cimino", "date": "2026-12-25", "column": "J"}])
+        slots = tg.slots_for_month(cfg, [day], {}, fixed_assignments=fixed)
+
+        by_tag = {s.slot_id.rsplit("-", 1)[-1]: s for s in slots}
+        for tag in ("DE", "HI", "J"):
+            self.assertEqual(by_tag[tag].allowed, [], tag)
+            self.assertFalse(by_tag[tag].required, tag)
+            self.assertGreater(by_tag[tag].blank_penalty, 0, tag)   # → cella gialla
+
+        assignment, _stats = solve_with_ortools(cfg, [day], slots, fixed_assignments=fixed)
+        for tag in ("DE", "HI", "J"):
+            self.assertIsNone(assignment.get(by_tag[tag].slot_id), tag)
+
+    def test_night_draw_of_inactive_doctor_on_blank_thursday_is_an_empty_night(self):
+        import turni_generator as tg
+        cfg = {"rules": {"J": {"pool_other": ["Trio"], "thursday_blank": True}}, "global_constraints": {}}
+        thu = DayRow(dt.date(2026, 12, 24), "Thu", 25)
+
+        slots = tg.slots_for_month(cfg, [thu], {}, fixed_assignments=[{"doctor": "Cimino", "date": "2026-12-24", "column": "J"}])
 
         j = [s for s in slots if "J" in s.columns]
         self.assertEqual(len(j), 1)
-        self.assertEqual(sorted(j[0].allowed), ["Cusmà", "Trio"])
+        self.assertEqual(j[0].allowed, [])
+        self.assertGreater(j[0].blank_penalty, 0)
 
     def test_draw_of_inactive_doctor_is_reported_as_not_applicable(self):
         import turni_generator as tg
