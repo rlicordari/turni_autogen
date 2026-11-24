@@ -5786,7 +5786,9 @@ def write_output(
             continue
         bp = int(getattr(s, "blank_penalty", 0) or 0)
         _non_indispensable = _indispensable_mode and not any(c in _critical_cols for c in (s.columns or []))
-        if bp <= 0 and not _non_indispensable:
+        # Un turno obbligatorio rimasto vuoto (es. troppe assenze) è scoperto:
+        # giallo anche se indispensabile, altrimenti sembra un turno non previsto.
+        if bp <= 0 and not _non_indispensable and not s.required:
             continue
         for col in (s.columns or []):
             cell = ws[f"{col}{s.day.row_idx}"]

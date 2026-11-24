@@ -297,6 +297,27 @@ class SolverRegressionTests(unittest.TestCase):
         for tag in ("DE", "HI", "J"):
             self.assertIsNone(assignment.get(by_tag[tag].slot_id), tag)
 
+    def test_uncovered_essential_shift_is_yellow_in_the_output(self):
+        # 12/12/2026: troppe assenze, UTIC pomeriggio (H, servizio indispensabile)
+        # resta scoperta. Prima la cella usciva bianca, come un turno non previsto.
+        import tempfile, openpyxl
+        from pathlib import Path
+        import turni_generator as tg
+        wb = openpyxl.Workbook(); ws = wb.active
+        ws["A1"], ws["D1"], ws["H1"] = "Data", "UTIC mattina", "UTIC pomeriggio"
+        day = DayRow(dt.date(2026, 12, 12), "Sat", 2)
+        slots = [
+            Slot(day, "2026-12-12-D", ["D"], ["Trio"], required=True),
+            Slot(day, "2026-12-12-H", ["H"], ["Trio"], required=True),
+        ]
+        cfg = {"pool_critical_services": {"D": {"fallback": "any"}, "H": {"fallback": "any"}}}
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "out.xlsx"
+            tg.write_output(wb, ws, [day], slots, {"2026-12-12-D": "Trio", "2026-12-12-H": None}, out, cfg=cfg)
+            res = openpyxl.load_workbook(out).active
+            self.assertEqual(res["H2"].fill.start_color.rgb, "FFFFF2CC")
+            self.assertNotEqual(res["D2"].fill.start_color.rgb, "FFFFF2CC")
+
     def test_night_draw_of_inactive_doctor_on_blank_thursday_is_an_empty_night(self):
         import turni_generator as tg
         cfg = {"rules": {"J": {"pool_other": ["Trio"], "thursday_blank": True}}, "global_constraints": {}}
