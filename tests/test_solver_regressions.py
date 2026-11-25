@@ -1716,6 +1716,36 @@ class SolverRegressionTests(unittest.TestCase):
         self.assertLessEqual(q.count("C"), 1, q)
         self.assertIn(stats["lexicographic"]["service_fair_status"], ("OPTIMAL", "FEASIBLE"))
 
+    def test_cardiology_morning_is_shared_by_availability(self):
+        # Dicembre 2026: Manganaro 10 mattine E+G, Allegra 1 con 17 mattine libere.
+        names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+        days = [DayRow(dt.date(2026, 11, 2) + dt.timedelta(days=7 * w + i), names[i], 6 * w + i + 2)
+                for w in range(2) for i in range(6)]
+        cfg = {"rules": {"E_G": {"days": "Mon-Sat", "allowed": ["Manganaro", "Allegra", "Dattilo"]},
+                         "I": {"distribution_pool": ["Allegra", "Dattilo", "Crea", "Rubino"]},
+                         "K": {"pool": ["Manganaro", "Trio", "Licordari"]}},
+               "global_constraints": {}}
+        slots = slots_for_month(cfg, days, {})
+
+        assignment, _ = solve_with_ortools(cfg, days, slots)
+
+        eg = [assignment.get(s.slot_id) for s in slots if s.columns == ["E", "G"]]
+        self.assertEqual(sorted(eg.count(d) for d in ("Manganaro", "Allegra", "Dattilo")), [4, 4, 4], eg)
+
+    def test_fairness_stage_covers_ward_day_services_but_not_df_pair(self):
+        import turni_generator as tg
+        from ortools.sat.python import cp_model
+        day = DayRow(dt.date(2026, 11, 2), "Mon", 2)
+        slots = [Slot(day, "eg", ["E", "G"], ["A", "B"], required=True, rule_tag="E_G"),
+                 Slot(day, "h", ["H"], ["A", "B"], required=True, rule_tag="H"),
+                 Slot(day, "i", ["I"], ["A", "B"], required=True, rule_tag="I"),
+                 Slot(day, "d", ["D"], ["A", "B"], required=True, rule_tag="D_F.D"),
+                 Slot(day, "l", ["L"], ["A", "B"], required=False, rule_tag="L")]
+        model = cp_model.CpModel()
+        x = {(sl.slot_id, d): model.NewBoolVar(f"{sl.slot_id}{d}") for sl in slots for d in sl.allowed}
+        terms = tg._service_fairness_terms(model, slots, x, ["A", "B"], {})
+        self.assertEqual(len(terms), 8)   # E, H, I, L × 2 medici; la coppia D/F no
+
     def test_history_targets_even_out_definitive_shifts(self):
         import turni_generator as tg
         hist = {"A": {"J": {"total": 10}, "_months_counted": 5},
@@ -1751,6 +1781,13 @@ class SolverRegressionTests(unittest.TestCase):
         got = [assignment[f"2026-08-0{d}-C"] for d in (3, 4, 5, 6, 7)]
         self.assertGreaterEqual(got.count("B"), got.count("Nuovo"))
         self.assertGreaterEqual(got.count("Nuovo"), got.count("A"))
+
+    def test_reperibilita_is_evened_out_after_the_first_solution(self):
+        # Dicembre 2026: 3 reperibilità ad alcuni, 1 ad altri pur potendo pareggiare.
+        assignment, _ = self._c_case([["A", "B", "C"]] * 6, {}, spacing=2)
+        got = [assignment[f"2026-08-0{d}-C"] for d in range(3, 9)]
+        counts = sorted(got.count(x) for x in "ABC")
+        self.assertEqual(counts, [2, 2, 2], got)
 
     def test_reperibilita_c_desired_distribution_is_not_a_hard_cap(self):
         docs = ["A", "B", "C"]

@@ -770,6 +770,43 @@ def assign_reperibilita_C(cfg: dict, days: List[DayRow], slots: List[Slot],
             "Verifica giorni senza candidati o esclusioni del pool C."
         )
 
+    # Pareggio finale: la prima soluzione valida può dare 3 reperibilità a uno e
+    # 1 a un altro (dicembre 2026). Si sposta una C da chi ne ha di più a chi ne
+    # ha almeno 2 in meno, solo dove quest'ultimo è candidato (stesso livello di
+    # vicinanza alle notti usato dalla soluzione) e la distanza minima regge.
+    _strict_cands = _cand_levels[0][1] if _cand_levels else candidates_by_date
+    _final_cands = {d: set(_strict_cands.get(d) or []) | ({assigned[d]} if d in assigned else set())
+                    for d in c_dates}
+    def _rebalance_c() -> int:
+        moves = 0
+        improved = True
+        while improved:
+            improved = False
+            cnt = defaultdict(int)
+            dates_by = defaultdict(list)
+            for d, doc in assigned.items():
+                cnt[doc] += 1
+                dates_by[doc].append(d)
+            for d in sorted(assigned, key=lambda d: -cnt[assigned[d]]):
+                a = assigned[d]
+                if d in fixed_c_by_date:
+                    continue
+                for b in sorted(_final_cands[d], key=lambda doc: (cnt[doc], doc.lower())):
+                    if b == a or cnt[b] + 2 > cnt[a]:
+                        continue
+                    if cnt[b] + 1 > hard_cap_by_doc.get(b, max_per):
+                        continue
+                    if _spacing_tried > 1 and any(abs((d - o).days) < _spacing_tried for o in dates_by[b]):
+                        continue
+                    assigned[d] = b
+                    moves += 1
+                    improved = True
+                    break
+                if improved:
+                    break
+        return moves
+    _c_moves = _rebalance_c()
+
     # Write back into assignment
     for d in c_dates:
         assignment[cslot_by_date[d].slot_id] = assigned.get(d)
@@ -2193,6 +2230,10 @@ def _repair_heavy_festive_assignments(
 WARD_TAGS = {"J", "H", "I", "D_F.D", "D_F.F", "E_G", "Festivo_DE", "Festivo_HI", "C_reperibilita"}
 PRIORITY_SERVICE_TAGS = {"Q", "K", "T", "Y_MAIN", "U", "V", "W", "K_T_SAT"}
 PRIORITY_SERVICE_COLUMNS = ("Q", "K", "T", "Y", "U", "V", "W")
+# Servizi di giorno divisi in proporzione alla disponibilità (fase 6). Fuori:
+# coppia D/F (titolari), AC (un solo medico), C (reperibilità, regole sue), J
+# (fase 3). Dicembre 2026: Manganaro 10 mattine E+G, Allegra 1 con 17 libere.
+FAIRNESS_COLUMNS = ("E", "H", "I") + PRIORITY_SERVICE_COLUMNS + ("L", "R", "S", "Z", "AB")
 
 
 def coverage_tier(rule_tag: Optional[str]) -> str:
@@ -2205,45 +2246,85 @@ def coverage_tier(rule_tag: Optional[str]) -> str:
     return "other"
 
 
+def proportional_targets(capacity: Dict[str, int], n: int) -> Dict[str, int]:
+    """n turni divisi in proporzione ai giorni disponibili (resti più grandi),
+    mai oltre la disponibilità di ciascuno; la somma fa n (se possibile)."""
+    docs = sorted(d for d, c in capacity.items() if c > 0)
+    cap_sum = sum(capacity[d] for d in docs)
+    if not docs or n <= 0 or cap_sum <= 0:
+        return {d: 0 for d in capacity}
+    n = min(n, cap_sum)
+    exact = {d: n * capacity[d] / cap_sum for d in docs}
+    out = {d: min(capacity[d], int(math.floor(exact[d] + 1e-9))) for d in docs}
+    rest = n - sum(out.values())
+    frac = {d: round(exact[d] - math.floor(exact[d] + 1e-9), 9) for d in docs if out[d] < capacity[d]}
+    order = sorted(frac, key=lambda d: -frac[d])
+    if rest > 0 and order:
+        cut = frac[order[min(rest, len(order)) - 1]]
+        # Parità al taglio: +1 a tutti i pari (mai scegliere per ordine alfabetico).
+        for d in order:
+            if frac[d] > cut or (frac[d] == cut and frac[d] > 0):
+                out[d] += 1
+    return out
+
+
 def _service_fairness_terms(model, slots: List[Slot], x: dict, doctors, cfg: dict) -> list:
-    """Fase 6: per Q/K/T/Y/U/V/W, turni proporzionali ai giorni in cui ciascuno
-    può farli (chi è in ferie metà mese ne fa la metà).
+    """Fase 6: per ogni servizio di giorno (E+G, H, I, Q/K/T/Y/U/V/W, L, R, S, Z,
+    AB) una quota giusta per medico, proporzionale ai giorni in cui può farlo
+    (chi è in ferie metà mese ne fa la metà); si penalizza solo chi la supera.
+    I festivi (DE/HI) restano fuori: sono sorteggiati.
 
     Esclusi da questa equità: Recupero, chi ha una quota sul servizio nella
     scheda, il fisso del martedì in Ergometria e il titolare del turno doppio
-    di Sala PM (i loro turni sono già decisi dalla scheda).
+    di Sala PM (i loro turni sono già decisi dalla scheda); i turni che fanno
+    loro vengono tolti dal totale da dividere.
     """
     rules = cfg.get("rules") or {}
-    quota_docs = {(norm_name(d), str(c)) for (d, c) in (cfg.get("pool_quota_overrides") or {})}
+    # Si tolgono dal totale solo i turni che la scheda impone (quota fissa o
+    # minima); un tetto massimo non va "riservato", altrimenti chi ha il tetto
+    # (es. Recupero in Ergometria, max 8) finirebbe sempre al massimo.
+    quota_value = {(norm_name(d), str(c)): (int((spec or {}).get("value", 0) or 0)
+                                            if (spec or {}).get("type") in ("fixed", "min") else 0)
+                   for (d, c), spec in (cfg.get("pool_quota_overrides") or {}).items()}
+    recupero_reserve = {
+        "T": int((rules.get("T") or {}).get("recupero_min_per_month", 0) or 0),
+        "L": int((rules.get("L") or {}).get("quota_recupero_per_month", 0) or 0),
+    }
     fixed_by_col = {
-        "W": {norm_name((rules.get("W") or {}).get("tuesday_fixed") or "")},
-        "V": {norm_name((rules.get("V") or {}).get("friday_required_doctor") or "")},
+        "W": {norm_name((rules.get("W") or {}).get("tuesday_fixed") or "")} - {""},
+        "V": {norm_name((rules.get("V") or {}).get("friday_required_doctor") or "")} - {""},
     }
     terms = []
-    for col in PRIORITY_SERVICE_COLUMNS:
+    for col in FAIRNESS_COLUMNS:
         col_slots = [sl for sl in slots if col in (sl.columns or []) and sl.rule_tag not in ("Festivo_DE", "Festivo_HI")]
         by_doc: Dict[str, list] = defaultdict(list)
+        excluded_cap: Dict[str, int] = defaultdict(int)
+        n_shared = 0
         for sl in col_slots:
+            shared = False
             for d in sl.allowed or []:
                 dn = norm_name(d)
-                if dn == "Recupero" or (dn, col) in quota_docs or dn in fixed_by_col.get(col, set()):
-                    continue
                 v = x.get((sl.slot_id, dn))
-                if v is not None:
-                    by_doc[dn].append(v)
+                if v is None:
+                    continue
+                if dn == "Recupero" or (dn, col) in quota_value or dn in fixed_by_col.get(col, set()):
+                    excluded_cap[dn] += 1
+                    continue
+                by_doc[dn].append(v)
+                shared = True
+            n_shared += 1 if shared else 0
         docs = sorted(d for d, v in by_doc.items() if v)
         if len(docs) < 2:
             continue
-        cap = {d: len(by_doc[d]) for d in docs}
-        cap_sum = sum(cap.values())
-        total = sum(v for d in docs for v in by_doc[d])
+        reserved = sum(min(excluded_cap[d], quota_value.get((d, col), 0)) for d in excluded_cap)
+        if "Recupero" in excluded_cap:
+            reserved += min(excluded_cap["Recupero"], recupero_reserve.get(col, 0))
+        targets = proportional_targets({d: len(by_doc[d]) for d in docs}, max(0, n_shared - reserved))
         for d in docs:
-            # dev >= cnt_d * cap_sum - total * cap_d  (sopra la quota proporzionale)
-            dev = model.NewIntVar(0, cap_sum * len(by_doc[d]), f"svc_fair_{col}_{abs(hash(d)) % 10**6}")
-            model.Add(dev >= sum(by_doc[d]) * cap_sum - total * cap[d])
-            terms.append(dev)
+            over = model.NewIntVar(0, len(by_doc[d]), f"svc_fair_{col}_{abs(hash(d)) % 10**6}")
+            model.Add(over >= sum(by_doc[d]) - targets.get(d, 0))
+            terms.append(over)
     return terms
-
 
 HISTORY_BALANCE_WEIGHTS = {"J": 200_000, "J_weekend": 150_000, "festivi": 150_000}
 
@@ -2363,6 +2444,9 @@ def solve_with_ortools(
     # l'ultima fase si ferma presto e l'equità, mischiata a tutto il resto,
     # restava indietro (dicembre 2026: Allegra 1 notte, Colarusso 4).
     night_fair_terms = []
+    # Tetto contrattuale degli universitari (monte ore): rispettato già nella
+    # fase di equità dei servizi, non solo nelle rifiniture.
+    contract_over_vars = []
     kt_share_vars = []
     # Warnings raccolti durante la costruzione del modello (non bloccanti)
     pre_solve_warnings: List[str] = []
@@ -4543,6 +4627,7 @@ def solve_with_ortools(
             model.Add(_uni_over >= uni_cnt - (target + 1))
             model.Add(_uni_over >= 0)
             extra_obj.append(500_000 * _uni_over)
+            contract_over_vars.append(_uni_over)
             # FLOOR SOFT: penalizza se sotto target
             under = model.NewIntVar(0, target, f"uni_under_{hash(doc)%10**6}")
             model.Add(under >= target - uni_cnt)
@@ -4899,8 +4984,10 @@ def solve_with_ortools(
     # Fase 6 — equità fra chi ha attivi Q, K, T, Y, U, V, W.
     service_fair_status = None
     service_fair_terms = _service_fairness_terms(model, slots, x, doctors, cfg)
-    if service_fair_terms:
-        service_fair_status, _ = _stage(sum(service_fair_terms), min(_T, 15.0))
+    if service_fair_terms or contract_over_vars:
+        service_fair_status, _ = _stage(
+            1000 * sum(contract_over_vars) + sum(service_fair_terms), min(_T, 30.0)
+        )
 
     model.Minimize(sum(full_objective_terms))
     status = _solve_keeping_previous(model, solver, had_solution=have_solution)
