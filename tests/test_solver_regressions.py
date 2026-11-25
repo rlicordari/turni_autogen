@@ -1687,6 +1687,35 @@ class SolverRegressionTests(unittest.TestCase):
         # L'equità delle notti ha una fase di calcolo sua, prima delle rifiniture.
         self.assertIn(stats["lexicographic"]["night_fair_status"], ("OPTIMAL", "FEASIBLE"))
 
+    def test_fair_nights_come_before_covering_letto(self):
+        # Ordine voluto (25/11/2026): le notti eque vengono prima di Q/K/T/Y/U/V/W.
+        names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+        days = [DayRow(dt.date(2026, 11, 2) + dt.timedelta(days=i), names[i], i + 2) for i in range(6)]
+        cfg = {"rules": {"J": {"pool_other": ["A", "B"]}, "K": {"pool": ["A"]}},
+               "global_constraints": {"night_spacing_days_min": 0, "night_spacing_days_preferred": 0,
+                                      "night_off": {"same_day": True, "next_day": True}}}
+        slots = slots_for_month(cfg, days, {})
+
+        assignment, stats = solve_with_ortools(cfg, days, slots)
+
+        nights = [assignment.get(s.slot_id) for s in slots if s.columns == ["J"]]
+        self.assertEqual(nights.count("A"), 3, nights)
+        self.assertEqual(nights.count("B"), 3, nights)
+
+    def test_priority_services_are_shared_by_availability(self):
+        names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+        days = [DayRow(dt.date(2026, 11, 2) + dt.timedelta(days=i), names[i], i + 2) for i in range(6)]
+        cfg = {"rules": {"Q": {"days": "Mon-Sat", "pool": ["A", "B", "C"]}}, "global_constraints": {}}
+        unav = {"C": {days[i].date: {"Any"} for i in range(3)}}   # C c'è solo 3 giorni su 6
+        slots = slots_for_month(cfg, days, unav)
+
+        assignment, stats = solve_with_ortools(cfg, days, slots)
+
+        q = [assignment.get(s.slot_id) for s in slots if s.columns == ["Q"]]
+        self.assertEqual(sorted(q.count(d) for d in "ABC"), [1, 2, 3], q)   # 6:6:3 di disponibilità ≈ 2.4/2.4/1.2
+        self.assertLessEqual(q.count("C"), 1, q)
+        self.assertIn(stats["lexicographic"]["service_fair_status"], ("OPTIMAL", "FEASIBLE"))
+
     def test_history_targets_even_out_definitive_shifts(self):
         import turni_generator as tg
         hist = {"A": {"J": {"total": 10}, "_months_counted": 5},

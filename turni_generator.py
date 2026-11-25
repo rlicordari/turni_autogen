@@ -2190,6 +2190,61 @@ def _repair_heavy_festive_assignments(
     return repaired, swaps
 
 
+WARD_TAGS = {"J", "H", "I", "D_F.D", "D_F.F", "E_G", "Festivo_DE", "Festivo_HI", "C_reperibilita"}
+PRIORITY_SERVICE_TAGS = {"Q", "K", "T", "Y_MAIN", "U", "V", "W", "K_T_SAT"}
+PRIORITY_SERVICE_COLUMNS = ("Q", "K", "T", "Y", "U", "V", "W")
+
+
+def coverage_tier(rule_tag: Optional[str]) -> str:
+    """ward = reparto (fase 1); service = Q/K/T/Y/U/V/W (fase 4); other (fase 5)."""
+    tag = str(rule_tag or "")
+    if tag in WARD_TAGS:
+        return "ward"
+    if tag in PRIORITY_SERVICE_TAGS:
+        return "service"
+    return "other"
+
+
+def _service_fairness_terms(model, slots: List[Slot], x: dict, doctors, cfg: dict) -> list:
+    """Fase 6: per Q/K/T/Y/U/V/W, turni proporzionali ai giorni in cui ciascuno
+    può farli (chi è in ferie metà mese ne fa la metà).
+
+    Esclusi da questa equità: Recupero, chi ha una quota sul servizio nella
+    scheda, il fisso del martedì in Ergometria e il titolare del turno doppio
+    di Sala PM (i loro turni sono già decisi dalla scheda).
+    """
+    rules = cfg.get("rules") or {}
+    quota_docs = {(norm_name(d), str(c)) for (d, c) in (cfg.get("pool_quota_overrides") or {})}
+    fixed_by_col = {
+        "W": {norm_name((rules.get("W") or {}).get("tuesday_fixed") or "")},
+        "V": {norm_name((rules.get("V") or {}).get("friday_required_doctor") or "")},
+    }
+    terms = []
+    for col in PRIORITY_SERVICE_COLUMNS:
+        col_slots = [sl for sl in slots if col in (sl.columns or []) and sl.rule_tag not in ("Festivo_DE", "Festivo_HI")]
+        by_doc: Dict[str, list] = defaultdict(list)
+        for sl in col_slots:
+            for d in sl.allowed or []:
+                dn = norm_name(d)
+                if dn == "Recupero" or (dn, col) in quota_docs or dn in fixed_by_col.get(col, set()):
+                    continue
+                v = x.get((sl.slot_id, dn))
+                if v is not None:
+                    by_doc[dn].append(v)
+        docs = sorted(d for d, v in by_doc.items() if v)
+        if len(docs) < 2:
+            continue
+        cap = {d: len(by_doc[d]) for d in docs}
+        cap_sum = sum(cap.values())
+        total = sum(v for d in docs for v in by_doc[d])
+        for d in docs:
+            # dev >= cnt_d * cap_sum - total * cap_d  (sopra la quota proporzionale)
+            dev = model.NewIntVar(0, cap_sum * len(by_doc[d]), f"svc_fair_{col}_{abs(hash(d)) % 10**6}")
+            model.Add(dev >= sum(by_doc[d]) * cap_sum - total * cap[d])
+            terms.append(dev)
+    return terms
+
+
 HISTORY_BALANCE_WEIGHTS = {"J": 200_000, "J_weekend": 150_000, "festivi": 150_000}
 
 
@@ -2564,6 +2619,11 @@ def solve_with_ortools(
     }
     blank_required_vars: Dict[str, object] = {}  # slot_id -> b_blank var (for diagnostics)
     coverage_obj_terms: List = []
+    # Fasi (vedi sotto): 1) turni di reparto, 4) Q/K/T/Y/U/V/W alla pari,
+    # 5) tutti gli altri servizi.
+    coverage_ward_terms: List = []
+    coverage_service_blanks: List = []
+    coverage_other_terms: List = []
     optional_blank_vars: List = []
     for s in slots:
         vars_ = [x[(s.slot_id, d)] for d in s.allowed if (s.slot_id, d) in x]
@@ -2576,6 +2636,13 @@ def solve_with_ortools(
             penalty = _BLANK_PENALTY_BY_TAG.get(s.rule_tag, BLANK_REQUIRED_PENALTY)
             coverage_obj_terms.append(penalty * b_blank)
             blank_required_vars[s.slot_id] = b_blank
+            _tier = coverage_tier(s.rule_tag)
+            if _tier == "ward":
+                coverage_ward_terms.append(penalty * b_blank)
+            elif _tier == "service":
+                coverage_service_blanks.append(b_blank)
+            else:
+                coverage_other_terms.append(penalty * b_blank)
         else:
             # Optional slot: can be left blank. If blank_penalty>0, we penalize blanks so it is used only as a last resort.
             if getattr(s, "blank_penalty", 0) and int(getattr(s, "blank_penalty", 0)) > 0:
@@ -2585,7 +2652,10 @@ def solve_with_ortools(
                 b = model.NewBoolVar(f"blank_{hash(s.slot_id)%10**8}")
                 model.Add(sum(vars_) + b == 1)
                 extra_obj.append(b * int(getattr(s, "blank_penalty", 0)))
-                optional_blank_vars.append(b)
+                if coverage_tier(s.rule_tag) == "service":
+                    coverage_service_blanks.append(b)
+                else:
+                    optional_blank_vars.append(b)
             else:
                 model.Add(sum(vars_) <= 1)
     # Penalità per medici di emergenza (non nel pool primario della colonna)
@@ -3929,12 +3999,14 @@ def solve_with_ortools(
                     model.Add(over_cap >= we_cnt - we_hard_cap)
                     model.Add(over_cap >= 0)
                     extra_obj.append(we_cap_penalty * over_cap)
+                    night_fair_terms.append(we_cap_penalty * over_cap)
                 we_cnt_vars.append(we_cnt)
                 if we_hard_cap > we_soft_target:
                     over_tgt = model.NewIntVar(0, len(we_vars) + prior_we_doc, f"we_over_tgt_{hash(doc)%10**6}")
                     model.Add(over_tgt >= we_cnt - we_soft_target)
                     model.Add(over_tgt >= 0)
                     extra_obj.append(max(we_spread_penalty // 4, 1) * over_tgt)
+                    night_fair_terms.append(max(we_spread_penalty // 4, 1) * over_tgt)
         if we_cnt_vars:
             we_upper = max(month_we_nights, 1)
             we_max = model.NewIntVar(0, we_upper, "we_night_max")
@@ -3946,6 +4018,7 @@ def solve_with_ortools(
                 model.Add(we_diff == we_max - we_min)
                 if we_spread_penalty > 0:
                     extra_obj.append(we_spread_penalty * we_diff)
+                    night_fair_terms.append(we_spread_penalty * we_diff)
 
         # Per-doctor J type split: for the same total number of J, prefer a
         # balanced split between feriali and festive/weekend nights. This makes
@@ -4747,6 +4820,8 @@ def solve_with_ortools(
                 _over = model.NewIntVar(0, len(_vars), f"hist_{_cat}_over_{abs(hash(_doc)) % 10 ** 6}")
                 model.Add(_over >= sum(_vars) - _t)
                 extra_obj.append(_weight * _over)
+                if _cat in ("J", "J_weekend"):
+                    night_fair_terms.append(_weight * _over)
 
     full_objective_terms = objective_terms + extra_obj + coverage_obj_terms
     coverage_expr = sum(coverage_obj_terms) if coverage_obj_terms else 0
@@ -4771,76 +4846,61 @@ def solve_with_ortools(
             return str(st)
 
     have_solution = False
-    if coverage_obj_terms:
-        model.Minimize(coverage_expr)
-        coverage_status = solver.Solve(model)
-        if coverage_status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+    _T = solver.parameters.max_time_in_seconds
+
+    def _stage(expr, time_limit):
+        """Minimize expr keeping every previous result; lock it (non-worsening)."""
+        nonlocal have_solution
+        model.Minimize(expr)
+        st = _solve_keeping_previous(model, solver, had_solution=have_solution, time_limit=time_limit)
+        value = None
+        if st in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             have_solution = True
             _hint_current_solution(model, solver)
-            coverage_cost = int(solver.Value(coverage_expr))
-            if coverage_status == cp_model.OPTIMAL:
-                model.Add(coverage_expr == coverage_cost)
+            value = int(solver.Value(expr))
+            if st == cp_model.OPTIMAL:
+                model.Add(expr == value)
             else:
-                # If coverage proof times out, keep the best found coverage as
-                # a non-worsening ceiling. Otherwise the final objective can
-                # drift back to a schedule with more blanks.
-                model.Add(coverage_expr <= coverage_cost)
+                model.Add(expr <= value)
+        return st, value
 
-    # K+T is a fallback. Preserve required coverage first, optional service
-    # coverage second, then minimize K+T shares. This stops ordinary balance
-    # costs from buying an unnecessary share without sacrificing other services.
-    if kt_share_vars and coverage_status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        kt_share_expr = sum(kt_share_vars)
-        optional_blank_expr = sum(optional_blank_vars) if optional_blank_vars else 0
-        kt_scale = len(kt_share_vars) + 1
-        coverage_scale = (len(optional_blank_vars) + 1) * kt_scale
-        kt_priority_expr = (
-            coverage_scale * coverage_expr
-            + kt_scale * optional_blank_expr
-            + kt_share_expr
-        )
-        model.Minimize(kt_priority_expr)
-        kt_share_status = _solve_keeping_previous(
-            model, solver, had_solution=have_solution,
-            time_limit=min(solver.parameters.max_time_in_seconds, 20.0),
-        )
-        if kt_share_status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            have_solution = True
-            _hint_current_solution(model, solver)
-            kt_priority_cost = int(solver.Value(kt_priority_expr))
-            kt_share_count = int(solver.Value(kt_share_expr))
-            optional_blank_count = int(solver.Value(optional_blank_expr)) if optional_blank_vars else 0
-            if kt_share_status == cp_model.OPTIMAL:
-                model.Add(kt_priority_expr == kt_priority_cost)
-            else:
-                model.Add(kt_priority_expr <= kt_priority_cost)
-
+    # Fase 1 — turni di reparto (notte, UTIC, Cardiologia, D/F, E+G, festivi).
+    if coverage_ward_terms:
+        coverage_status, coverage_cost = _stage(sum(coverage_ward_terms), min(_T, 30.0))
+    # Fase 2 — festivi pesanti: notti di sabato/domenica/festivi e domeniche di
+    # giorno ben distribuite (i festivi sorteggiati sono già fissati).
     heavy_priority_expr = sum(heavy_priority_terms) if heavy_priority_terms else 0
     if heavy_priority_terms:
-        model.Minimize(heavy_priority_expr)
-        heavy_status = _solve_keeping_previous(model, solver, had_solution=have_solution)
-        if heavy_status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            have_solution = True
-            _hint_current_solution(model, solver)
-            heavy_cost = int(solver.Value(heavy_priority_expr))
-            if heavy_status == cp_model.OPTIMAL:
-                model.Add(heavy_priority_expr == heavy_cost)
-            else:
-                model.Add(heavy_priority_expr <= heavy_cost)
-
+        heavy_status, heavy_cost = _stage(heavy_priority_expr, min(_T, 20.0))
+    # Fase 3 — equità delle notti: totale e sabato/domenica, quote fisse della
+    # scheda, storico definitivo.
     night_fair_status = None
     night_fair_cost = None
-    if night_fair_terms and have_solution:
-        night_fair_expr = sum(night_fair_terms)
-        model.Minimize(night_fair_expr)
-        night_fair_status = _solve_keeping_previous(
-            model, solver, had_solution=have_solution,
-            time_limit=min(solver.parameters.max_time_in_seconds, 20.0),
+    if night_fair_terms:
+        night_fair_status, night_fair_cost = _stage(sum(night_fair_terms), min(_T, 20.0))
+    # Fase 4 — Q, K, T, Y, U, V, W coperti, tutti alla pari.
+    service_status = None
+    service_blank_count = None
+    if coverage_service_blanks:
+        service_status, service_blank_count = _stage(sum(coverage_service_blanks), min(_T, 15.0))
+    # Fase 5 — gli altri servizi, poi meno Letto+Interni allo stesso medico.
+    _other_expr = sum(coverage_other_terms) if coverage_other_terms else 0
+    _optional_expr = sum(optional_blank_vars) if optional_blank_vars else 0
+    _kt_expr = sum(kt_share_vars) if kt_share_vars else 0
+    if coverage_other_terms or optional_blank_vars or kt_share_vars:
+        _kt_scale = len(kt_share_vars) + 1
+        _opt_scale = (len(optional_blank_vars) + 1) * _kt_scale
+        kt_share_status, _ = _stage(
+            _opt_scale * _other_expr + _kt_scale * _optional_expr + _kt_expr, min(_T, 15.0)
         )
-        if night_fair_status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            _hint_current_solution(model, solver)
-            night_fair_cost = int(solver.Value(night_fair_expr))
-            model.Add(night_fair_expr <= night_fair_cost)
+        if kt_share_status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            kt_share_count = int(solver.Value(_kt_expr)) if kt_share_vars else 0
+            optional_blank_count = int(solver.Value(_optional_expr)) if optional_blank_vars else 0
+    # Fase 6 — equità fra chi ha attivi Q, K, T, Y, U, V, W.
+    service_fair_status = None
+    service_fair_terms = _service_fairness_terms(model, slots, x, doctors, cfg)
+    if service_fair_terms:
+        service_fair_status, _ = _stage(sum(service_fair_terms), min(_T, 15.0))
 
     model.Minimize(sum(full_objective_terms))
     status = _solve_keeping_previous(model, solver, had_solution=have_solution)
@@ -5148,6 +5208,9 @@ def solve_with_ortools(
             "heavy_cost": heavy_cost,
             "night_fair_status": _status_name(night_fair_status),
             "night_fair_cost": night_fair_cost,
+            "service_status": _status_name(service_status),
+            "service_blank_count": service_blank_count,
+            "service_fair_status": _status_name(service_fair_status),
             "final_status": _status_name(status),
         },
     }
