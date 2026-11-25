@@ -1663,6 +1663,30 @@ class SolverRegressionTests(unittest.TestCase):
         self.assertEqual(got.count("B"), 2)
         self.assertEqual(got.count("A"), 1)
 
+    def test_doctor_protected_for_small_afternoon_pool_still_gets_fair_nights(self):
+        # Dicembre 2026: Allegra (una delle poche per Cardiologia pomeriggio) 1 notte,
+        # Colarusso 4. La protezione dei servizi piccoli non deve battere l'equità delle notti.
+        names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+        days = []
+        for w in range(2):
+            for i in range(6):
+                d = dt.date(2026, 11, 2) + dt.timedelta(days=7 * w + i)
+                days.append(DayRow(d, names[i], len(days) + 2))
+        others = ["Colarusso", "Cusmà", "Licordari", "Trio", "Rubino"]
+        cfg = {"rules": {"J": {"pool_other": ["Allegra"] + others},
+                         "I": {"distribution_pool": ["Allegra", "Crea", "Dattilo"]}},
+               "global_constraints": {"night_spacing_days_min": 0, "night_spacing_days_preferred": 0,
+                                      "night_off": {"same_day": True, "next_day": True}}}
+        slots = slots_for_month(cfg, days, {})
+
+        assignment, stats = solve_with_ortools(cfg, days, slots)
+
+        nights = [assignment.get(s.slot_id) for s in slots if s.columns == ["J"]]
+        counts = {d: nights.count(d) for d in ["Allegra"] + others}
+        self.assertEqual(sorted(counts.values()), [2, 2, 2, 2, 2, 2], counts)
+        # L'equità delle notti ha una fase di calcolo sua, prima delle rifiniture.
+        self.assertIn(stats["lexicographic"]["night_fair_status"], ("OPTIMAL", "FEASIBLE"))
+
     def test_history_targets_even_out_definitive_shifts(self):
         import turni_generator as tg
         hist = {"A": {"J": {"total": 10}, "_months_counted": 5},

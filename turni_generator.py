@@ -2303,6 +2303,11 @@ def solve_with_ortools(
     # Collect extra objective terms built during constraint setup
     extra_obj = []
     heavy_priority_terms = []
+    # Equità delle notti fra i medici senza quota fissa: ha una fase di calcolo
+    # tutta sua (dopo copertura, K+T e festivi pesanti). Su un server lento
+    # l'ultima fase si ferma presto e l'equità, mischiata a tutto il resto,
+    # restava indietro (dicembre 2026: Allegra 1 notte, Colarusso 4).
+    night_fair_terms = []
     kt_share_vars = []
     # Warnings raccolti durante la costruzione del modello (non bloccanti)
     pre_solve_warnings: List[str] = []
@@ -2997,7 +3002,9 @@ def solve_with_ortools(
     # when the night pool has alternatives, because night_off_next_day would
     # remove them from tomorrow's scarce service.
     try:
-        next_day_tiny_penalty = int((gc.get("next_day_tiny_pool_night_penalty", 60_000_000) or 60_000_000))
+        # Preferenza debole: non deve mai battere l'equità delle notti
+        # (dicembre 2026: Allegra 1 notte, Colarusso 4).
+        next_day_tiny_penalty = int((gc.get("next_day_tiny_pool_night_penalty", 10_000_000) or 10_000_000))
         if next_day_tiny_penalty > 0:
             day_by_date = {d.date: d for d in days}
             for day in days:
@@ -3468,7 +3475,7 @@ def solve_with_ortools(
     # Licordari, Colarusso e gli altri: nessuna quota fissa qui — bilanciamento
     # soft [min_per, max_per] gestito più sotto (target 2, fino a 3 se necessario).
     J_QUOTA_DEV_PENALTY = 8_000_000   # default
-    J_QUOTA_STRICT_PENALTY = 25_000_000  # Zito, Dattilo, Calabrò — quasi-obbligatorio
+    J_QUOTA_STRICT_PENALTY = 200_000_000  # quota notti "fissa" della scheda: pari all'equità delle notti
     # Quota "fissa" nella scheda medico = quasi obbligatoria e mai superata.
     _j_strict_docs = {norm_name(k) for k in ((cfg.get("rules") or {}).get("J") or {}).get("monthly_quotas") or {}}
     if "rules" in cfg and "J" in cfg["rules"]:
@@ -3502,6 +3509,7 @@ def solve_with_ortools(
                     model.Add(_jsup >= sum(vars_) - q_target)
                     model.Add(_jsup >= 0)
                     extra_obj.append(_pen * _jsup)
+                    night_fair_terms.append(_pen * _jsup)
             else:
                 # Soft surplus per gli altri (hard upper già gestito da pool_quota_overrides)
                 _jsup = model.NewIntVar(0, n_avail, f"jsup_{hash(doc)%10**6}")
@@ -3515,6 +3523,8 @@ def solve_with_ortools(
             model.Add(_jdef >= q_target - _jsum)
             model.Add(_jdef >= 0)
             extra_obj.append(_pen * _jdef)
+            if _strict:
+                night_fair_terms.append(_pen * _jdef)
     # Pool quota overrides max/min — da pool_config (tutti i tipi e colonne)
     qov = cfg.get("pool_quota_overrides") or {}
     for (doc_n, col), spec in qov.items():
@@ -3802,7 +3812,10 @@ def solve_with_ortools(
                 # max_per = min_per se il resto è 0, altrimenti min_per+1
                 max_per = min_per + (1 if remainder > 0 else 0)
                 max_per = max(max_per, 0)  # sicurezza: mai negativo
-                free_quota_penalty = int(rJ.get("free_night_quota_penalty", 30_000_000) or 0)
+                # Equità delle notti sopra ogni preferenza secondaria (protezioni dei
+                # servizi piccoli, concentrazioni festive…), sotto la copertura dei turni
+                # (un turno scoperto costa almeno 300M).
+                free_quota_penalty = int(rJ.get("free_night_quota_penalty", 200_000_000) or 0)
                 free_spread_penalty = int(rJ.get("free_night_spread_penalty", 20_000_000) or 0)
 
                 for doc in free_docs:
@@ -3819,10 +3832,12 @@ def solve_with_ortools(
                                 model.Add(under_free >= cur_min - cur_sum)
                                 model.Add(under_free >= 0)
                                 extra_obj.append(free_quota_penalty * under_free)
+                                night_fair_terms.append(free_quota_penalty * under_free)
                             over_free = model.NewIntVar(0, len(vars_), f"j_free_over_{hash(doc)%10**6}")
                             model.Add(over_free >= cur_sum - cur_max)
                             model.Add(over_free >= 0)
                             extra_obj.append(free_quota_penalty * over_free)
+                            night_fair_terms.append(free_quota_penalty * over_free)
 
                 # Soft balance: minimizza la differenza max-min tra i medici liberi.
                 # Deve avere un peso reale: con pesi bassi il solver può accettare
@@ -3844,6 +3859,7 @@ def solve_with_ortools(
                         diff_cnt = model.NewIntVar(0, month_free_total, "night_diff_free")
                         model.Add(diff_cnt == max_cnt - min_cnt)
                         extra_obj.append(free_spread_penalty * diff_cnt)
+                        night_fair_terms.append(free_spread_penalty * diff_cnt)
 
         # Weekday J balance: separate from weekend nights. The total J balance
         # alone can hide an uneven split between Mon-Fri nights and Sat/Sun.
@@ -4812,6 +4828,20 @@ def solve_with_ortools(
             else:
                 model.Add(heavy_priority_expr <= heavy_cost)
 
+    night_fair_status = None
+    night_fair_cost = None
+    if night_fair_terms and have_solution:
+        night_fair_expr = sum(night_fair_terms)
+        model.Minimize(night_fair_expr)
+        night_fair_status = _solve_keeping_previous(
+            model, solver, had_solution=have_solution,
+            time_limit=min(solver.parameters.max_time_in_seconds, 20.0),
+        )
+        if night_fair_status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            _hint_current_solution(model, solver)
+            night_fair_cost = int(solver.Value(night_fair_expr))
+            model.Add(night_fair_expr <= night_fair_cost)
+
     model.Minimize(sum(full_objective_terms))
     status = _solve_keeping_previous(model, solver, had_solution=have_solution)
     if status not in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
@@ -5116,6 +5146,8 @@ def solve_with_ortools(
             "optional_blank_count": optional_blank_count,
             "heavy_status": _status_name(heavy_status),
             "heavy_cost": heavy_cost,
+            "night_fair_status": _status_name(night_fair_status),
+            "night_fair_cost": night_fair_cost,
             "final_status": _status_name(status),
         },
     }
