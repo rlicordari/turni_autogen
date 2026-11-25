@@ -39,6 +39,7 @@ import xlsx_utils
 import shift_history as sh
 import doctor_registry as dreg
 import doctor_admin_ui
+import entry_window as ew
 from fixed_assignment_options import parse_fixed_assignment_rows
 
 # Import generator
@@ -1570,6 +1571,8 @@ DEFAULT_SETTINGS = {
     # Copie della mail di resoconto a ogni salvataggio (oltre al medico).
     # Modificabile dal pannello admin; si somma a secrets [notifications] receipt_cc.
     "receipt_cc_emails": ["utic@polime.it"],
+    # Il mese successivo si chiude da solo il giorno N alle 00:00 (ora italiana); 0 = mai.
+    "auto_close_day": ew.DEFAULT_CLOSE_DAY,
 }
 
 AUDIT_FIELDS = usvc.AUDIT_FIELDS
@@ -1649,6 +1652,8 @@ def _load_app_settings_uncached() -> tuple[dict, str | None]:
         cc = receipts.parse_email_list(cc)
     if isinstance(cc, list):
         out["receipt_cc_emails"] = [str(x).strip() for x in cc if str(x).strip()]
+
+    out["auto_close_day"] = ew.normalize_close_day(data.get("auto_close_day", DEFAULT_SETTINGS["auto_close_day"]))
 
     # optional metadata
     out["updated_at"] = str(data.get("updated_at") or "")
@@ -3595,11 +3600,23 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-mode = st.sidebar.radio(
-    "Sezione",
-    ["📋 Le mie indisponibilità", "⚙️ Admin — Genera turni", "👩‍⚕️ Admin — Medici", "🎄 Admin — Festivi", "📊 Admin — Storico turni", "🔧 Admin — Configurazione"],
-    index=0,
-)
+# Le pagine admin compaiono nella barra solo dopo la password admin:
+# prima i medici vedono solo la propria pagina e "Accesso admin".
+DOCTOR_PAGE = "📋 Le mie indisponibilità"
+ADMIN_ENTRY = "🔐 Accesso admin"
+ADMIN_PAGES = ["⚙️ Admin — Genera turni", "👩‍⚕️ Admin — Medici", "🎄 Admin — Festivi",
+               "📊 Admin — Storico turni", "🔧 Admin — Configurazione"]
+_admin_in = bool(st.session_state.get("admin_auth_ok"))
+_nav_options = [DOCTOR_PAGE] + (ADMIN_PAGES if _admin_in else [ADMIN_ENTRY])
+if "_nav_next" in st.session_state:          # cambio pagina chiesto dal run precedente
+    st.session_state["nav_mode"] = st.session_state.pop("_nav_next")
+if st.session_state.get("nav_mode") not in _nav_options:
+    st.session_state["nav_mode"] = DOCTOR_PAGE
+mode = st.sidebar.radio("Sezione", _nav_options, key="nav_mode")
+if _admin_in and st.sidebar.button("🚪 Esci da Admin", help="Chiude la sessione Admin su questo browser."):
+    st.session_state.admin_auth_ok = False
+    st.session_state["_nav_next"] = DOCTOR_PAGE
+    st.rerun()
 
 # Doctor list: only the doctor cards (Admin → Medici)
 cfg_default = tg.load_rules(DEFAULT_RULES_PATH)
@@ -3873,15 +3890,14 @@ if mode == "📋 Le mie indisponibilità":
     }
 
 
-    # Default month/year: NEXT month relative to today's date (es. Febbraio -> Marzo)
-
+    # Default: il primo mese ancora aperto (il successivo, o quello dopo se
+    # il successivo si è già chiuso automaticamente il giorno di chiusura).
     _first_of_this_month = today.replace(day=1)
-
-    _first_of_next_month = (_first_of_this_month + timedelta(days=32)).replace(day=1)
-
-    default_year = _first_of_next_month.year
-
-    default_month = _first_of_next_month.month
+    try:
+        _close_day = load_app_settings_from_github()[0].get("auto_close_day", ew.DEFAULT_CLOSE_DAY)
+    except Exception:
+        _close_day = ew.DEFAULT_CLOSE_DAY
+    default_year, default_month = ew.first_open_month(ew.now_local(), _close_day)
 
 
     # Set defaults once per session (do not override user choices on rerun)
@@ -3985,8 +4001,30 @@ if mode == "📋 Le mie indisponibilità":
     if max_weekend_days_cfg < 0:
         max_weekend_days_cfg = 0
 
+    closed_msg = ""
+    # Chiusura automatica del mese mostrato (giorno di chiusura alle 00:00, ora italiana)
+    _close_day = ew.normalize_close_day(app_settings.get("auto_close_day", ew.DEFAULT_CLOSE_DAY))
+    _deadline = ew.month_deadline(active_month[0], active_month[1], _close_day)
+    _month_label = f"{month_names[active_month[1]]} {active_month[0]}"
+    _month_open = ew.month_is_open(active_month[0], active_month[1], ew.now_local(), _close_day)
     if not unav_open:
+        closed_msg = "Inserimento chiuso dall'amministratore: puoi solo visualizzare."
         st.warning("🔒 Inserimento indisponibilità temporaneamente **chiuso** dall'amministratore. Puoi solo visualizzare (non puoi salvare).")
+    elif not _month_open:
+        unav_open = False
+        closed_msg = (f"Inserimento per {_month_label} chiuso il {_deadline:%d/%m/%Y} alle 00:00: "
+                      "puoi solo visualizzare. Per modifiche urgenti contatta l'amministratore.")
+        st.warning(
+            f"🔒 L'inserimento per **{_month_label}** si è chiuso automaticamente il "
+            f"**{_deadline:%d/%m/%Y} alle 00:00**. Puoi solo visualizzare; per modifiche urgenti "
+            "contatta l'amministratore."
+        )
+    elif _deadline is not None:
+        st.info(
+            f"⏰ Puoi inserire o modificare **{_month_label}** fino al "
+            f"**{_deadline - timedelta(days=1):%d/%m/%Y}** compreso: il {_deadline:%d/%m} alle 00:00 "
+            "l'inserimento si chiude automaticamente."
+        )
     if max_per_shift_for_doctor != max_per_shift:
         st.caption(
             f"Limite per fascia al mese: **max {max_per_shift_for_doctor}** "
@@ -4227,7 +4265,24 @@ if mode == "📋 Le mie indisponibilità":
                 ]
             else:
                 # Inserimento chiuso dall'amministratore: sola lettura
-                st.info("🔒 Inserimento chiuso dall'amministratore: puoi solo visualizzare.")
+                st.info(f"🔒 {closed_msg}")
+                # Il calendario (con le sue frecce) non c'è: frecce qui per cambiare mese.
+                _nav_prev, _nav_next = st.columns(2)
+
+                def _shift_month(delta: int) -> tuple[int, int]:
+                    _y, _m = yy, mm + delta
+                    return (_y + (_m - 1) // 12, (_m - 1) % 12 + 1)
+
+                with _nav_prev:
+                    if st.button("‹ Mese precedente", key=f"closed_prev_{yy}_{mm}", width="stretch",
+                                 disabled=not (active_month > _month_min)):
+                        st.session_state.doctor_active_month = _shift_month(-1)
+                        st.rerun()
+                with _nav_next:
+                    if st.button("Mese successivo ›", key=f"closed_next_{yy}_{mm}", width="stretch",
+                                 disabled=not (active_month < _month_max)):
+                        st.session_state.doctor_active_month = _shift_month(1)
+                        st.rerun()
                 st.dataframe(init, width="stretch", hide_index=True)
                 if existing_avail:
                     st.caption("Preferenze registrate")
@@ -4328,7 +4383,7 @@ if mode == "📋 Le mie indisponibilità":
 
     if save:
         if not unav_open:
-            st.error("Inserimento indisponibilità chiuso dall'amministratore: non è possibile salvare.")
+            st.error(f"{closed_msg} Non è possibile salvare.")
             st.stop()
 
         # Force a lease ownership check right before saving (no throttle).
@@ -4473,26 +4528,19 @@ else:
 
     if not st.session_state.admin_auth_ok:
         with st.form("admin_login"):
-            pin = st.text_input("PIN Admin", type="password")
-            ok = st.form_submit_button("Sblocca area Admin", type="primary")
+            pin = st.text_input("Password admin", type="password", key="admin_password")
+            ok = st.form_submit_button("Entra", type="primary")
 
         if not ok:
             st.stop()
-        if pin != admin_pin:
-            st.error("PIN Admin errato.")
+        if not hmac.compare_digest(str(pin), admin_pin):
+            st.error("Password admin errata.")
             st.stop()
 
         st.session_state.admin_auth_ok = True
-        # Rerun to avoid re-submitting the form on next widget interaction
+        # Si apre il pannello completo nella barra a sinistra.
+        st.session_state["_nav_next"] = ADMIN_PAGES[0]
         st.rerun()
-
-    col_logout, col_status = st.columns([1, 3])
-    with col_logout:
-        if st.button("Esci (Admin)", help="Chiude la sessione Admin su questo browser."):
-            st.session_state.admin_auth_ok = False
-            st.rerun()
-    with col_status:
-        st.success("Area Admin sbloccata ✅")
 
     # Carica cfg una volta per entrambi i rami (Genera e Configurazione)
     cfg_admin = tg.load_rules(DEFAULT_RULES_PATH)
@@ -4563,6 +4611,22 @@ else:
                 value=cur_open,
                 help="Se disattivato, i medici possono solo visualizzare le proprie indisponibilità ma non salvarle.",
             )
+            _cur_close = ew.normalize_close_day(app_settings.get("auto_close_day", ew.DEFAULT_CLOSE_DAY))
+            new_close_day = st.number_input(
+                "Chiusura automatica: giorno del mese (alle 00:00, 0 = mai)",
+                min_value=0,
+                max_value=28,
+                value=int(_cur_close),
+                step=1,
+                help="Il giorno N alle 00:00 (ora italiana) si chiude l'inserimento per il mese successivo; "
+                     "i mesi dopo restano aperti. Esempio 21: dicembre si chiude il 21 novembre alle 00:00.",
+            )
+            if int(new_close_day):
+                _nxt = ew.first_open_month(ew.now_local(), int(new_close_day))
+                st.caption(
+                    f"Oggi i medici possono modificare da **{_nxt[1]:02d}/{_nxt[0]}** in poi "
+                    f"(chiude il {ew.month_deadline(_nxt[0], _nxt[1], int(new_close_day)):%d/%m/%Y} alle 00:00)."
+                )
             _aS1, _aS2, _aS3, _aS4 = st.columns([1, 1, 1, 1.5])
             with _aS1:
                 new_max = st.number_input(
@@ -4649,6 +4713,7 @@ else:
                     "max_weekend_days": int(new_max_weekend),
                     "doctor_caps": {doc: int(v) for doc, v in new_doctor_caps.items()},
                     "receipt_cc_emails": [a for a in new_receipt_cc if a not in _bad_cc],
+                    "auto_close_day": int(new_close_day),
                     "updated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
                     "updated_by": "admin",
                 }

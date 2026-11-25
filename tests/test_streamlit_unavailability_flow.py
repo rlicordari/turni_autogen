@@ -38,6 +38,10 @@ ROWS_KEY = f"unav_rows_{DOCTOR}_{YY}_{MM}"
 OFFICIAL = "data/unavailability/unavail_migliorato.csv"
 DRAFT = "data/unavailability_drafts/draft_migliorato.json"
 AVAIL = "data/availability/avail_migliorato.csv"
+DOCTOR_PAGE = "📋 Le mie indisponibilità"
+ADMIN_ENTRY = "🔐 Accesso admin"
+ADMIN_PAGES = ["⚙️ Admin — Genera turni", "👩‍⚕️ Admin — Medici", "🎄 Admin — Festivi",
+               "📊 Admin — Storico turni", "🔧 Admin — Configurazione"]
 
 
 def day(n: int) -> dt.date:
@@ -130,7 +134,7 @@ class DoctorUnavailabilityFlowTests(unittest.TestCase):
         self.gh.seed("data/doctor_contacts.yml", f"{DOCTOR}:\n  email: migliorato@example.org\n")
         self.gh.seed(
             "data/unavailability_settings.yml",
-            "unavailability_open: true\nmax_unavailability_per_shift: 6\nmax_weekend_days: 4\n"
+            "unavailability_open: true\nmax_unavailability_per_shift: 6\nmax_weekend_days: 4\nauto_close_day: 0\n"
             "receipt_cc_emails:\n- admin@example.org\n- utic@polime.it\n",
         )
         FakeSMTP.sent = []
@@ -239,6 +243,28 @@ class DoctorUnavailabilityFlowTests(unittest.TestCase):
         self.assertEqual(self.gh.files[OFFICIAL][1], official_sha_before)
         self.assertEqual(len(FakeSMTP.sent), 1)
         self.assertIn("Nessuna modifica da inviare", self.page_text(at))
+
+    def test_next_month_is_read_only_after_the_closing_day(self):
+        # Giorno 1 = il mese successivo è sempre già chiuso (1° di questo mese, 00:00).
+        self.gh.seed("data/unavailability_settings.yml",
+                     "unavailability_open: true\nmax_unavailability_per_shift: 6\nauto_close_day: 1\n")
+        at = self.login(self.new_session())
+        after = (day(1) + dt.timedelta(days=32)).replace(day=1)
+
+        # Si parte dal primo mese ancora aperto, con la scadenza scritta.
+        self.assertEqual((self.calendar.last["year"], self.calendar.last["month"]), (after.year, after.month))
+        self.assertIn(f"fino al **{(after.replace(day=1) - dt.timedelta(days=1)).replace(day=1) - dt.timedelta(days=1):%d/%m/%Y}**",
+                      self.page_text(at))
+
+        self.calendar.go_to(YY, MM)
+        at.run()
+        self.assertIn("si è chiuso automaticamente", self.page_text(at))
+        self.assertTrue(at.button(key=f"save_unav_{YY}_{MM}").disabled)
+
+        at.button(key=f"closed_next_{YY}_{MM}").click()
+        at.run()
+        self.assertFalse(at.exception, at.exception)
+        self.assertEqual((self.calendar.last["year"], self.calendar.last["month"]), (after.year, after.month))
 
     def test_calendar_day_with_several_shifts_is_saved(self):
         at = self.login(self.new_session())
@@ -485,15 +511,38 @@ class DoctorUnavailabilityFlowTests(unittest.TestCase):
         self.assertEqual(len(FakeSMTP.sent), len(self.DOCTORS))
         self.assertEqual(self.gh.max_put_in_flight, 1)
 
-    def admin_session(self, section: str, smtp: bool = True) -> AppTest:
-        at = self.new_session(smtp=smtp)
-        at.sidebar.radio[0].set_value(section)
+    def admin_login(self, at: AppTest, password: str = "9999") -> AppTest:
+        at.sidebar.radio[0].set_value(ADMIN_ENTRY)
         at.run()
-        at.text_input[0].input("9999")
-        next(b for b in at.button if b.label == "Sblocca area Admin").click()
+        at.text_input(key="admin_password").input(password)
+        next(b for b in at.button if b.label == "Entra").click()
         at.run()
         self.assertFalse(at.exception, at.exception)
         return at
+
+    def admin_session(self, section: str, smtp: bool = True) -> AppTest:
+        at = self.admin_login(self.new_session(smtp=smtp))
+        at.sidebar.radio[0].set_value(section)
+        at.run()
+        self.assertFalse(at.exception, at.exception)
+        return at
+
+    def test_doctors_see_no_admin_pages_until_the_admin_password(self):
+        at = self.new_session()
+        self.assertEqual(at.sidebar.radio[0].options, [DOCTOR_PAGE, ADMIN_ENTRY])
+
+        self.admin_login(at, "0000")
+        self.assertIn("Password admin errata", self.page_text(at))
+        self.assertEqual(at.sidebar.radio[0].options, [DOCTOR_PAGE, ADMIN_ENTRY])
+
+        self.admin_login(at)
+        self.assertEqual(at.sidebar.radio[0].options, [DOCTOR_PAGE] + ADMIN_PAGES)
+        self.assertEqual(at.sidebar.radio[0].value, ADMIN_PAGES[0])
+
+        next(b for b in at.sidebar.button if b.label == "🚪 Esci da Admin").click()
+        at.run()
+        self.assertEqual(at.sidebar.radio[0].options, [DOCTOR_PAGE, ADMIN_ENTRY])
+        self.assertEqual(at.sidebar.radio[0].value, DOCTOR_PAGE)
 
     def test_admin_sees_unsent_drafts_before_generating(self):
         doc = self.login(self.new_session())
